@@ -1,0 +1,51 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, WebSocket tickets, private transcripts, or personal data.
+        Report security issues privately through the repository Security tab.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe reproduction.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: T3Layer revision
+      placeholder: Commit SHA or branch
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime versions
+      description: Include Bun and T3 Code versions when relevant.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Include logs or structural state with all credentials and private data removed.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, tickets, private transcripts, and personal data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

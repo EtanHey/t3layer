@@ -1,0 +1,21 @@
+node_modules/
+coverage/
+dist/
+*.tsbuildinfo
+
+# Local orchestration evidence, transcripts, reports, and handoffs.
+docs.local/
+handoffs/
+
+# Pre-release plans awaiting a public-safe rewrite.
+docs/plans/
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system state.
+.DS_Store
+.idea/
+.vscode/
