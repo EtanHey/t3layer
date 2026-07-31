@@ -531,7 +531,7 @@ describe("T3 native runtime adapter", () => {
       },
     });
 
-    expect(runtime.getThread("thread-1")).rejects.toMatchObject({
+    await expect(runtime.getThread("thread-1")).rejects.toMatchObject({
       name: "NativeRuntimeAdapterError",
       code: "transport_unavailable",
     });
@@ -1021,7 +1021,7 @@ describe("T3 native runtime adapter", () => {
       socketUrl: "ws://127.0.0.1/ephemeral",
     };
 
-    expect(sessionFactory.connect(connection)).rejects.toThrow(
+    await expect(sessionFactory.connect(connection)).rejects.toThrow(
       "temporary initialization failure",
     );
     const session = await sessionFactory.connect(connection);
