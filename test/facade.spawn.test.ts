@@ -125,6 +125,89 @@ describe("spawn", () => {
     expect(JSON.stringify(evidence)).not.toContain("secret task body");
   });
 
+  test("counts multibyte spawn evidence by encoded byte length", async () => {
+    const evidence: unknown[] = [];
+    const runtime = {
+      async listProjects() {
+        return [{ projectId: "project-1", workspaceRoot: "/work/app" }];
+      },
+      async createProject() {
+        return { sequence: 1 };
+      },
+      async startThread() {
+        return { sequence: 2 };
+      },
+      async startTurn() {
+        return { sequence: 3 };
+      },
+      async getThread(threadId: string) {
+        return {
+          threadId,
+          projectId: "project-1",
+          snapshotSequence: 2,
+          session: { status: "running", activeTurnId: "turn-1" },
+          latestTurn: {
+            turnId: "turn-1",
+            status: "running",
+            userMessageId: "message-multibyte",
+            assistantMessage: null,
+          },
+          pendingApproval: null,
+          pendingInput: null,
+        };
+      },
+      async *subscribeThread() {
+        return;
+      },
+    };
+    const ids = ["thread-multibyte", "command-multibyte", "message-multibyte"];
+    const facade = createT3Facade(runtime, {
+      id: () => ids.shift()!,
+      now: () => "2026-07-31T00:00:00.000Z",
+      evidence: (record) => evidence.push(record),
+    });
+
+    await facade.spawn({
+      workspaceRoot: "/work/app",
+      title: "worker",
+      message: "é🙂",
+      modelSelection: {
+        instanceId: "codex",
+        model: "gpt-5.6-sol",
+        options: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+    });
+
+    expect("é🙂").toHaveLength(3);
+    expect(evidence).toEqual([
+      {
+        operation: "spawn",
+        commandId: "command-multibyte",
+        projectId: "project-1",
+        threadId: "thread-multibyte",
+        messageId: "message-multibyte",
+        workspaceRoot: "/work/app",
+        modelSelection: {
+          instanceId: "codex",
+          model: "gpt-5.6-sol",
+          optionCount: 0,
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-07-31T00:00:00.000Z",
+        attachments: 0,
+        messageBytes: 6,
+      },
+    ]);
+    expect(JSON.stringify(evidence)).not.toContain("é🙂");
+  });
+
   test("allowlists model-selection evidence without option values", async () => {
     const credential = "hostile-model-option-credential";
     const evidence: unknown[] = [];

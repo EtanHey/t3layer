@@ -115,18 +115,17 @@ interface TurnReceiptBase {
   readonly agentId: string;
   readonly commandId: string;
   readonly messageId: string;
+  readonly sequence: number;
 }
 
 export type TurnReceipt =
   | (TurnReceiptBase & {
       readonly recovered: false;
-      readonly sequence: number;
-      readonly snapshotSequence?: never;
+      readonly sequenceSource: "dispatch";
     })
   | (TurnReceiptBase & {
       readonly recovered: true;
-      readonly snapshotSequence: number;
-      readonly sequence?: never;
+      readonly sequenceSource: "projection";
     });
 
 export type AgentLifecycle =
@@ -276,20 +275,23 @@ function matchesSpawnIdentity(
 function toAgentEvent(snapshot: NativeThreadSnapshot): AgentEvent {
   const assistant = snapshot.latestTurn?.assistantMessage;
   let lifecycle: AgentLifecycle;
-  if (snapshot.pendingApproval != null || snapshot.pendingInput != null) {
-    lifecycle = "awaiting_input";
-  } else if (
+  if (
     snapshot.session.status === "interrupted" ||
     snapshot.latestTurn?.status === "interrupted"
   ) {
     lifecycle = "interrupted";
-  } else if (snapshot.session.status === "stopped") {
-    lifecycle = "stopped";
   } else if (
     snapshot.session.status === "error" ||
     snapshot.latestTurn?.status === "error"
   ) {
     lifecycle = "error";
+  } else if (
+    snapshot.pendingApproval != null ||
+    snapshot.pendingInput != null
+  ) {
+    lifecycle = "awaiting_input";
+  } else if (snapshot.session.status === "stopped") {
+    lifecycle = "stopped";
   } else if (
     snapshot.session.status === "ready" &&
     snapshot.latestTurn?.status === "completed" &&
@@ -323,11 +325,35 @@ function toAgentEvent(snapshot: NativeThreadSnapshot): AgentEvent {
     ...(assistant !== null &&
     assistant !== undefined &&
     !assistant.streaming &&
-    assistant.content.length > 0
+    assistant.content.trim().length > 0
       ? { assistantContent: assistant.content }
       : {}),
     native: snapshot,
   };
+}
+
+function requireSendableThread(
+  snapshot: NativeThreadSnapshot | undefined,
+  agentId: string,
+  unavailableBoundary: NativeThreadSnapshot,
+): NativeThreadSnapshot {
+  if (snapshot === undefined) {
+    throw new FacadeError("transport_unavailable", unavailableBoundary);
+  }
+  if (snapshot.threadId !== agentId) {
+    throw new FacadeError("transport_unavailable", snapshot);
+  }
+  if (
+    snapshot.session.activeTurnId !== null ||
+    snapshot.session.status === "starting" ||
+    snapshot.session.status === "running" ||
+    snapshot.latestTurn?.status === "running" ||
+    snapshot.pendingApproval != null ||
+    snapshot.pendingInput != null
+  ) {
+    throw new FacadeError("turn_error", snapshot);
+  }
+  return snapshot;
 }
 
 function isTerminal(event: AgentEvent): boolean {
@@ -528,26 +554,11 @@ export function createT3Facade(
 
     async send(agentId: string, message: string): Promise<TurnReceipt> {
       const sendBoundary = unavailableSnapshot(agentId);
-      const current = await callRuntime(
-        () => runtime.getThread(agentId),
+      const current = requireSendableThread(
+        await callRuntime(() => runtime.getThread(agentId), sendBoundary),
+        agentId,
         sendBoundary,
       );
-      if (current === undefined) {
-        throw new FacadeError("transport_unavailable", sendBoundary);
-      }
-      if (current.threadId !== agentId) {
-        throw new FacadeError("transport_unavailable", current);
-      }
-      if (
-        current.session.activeTurnId !== null ||
-        current.session.status === "starting" ||
-        current.session.status === "running" ||
-        current.latestTurn?.status === "running" ||
-        current.pendingApproval != null ||
-        current.pendingInput != null
-      ) {
-        throw new FacadeError("turn_error", current);
-      }
 
       const commandId = id();
       const messageId = id();
@@ -586,10 +597,12 @@ export function createT3Facade(
             agentId,
             commandId,
             messageId,
-            snapshotSequence: snapshot.snapshotSequence,
+            sequence: snapshot.snapshotSequence,
+            sequenceSource: "projection",
             recovered: true,
           };
         }
+        requireSendableThread(snapshot, agentId, current);
         try {
           receipt = await callRuntime(
             () => runtime.startTurn(command),
@@ -613,7 +626,8 @@ export function createT3Facade(
             agentId,
             commandId,
             messageId,
-            snapshotSequence: finalSnapshot.snapshotSequence,
+            sequence: finalSnapshot.snapshotSequence,
+            sequenceSource: "projection",
             recovered: true,
           };
         }
@@ -623,6 +637,7 @@ export function createT3Facade(
         commandId,
         messageId,
         sequence: receipt.sequence,
+        sequenceSource: "dispatch",
         recovered: false,
       };
     },
@@ -666,6 +681,7 @@ export function createT3Facade(
       if (isTerminal(initialEvent)) return;
 
       let lastSnapshot = initial;
+      let lastObservationSequence = initial.snapshotSequence;
       let iterator: AsyncIterator<NativeThreadObservation>;
       try {
         iterator = runtime
@@ -706,6 +722,10 @@ export function createT3Facade(
           if (next.value.snapshot.threadId !== agentId) {
             throw new FacadeError("transport_unavailable", next.value.snapshot);
           }
+          if (next.value.sequence <= lastObservationSequence) {
+            throw new FacadeError("transport_unavailable", lastSnapshot);
+          }
+          lastObservationSequence = next.value.sequence;
           lastSnapshot = next.value.snapshot;
           assertNonEmptyTerminal(lastSnapshot);
           const event = toAgentEvent(lastSnapshot);

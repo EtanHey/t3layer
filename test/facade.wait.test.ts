@@ -123,6 +123,93 @@ describe("wait", () => {
     });
   });
 
+  for (const violation of [
+    {
+      label: "duplicates the initial sequence",
+      yieldsAdvancingObservation: false,
+      expectedLastSequence: 70,
+    },
+    {
+      label: "regresses after an advancing observation",
+      yieldsAdvancingObservation: true,
+      expectedLastSequence: 71,
+    },
+  ] as const) {
+    test(`fails closed before retaining or yielding an observation that ${violation.label}`, async () => {
+      const initial = {
+        threadId: "thread-1",
+        projectId: "project-1",
+        snapshotSequence: 70,
+        session: { status: "running", activeTurnId: "turn-1" },
+        latestTurn: {
+          turnId: "turn-1",
+          status: "running",
+          userMessageId: "message-1",
+          assistantMessage: null,
+        },
+        pendingApproval: null,
+        pendingInput: null,
+      };
+      const advancing = {
+        ...initial,
+        snapshotSequence: 71,
+      };
+      const invalid = {
+        ...initial,
+        pendingApproval: {
+          requestId: "approval-invalid",
+          payload: "x".repeat(20_000),
+        },
+      };
+      const runtime = {
+        async listProjects() {
+          return [];
+        },
+        async createProject() {
+          return { sequence: 1 };
+        },
+        async startThread() {
+          return { sequence: 2 };
+        },
+        async startTurn() {
+          return { sequence: 3 };
+        },
+        async getThread() {
+          return initial;
+        },
+        async *subscribeThread() {
+          if (violation.yieldsAdvancingObservation) {
+            yield { sequence: 71, snapshot: advancing };
+          }
+          yield { sequence: 70, snapshot: invalid };
+        },
+      };
+      const facade = createT3Facade(runtime);
+      const iterator = facade
+        .wait("thread-1", {
+          kind: "terminal",
+          timeoutMs: 1_000,
+          maxEvidenceBytes: 10_000,
+        })
+        [Symbol.asyncIterator]();
+
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { sequence: 70 },
+        done: false,
+      });
+      if (violation.yieldsAdvancingObservation) {
+        await expect(iterator.next()).resolves.toMatchObject({
+          value: { sequence: 71 },
+          done: false,
+        });
+      }
+      await expect(iterator.next()).rejects.toMatchObject({
+        code: "transport_unavailable",
+        sequence: violation.expectedLastSequence,
+      });
+    });
+  }
+
   test("fails closed when the initial lookup returns a different thread", async () => {
     const divergent = {
       threadId: "thread-other",
@@ -425,6 +512,62 @@ describe("wait", () => {
 
     expect(events.map((event) => event.lifecycle)).toEqual(["awaiting_input"]);
   });
+
+  for (const failedState of ["interrupted", "error"] as const) {
+    test(`keeps ${failedState} ahead of pending state and omits whitespace-only assistant content`, async () => {
+      const failed = {
+        threadId: "thread-1",
+        projectId: "project-1",
+        snapshotSequence: 32,
+        session: { status: failedState, activeTurnId: null },
+        latestTurn: {
+          turnId: "turn-1",
+          status: "running",
+          userMessageId: "message-1",
+          assistantMessage: { content: " \n\t ", streaming: false },
+        },
+        pendingApproval:
+          failedState === "interrupted"
+            ? { requestId: "approval-pending" }
+            : null,
+        pendingInput:
+          failedState === "error" ? { requestId: "input-pending" } : null,
+      };
+      const runtime = {
+        async listProjects() {
+          return [];
+        },
+        async createProject() {
+          return { sequence: 1 };
+        },
+        async startThread() {
+          return { sequence: 2 };
+        },
+        async startTurn() {
+          return { sequence: 3 };
+        },
+        async getThread() {
+          return failed;
+        },
+        async *subscribeThread() {
+          throw new Error("failed state must stop before subscription");
+        },
+      };
+      const facade = createT3Facade(runtime);
+
+      const events = await collect(
+        facade.wait("thread-1", {
+          kind: "terminal",
+          timeoutMs: 1_000,
+          maxEvidenceBytes: 10_000,
+        }),
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.lifecycle).toBe(failedState);
+      expect(events[0]).not.toHaveProperty("assistantContent");
+    });
+  }
 
   test("decodes omitted pending fields as no pending input", async () => {
     const initial = {

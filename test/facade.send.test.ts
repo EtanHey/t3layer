@@ -58,6 +58,7 @@ describe("send", () => {
       commandId: "command-2",
       messageId: "message-2",
       sequence: 21,
+      sequenceSource: "dispatch",
       recovered: false,
     });
     expect(evidence).toEqual([
@@ -73,6 +74,60 @@ describe("send", () => {
     ]);
     expect(JSON.stringify(evidence)).not.toContain("secret follow-up");
     expect(JSON.stringify(calls)).not.toContain("bootstrap");
+  });
+
+  test("counts multibyte send evidence by encoded byte length", async () => {
+    const evidence: unknown[] = [];
+    const runtime = {
+      async listProjects() {
+        return [];
+      },
+      async createProject() {
+        return { sequence: 1 };
+      },
+      async startThread() {
+        return { sequence: 2 };
+      },
+      async startTurn() {
+        return { sequence: 21 };
+      },
+      async getThread(threadId: string) {
+        return {
+          threadId,
+          projectId: "project-1",
+          snapshotSequence: 20,
+          session: { status: "ready", activeTurnId: null },
+          latestTurn: null,
+          pendingApproval: null,
+          pendingInput: null,
+        };
+      },
+      async *subscribeThread() {
+        return;
+      },
+    };
+    const ids = ["command-multibyte", "message-multibyte"];
+    const facade = createT3Facade(runtime, {
+      id: () => ids.shift()!,
+      now: () => "2026-07-31T00:00:00.000Z",
+      evidence: (record) => evidence.push(record),
+    });
+
+    await facade.send("thread-1", "é🙂");
+
+    expect("é🙂").toHaveLength(3);
+    expect(evidence).toEqual([
+      {
+        operation: "send",
+        commandId: "command-multibyte",
+        threadId: "thread-1",
+        messageId: "message-multibyte",
+        createdAt: "2026-07-31T00:00:00.000Z",
+        attachments: 0,
+        messageBytes: 6,
+      },
+    ]);
+    expect(JSON.stringify(evidence)).not.toContain("é🙂");
   });
 
   test("fails closed before dispatch when preflight returns a different thread", async () => {
@@ -224,7 +279,8 @@ describe("send", () => {
       agentId: "thread-1",
       commandId: "command-2",
       messageId: "message-2",
-      snapshotSequence: 22,
+      sequence: 22,
+      sequenceSource: "projection",
       recovered: true,
     });
   });
@@ -289,6 +345,7 @@ describe("send", () => {
       commandId: "command-stable",
       messageId: "message-stable",
       sequence: 23,
+      sequenceSource: "dispatch",
       recovered: false,
     });
   });
@@ -352,13 +409,165 @@ describe("send", () => {
       agentId: "thread-1",
       commandId: "command-stable",
       messageId: "message-stable",
-      snapshotSequence: 23,
+      sequence: 23,
+      sequenceSource: "projection",
       recovered: true,
     });
   });
 
-  for (const reconciliationQuery of [2, 3]) {
-    test(`rejects a different thread on ambiguous send reconciliation query ${reconciliationQuery}`, async () => {
+  test("fails closed without retry when the first ambiguous-send reconciliation returns a different thread", async () => {
+    let attempts = 0;
+    let queryCount = 0;
+    const runtime = {
+      async listProjects() {
+        return [];
+      },
+      async createProject() {
+        return { sequence: 1 };
+      },
+      async startThread() {
+        return { sequence: 2 };
+      },
+      async startTurn() {
+        attempts += 1;
+        throw new AmbiguousDispatchError();
+      },
+      async getThread(threadId: string) {
+        queryCount += 1;
+        return {
+          threadId: queryCount === 2 ? "thread-colliding" : threadId,
+          projectId: "project-1",
+          snapshotSequence: 20 + queryCount,
+          session: { status: "ready", activeTurnId: null },
+          latestTurn: null,
+          pendingApproval: null,
+          pendingInput: null,
+        };
+      },
+      async *subscribeThread() {
+        return;
+      },
+    };
+    const ids = ["command-stable", "message-stable"];
+    const facade = createT3Facade(runtime, {
+      id: () => ids.shift()!,
+      now: () => "2026-07-31T00:00:00.000Z",
+    });
+
+    await expect(facade.send("thread-1", "follow-up")).rejects.toMatchObject({
+      code: "transport_unavailable",
+      sequence: 22,
+    });
+    expect(attempts).toBe(1);
+    expect(queryCount).toBe(2);
+    expect(ids).toHaveLength(0);
+  });
+
+  test("rejects a different thread after the final ambiguous-send reconciliation", async () => {
+    let attempts = 0;
+    let queryCount = 0;
+    const runtime = {
+      async listProjects() {
+        return [];
+      },
+      async createProject() {
+        return { sequence: 1 };
+      },
+      async startThread() {
+        return { sequence: 2 };
+      },
+      async startTurn() {
+        attempts += 1;
+        throw new AmbiguousDispatchError();
+      },
+      async getThread(threadId: string) {
+        queryCount += 1;
+        const colliding = queryCount === 3;
+        return {
+          threadId: colliding ? "thread-colliding" : threadId,
+          projectId: "project-1",
+          snapshotSequence: 20 + queryCount,
+          session: { status: "ready", activeTurnId: null },
+          latestTurn: colliding
+            ? {
+                turnId: "turn-colliding",
+                status: "running",
+                userMessageId: "message-stable",
+                assistantMessage: null,
+              }
+            : null,
+          pendingApproval: null,
+          pendingInput: null,
+        };
+      },
+      async *subscribeThread() {
+        return;
+      },
+    };
+    const ids = ["command-stable", "message-stable"];
+    const facade = createT3Facade(runtime, {
+      id: () => ids.shift()!,
+      now: () => "2026-07-31T00:00:00.000Z",
+    });
+
+    await expect(facade.send("thread-1", "follow-up")).rejects.toBeInstanceOf(
+      AmbiguousDispatchError,
+    );
+    expect(attempts).toBe(2);
+    expect(queryCount).toBe(3);
+    expect(ids).toHaveLength(0);
+  });
+
+  for (const blocked of [
+    {
+      label: "an active turn",
+      session: { status: "ready", activeTurnId: "turn-other" },
+      latestTurn: null,
+      pendingApproval: null,
+      pendingInput: null,
+    },
+    {
+      label: "a starting session",
+      session: { status: "starting", activeTurnId: null },
+      latestTurn: null,
+      pendingApproval: null,
+      pendingInput: null,
+    },
+    {
+      label: "a running session",
+      session: { status: "running", activeTurnId: null },
+      latestTurn: null,
+      pendingApproval: null,
+      pendingInput: null,
+    },
+    {
+      label: "a running latest turn",
+      session: { status: "ready", activeTurnId: null },
+      latestTurn: {
+        turnId: "turn-other",
+        status: "running",
+        userMessageId: "message-other",
+        assistantMessage: null,
+      },
+      pendingApproval: null,
+      pendingInput: null,
+    },
+    {
+      label: "pending approval",
+      session: { status: "ready", activeTurnId: null },
+      latestTurn: null,
+      pendingApproval: { requestId: "approval-other" },
+      pendingInput: null,
+    },
+    {
+      label: "pending input",
+      session: { status: "ready", activeTurnId: null },
+      latestTurn: null,
+      pendingApproval: null,
+      pendingInput: { requestId: "input-other" },
+    },
+  ] as const) {
+    test(`does not retry an ambiguous send after reconciliation finds ${blocked.label}`, async () => {
       let attempts = 0;
       let queryCount = 0;
       const runtime = {
@@ -377,22 +586,25 @@ describe("send", () => {
         },
         async getThread(threadId: string) {
           queryCount += 1;
-          const colliding = queryCount === reconciliationQuery;
+          if (queryCount === 1) {
+            return {
+              threadId,
+              projectId: "project-1",
+              snapshotSequence: 20,
+              session: { status: "ready", activeTurnId: null },
+              latestTurn: null,
+              pendingApproval: null,
+              pendingInput: null,
+            };
+          }
           return {
-            threadId: colliding ? "thread-colliding" : threadId,
+            threadId,
             projectId: "project-1",
-            snapshotSequence: 20 + queryCount,
-            session: { status: "ready", activeTurnId: null },
-            latestTurn: colliding
-              ? {
-                  turnId: "turn-colliding",
-                  status: "running",
-                  userMessageId: "message-stable",
-                  assistantMessage: null,
-                }
-              : null,
-            pendingApproval: null,
-            pendingInput: null,
+            snapshotSequence: 22,
+            session: blocked.session,
+            latestTurn: blocked.latestTurn,
+            pendingApproval: blocked.pendingApproval,
+            pendingInput: blocked.pendingInput,
           };
         },
         async *subscribeThread() {
@@ -405,11 +617,12 @@ describe("send", () => {
         now: () => "2026-07-31T00:00:00.000Z",
       });
 
-      await expect(facade.send("thread-1", "follow-up")).rejects.toBeInstanceOf(
-        AmbiguousDispatchError,
-      );
-      expect(attempts).toBe(2);
-      expect(queryCount).toBe(3);
+      await expect(facade.send("thread-1", "follow-up")).rejects.toMatchObject({
+        code: "turn_error",
+        sequence: 22,
+      });
+      expect(attempts).toBe(1);
+      expect(queryCount).toBe(2);
       expect(ids).toHaveLength(0);
     });
   }
