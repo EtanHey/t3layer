@@ -270,10 +270,8 @@ function toAgentSnapshot(snapshot: NativeThreadSnapshot): AgentSnapshot {
   };
 }
 
-function matchesSpawnIdentity(
+function matchesMessageIdentity(
   snapshot: NativeThreadSnapshot,
-  threadId: string,
-  projectId: string,
   messageId: string,
 ): boolean {
   const observedMessageIds = [
@@ -281,10 +279,21 @@ function matchesSpawnIdentity(
     snapshot.latestTurn?.userMessageId,
   ].filter((candidate): candidate is string => candidate !== undefined);
   return (
-    snapshot.threadId === threadId &&
-    snapshot.projectId === projectId &&
     observedMessageIds.length > 0 &&
     observedMessageIds.every((candidate) => candidate === messageId)
+  );
+}
+
+function matchesSpawnIdentity(
+  snapshot: NativeThreadSnapshot,
+  threadId: string,
+  projectId: string,
+  messageId: string,
+): boolean {
+  return (
+    snapshot.threadId === threadId &&
+    snapshot.projectId === projectId &&
+    matchesMessageIdentity(snapshot, messageId)
   );
 }
 
@@ -610,7 +619,7 @@ export function createT3Facade(runtime: NativeRuntime, options: FacadeOptions) {
         );
         if (
           snapshot?.threadId === agentId &&
-          snapshot.latestTurn?.userMessageId === messageId
+          matchesMessageIdentity(snapshot, messageId)
         ) {
           return {
             agentId,
@@ -637,7 +646,7 @@ export function createT3Facade(runtime: NativeRuntime, options: FacadeOptions) {
           );
           if (
             finalSnapshot?.threadId !== agentId ||
-            finalSnapshot.latestTurn?.userMessageId !== messageId
+            !matchesMessageIdentity(finalSnapshot, messageId)
           ) {
             throw retryError;
           }

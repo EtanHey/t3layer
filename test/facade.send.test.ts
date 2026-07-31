@@ -265,10 +265,10 @@ describe("send", () => {
           projectId: "project-1",
           snapshotSequence: 22,
           session: { status: "running", activeTurnId: "turn-2" },
+          latestUserMessageId: "message-2",
           latestTurn: {
             turnId: "turn-2",
             status: "running",
-            userMessageId: "message-2",
             assistantMessage: null,
           },
           pendingApproval: null,
@@ -394,12 +394,14 @@ describe("send", () => {
             queryCount === 3
               ? { status: "running", activeTurnId: "turn-2" }
               : { status: "ready", activeTurnId: null },
+          ...(queryCount === 3
+            ? { latestUserMessageId: "message-stable" }
+            : {}),
           latestTurn:
             queryCount === 3
               ? {
                   turnId: "turn-2",
                   status: "running",
-                  userMessageId: "message-stable",
                   assistantMessage: null,
                 }
               : null,
@@ -431,6 +433,72 @@ describe("send", () => {
       sequenceSource: "projection",
       recovered: true,
     });
+  });
+
+  test("fails closed when ambiguous send identity sources conflict", async () => {
+    let attempts = 0;
+    let queryCount = 0;
+    const runtime = {
+      async listProjects() {
+        return [];
+      },
+      async createProject() {
+        return { sequence: 1 };
+      },
+      async startThread() {
+        return { sequence: 2 };
+      },
+      async startTurn() {
+        attempts += 1;
+        throw new AmbiguousDispatchError();
+      },
+      async getThread(threadId: string) {
+        queryCount += 1;
+        if (queryCount === 1) {
+          return {
+            threadId,
+            projectId: "project-1",
+            snapshotSequence: 20,
+            session: { status: "ready", activeTurnId: null },
+            latestTurn: null,
+            pendingApproval: null,
+            pendingInput: null,
+          };
+        }
+        return {
+          threadId,
+          projectId: "project-1",
+          snapshotSequence: 22,
+          session: { status: "running", activeTurnId: "turn-2" },
+          latestUserMessageId: "message-stable",
+          latestTurn: {
+            turnId: "turn-2",
+            status: "running",
+            userMessageId: "message-stale",
+            assistantMessage: null,
+          },
+          pendingApproval: null,
+          pendingInput: null,
+        };
+      },
+      async *subscribeThread() {
+        return;
+      },
+    };
+    const ids = ["command-stable", "message-stable"];
+    const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
+      id: () => ids.shift()!,
+      now: () => "2026-07-31T00:00:00.000Z",
+    });
+
+    await expect(facade.send("thread-1", "follow-up")).rejects.toMatchObject({
+      code: "turn_error",
+      sequence: 22,
+    });
+    expect(attempts).toBe(1);
+    expect(queryCount).toBe(2);
+    expect(ids).toHaveLength(0);
   });
 
   test("fails closed without retry when the first ambiguous-send reconciliation returns a different thread", async () => {
