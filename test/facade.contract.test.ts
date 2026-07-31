@@ -142,7 +142,13 @@ describe("canonical pre-adapter contracts", () => {
       modelSelection: { optionCount: 1 },
     });
     expect(JSON.stringify(evidence)).not.toContain("fastMode");
-    expect(JSON.stringify(evidence)).not.toContain("true");
+    expect(
+      (
+        evidence[0] as {
+          readonly modelSelection: Record<string, unknown>;
+        }
+      ).modelSelection,
+    ).not.toHaveProperty("options");
   });
 
   test("includes the configured modes in follow-up dispatch and evidence", async () => {

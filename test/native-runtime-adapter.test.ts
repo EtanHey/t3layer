@@ -24,6 +24,11 @@ const MODEL = {
   model: "gpt-5.6-sol",
   options: [{ id: "reasoningEffort", value: "high" }],
 } as const;
+const BOOLEAN_MODEL = {
+  instanceId: "codex",
+  model: "gpt-5.6-sol",
+  options: [{ id: "fastMode", value: true }],
+} as const;
 
 function project(
   id = "project-1",
@@ -204,6 +209,26 @@ function scriptedStream<T>(
   };
 }
 
+type PromiseOutcome<T> =
+  | { readonly kind: "resolved"; readonly value: T }
+  | { readonly kind: "rejected"; readonly error: unknown }
+  | { readonly kind: "pending" };
+
+async function outcomeWithin<T>(
+  promise: Promise<T>,
+  timeoutMs = 100,
+): Promise<PromiseOutcome<T>> {
+  return Promise.race([
+    promise.then(
+      (value): PromiseOutcome<T> => ({ kind: "resolved", value }),
+      (error): PromiseOutcome<T> => ({ kind: "rejected", error }),
+    ),
+    new Promise<PromiseOutcome<T>>((resolve) => {
+      setTimeout(() => resolve({ kind: "pending" }), timeoutMs);
+    }),
+  ]);
+}
+
 describe("T3 native runtime adapter", () => {
   test("maps project and turn operations onto canonical RPC commands", async () => {
     const commands: unknown[] = [];
@@ -264,7 +289,7 @@ describe("T3 native runtime adapter", () => {
         messageId: "message-user",
         title: "Worker",
         message: "Do the work",
-        modelSelection: MODEL,
+        modelSelection: BOOLEAN_MODEL,
         runtimeMode: "full-access",
         interactionMode: "default",
         branch: null,
@@ -307,14 +332,14 @@ describe("T3 native runtime adapter", () => {
           text: "Do the work",
           attachments: [],
         },
-        modelSelection: MODEL,
+        modelSelection: BOOLEAN_MODEL,
         runtimeMode: "full-access",
         interactionMode: "default",
         bootstrap: {
           createThread: {
             projectId: "project-1",
             title: "Worker",
-            modelSelection: MODEL,
+            modelSelection: BOOLEAN_MODEL,
             runtimeMode: "full-access",
             interactionMode: "default",
             branch: null,
@@ -342,6 +367,84 @@ describe("T3 native runtime adapter", () => {
     expect(connections).toHaveLength(4);
     expect(socketAcquisitions).toBe(4);
     expect(closes).toBe(4);
+  });
+
+  test("sanitizes unsent command projection failures without opening a session", async () => {
+    const secret = "projection-super-secret";
+    const invalidCreatedAt = "not-an-iso-date";
+    let connects = 0;
+    const runtime = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: {
+        async connect() {
+          connects += 1;
+          throw new Error("must not connect");
+        },
+      },
+    });
+    const invalidCalls = [
+      () =>
+        runtime.createProject({
+          commandId: "",
+          projectId: "project-new",
+          title: secret,
+          workspaceRoot: "/new",
+          createWorkspaceRootIfMissing: false,
+          defaultModelSelection: MODEL,
+          createdAt: invalidCreatedAt,
+        }),
+      () =>
+        runtime.startThread({
+          commandId: "",
+          projectId: "project-1",
+          threadId: "thread-1",
+          messageId: "message-user",
+          title: "Worker",
+          message: secret,
+          modelSelection: MODEL,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: invalidCreatedAt,
+          attachments: [],
+        }),
+      () =>
+        runtime.startTurn({
+          commandId: "",
+          threadId: "thread-1",
+          messageId: "message-follow-up",
+          message: secret,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: invalidCreatedAt,
+          attachments: [],
+        }),
+    ];
+
+    for (const call of invalidCalls) {
+      const outcome = await outcomeWithin(Promise.resolve().then(call));
+      expect(outcome).toMatchObject({
+        kind: "rejected",
+        error: {
+          name: "NativeRuntimeAdapterError",
+          code: "command_rejected",
+        },
+      });
+      if (outcome.kind !== "rejected") {
+        throw new Error("expected rejected command projection");
+      }
+      expect(String(outcome.error)).toBe(
+        "NativeRuntimeAdapterError: command_rejected",
+      );
+      expect((outcome.error as Error).message).toBe("command_rejected");
+      expect(String(outcome.error)).not.toContain(secret);
+      expect(String(outcome.error)).not.toContain("ParseError");
+      expect((outcome.error as Error).name).not.toBe("AmbiguousDispatchError");
+    }
+    expect(connects).toBe(0);
   });
 
   test("reconciles a pending-only shell snapshot ahead of a synchronized detail snapshot", async () => {
@@ -752,6 +855,204 @@ describe("T3 native runtime adapter", () => {
     });
   });
 
+  test("times out a hanging initial alignment replay without awaiting a hanging iterator return", async () => {
+    let replayReturns = 0;
+    let detailReturns = 0;
+    let shellReturns = 0;
+    const hangingReplay: AsyncIterable<OrchestrationThreadStreamItem> = {
+      [Symbol.asyncIterator]() {
+        return {
+          next: () =>
+            new Promise<IteratorResult<OrchestrationThreadStreamItem>>(
+              () => undefined,
+            ),
+          return() {
+            replayReturns += 1;
+            return new Promise<IteratorResult<OrchestrationThreadStreamItem>>(
+              () => undefined,
+            );
+          },
+        };
+      },
+    };
+    const session: RuntimeClientSession = {
+      async dispatchCommand() {
+        return { sequence: 1 };
+      },
+      subscribeShell: () =>
+        stream(
+          [
+            {
+              kind: "snapshot",
+              snapshot: shellSnapshot(11, [shellThread(11)]),
+            },
+            { kind: "synchronized" },
+          ],
+          () => {
+            shellReturns += 1;
+          },
+        ),
+      subscribeThread(input) {
+        if (input.afterSequence === 10) return hangingReplay;
+        return stream(
+          [
+            {
+              kind: "snapshot",
+              snapshot: { snapshotSequence: 10, thread: thread(10) },
+            },
+            { kind: "synchronized" },
+          ],
+          () => {
+            detailReturns += 1;
+          },
+        );
+      },
+      async close() {},
+    };
+    const runtime = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      alignmentTimeoutMs: 10,
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: { connect: async () => session },
+    });
+
+    const outcome = await outcomeWithin(runtime.getThread("thread-1"));
+
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      error: {
+        name: "NativeRuntimeAdapterError",
+        code: "transport_unavailable",
+      },
+    });
+    expect(replayReturns).toBe(1);
+    expect(detailReturns).toBe(1);
+    expect(shellReturns).toBe(1);
+  });
+
+  test("returns missing when aligned shell replay removes the target thread", async () => {
+    const session: RuntimeClientSession = {
+      async dispatchCommand() {
+        return { sequence: 1 };
+      },
+      subscribeShell(input) {
+        if (input.afterSequence === 10) {
+          return stream([
+            {
+              kind: "snapshot",
+              snapshot: shellSnapshot(12, []),
+            },
+            { kind: "synchronized" },
+          ]);
+        }
+        return stream([
+          {
+            kind: "snapshot",
+            snapshot: shellSnapshot(10, [shellThread(10)]),
+          },
+          { kind: "synchronized" },
+        ]);
+      },
+      subscribeThread(input) {
+        if (input.afterSequence === 11) {
+          return stream([{ kind: "synchronized" }]);
+        }
+        return stream([
+          {
+            kind: "snapshot",
+            snapshot: { snapshotSequence: 11, thread: thread(11) },
+          },
+          { kind: "synchronized" },
+        ]);
+      },
+      async close() {},
+    };
+    const runtime = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: { connect: async () => session },
+    });
+
+    expect(await runtime.getThread("thread-1")).toBeUndefined();
+  });
+
+  test("terminates fallback alignment after one shell catch-up and one detail catch-up", async () => {
+    let shellSubscriptions = 0;
+    let detailSubscriptions = 0;
+    let iteratorReturns = 0;
+    const session: RuntimeClientSession = {
+      async dispatchCommand() {
+        return { sequence: 1 };
+      },
+      subscribeShell(input) {
+        shellSubscriptions += 1;
+        if (input.afterSequence === 10) {
+          return stream(
+            [
+              {
+                kind: "snapshot",
+                snapshot: shellSnapshot(20, [shellThread(20)]),
+              },
+              { kind: "synchronized" },
+            ],
+            () => {
+              iteratorReturns += 1;
+            },
+          );
+        }
+        return stream(
+          [
+            {
+              kind: "snapshot",
+              snapshot: shellSnapshot(10, [shellThread(10)]),
+            },
+            { kind: "synchronized" },
+          ],
+          () => {
+            iteratorReturns += 1;
+          },
+        );
+      },
+      subscribeThread(input) {
+        detailSubscriptions += 1;
+        if (input.afterSequence === 11) {
+          return stream([{ kind: "synchronized" }], () => {
+            iteratorReturns += 1;
+          });
+        }
+        return stream(
+          [
+            {
+              kind: "snapshot",
+              snapshot: { snapshotSequence: 11, thread: thread(11) },
+            },
+            { kind: "synchronized" },
+          ],
+          () => {
+            iteratorReturns += 1;
+          },
+        );
+      },
+      async close() {},
+    };
+    const runtime = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: { connect: async () => session },
+    });
+
+    expect(await runtime.getThread("thread-1")).toMatchObject({
+      threadId: "thread-1",
+      snapshotSequence: 20,
+    });
+    expect(shellSubscriptions).toBe(2);
+    expect(detailSubscriptions).toBe(2);
+    expect(iteratorReturns).toBe(4);
+  });
+
   test("reconciles interleaved reducers at a common monotonic watermark and preserves pending precedence", async () => {
     let shellReturns = 0;
     let detailReturns = 0;
@@ -1000,6 +1301,181 @@ describe("T3 native runtime adapter", () => {
     });
     expect(String(failure)).not.toContain("super-secret");
     expect(JSON.stringify(failure)).not.toContain("super-secret");
+  });
+
+  test("bounds socket acquisition and injected session connection hangs", async () => {
+    let socketFactoryConnects = 0;
+    const socketHang = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      connectionTimeoutMs: 10,
+      acquireSocketUrl: () => new Promise<string>(() => undefined),
+      sessionFactory: {
+        async connect() {
+          socketFactoryConnects += 1;
+          throw new Error("must not connect");
+        },
+      },
+    });
+    const socketOutcome = await outcomeWithin(socketHang.listProjects());
+    expect(socketOutcome).toMatchObject({
+      kind: "rejected",
+      error: {
+        name: "NativeRuntimeAdapterError",
+        code: "transport_unavailable",
+      },
+    });
+    expect(socketFactoryConnects).toBe(0);
+
+    const connectHang = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      connectionTimeoutMs: 10,
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: {
+        connect: () => new Promise<RuntimeClientSession>(() => undefined),
+      },
+    });
+    const connectOutcome = await outcomeWithin(connectHang.listProjects());
+    expect(connectOutcome).toMatchObject({
+      kind: "rejected",
+      error: {
+        name: "NativeRuntimeAdapterError",
+        code: "transport_unavailable",
+      },
+    });
+  });
+
+  test("closes a late injected session exactly once after the caller times out", async () => {
+    let resolveConnect: ((session: RuntimeClientSession) => void) | undefined;
+    let closes = 0;
+    const lateSession: RuntimeClientSession = {
+      async dispatchCommand() {
+        return { sequence: 1 };
+      },
+      subscribeShell: () => stream([]),
+      subscribeThread: () => stream([]),
+      async close() {
+        closes += 1;
+      },
+    };
+    const runtime = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      connectionTimeoutMs: 10,
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: {
+        connect: () =>
+          new Promise<RuntimeClientSession>((resolve) => {
+            resolveConnect = resolve;
+          }),
+      },
+    });
+
+    const outcome = await outcomeWithin(runtime.listProjects());
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      error: {
+        name: "NativeRuntimeAdapterError",
+        code: "transport_unavailable",
+      },
+    });
+
+    resolveConnect?.(lateSession);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(closes).toBe(1);
+  });
+
+  test("rejects timeout values larger than the platform timer limit", () => {
+    const options = {
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+    };
+
+    for (const oversized of [
+      { connectionTimeoutMs: 2_147_483_648 },
+      { alignmentTimeoutMs: 2_147_483_648 },
+    ]) {
+      expect(() => createT3NativeRuntime({ ...options, ...oversized })).toThrow(
+        expect.objectContaining({
+          name: "NativeRuntimeAdapterError",
+          code: "transport_unavailable",
+        }),
+      );
+    }
+  });
+
+  test("bounds hanging default factory effects without awaiting their cleanup finalizers", async () => {
+    const connection = {
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      socketUrl: "ws://127.0.0.1/ephemeral",
+    };
+    let connectScopeCloses = 0;
+    const connectHang = createDefaultSessionFactory(
+      async () =>
+        ({
+          connect: () =>
+            Effect.gen(function* () {
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  connectScopeCloses += 1;
+                }).pipe(Effect.andThen(Effect.never)),
+              );
+              return yield* Effect.never;
+            }),
+        }) as unknown as RuntimeClientRpcSessionFactory,
+      10,
+    );
+    const connectOutcome = await outcomeWithin(connectHang.connect(connection));
+    expect(connectOutcome).toMatchObject({
+      kind: "rejected",
+      error: {
+        name: "NativeRuntimeAdapterError",
+        code: "transport_unavailable",
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(connectScopeCloses).toBe(1);
+
+    let readyInterrupts = 0;
+    let readyScopeCloses = 0;
+    const readyHang = createDefaultSessionFactory(
+      async () =>
+        ({
+          connect: () =>
+            Effect.gen(function* () {
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  readyScopeCloses += 1;
+                }).pipe(Effect.andThen(Effect.never)),
+              );
+              return {
+                ready: Effect.never.pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      readyInterrupts += 1;
+                    }).pipe(Effect.andThen(Effect.never)),
+                  ),
+                ),
+                client: {},
+              };
+            }),
+        }) as unknown as RuntimeClientRpcSessionFactory,
+      10,
+    );
+    const readyOutcome = await outcomeWithin(readyHang.connect(connection));
+    expect(readyOutcome).toMatchObject({
+      kind: "rejected",
+      error: {
+        name: "NativeRuntimeAdapterError",
+        code: "transport_unavailable",
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(readyInterrupts).toBe(1);
+    expect(readyScopeCloses).toBe(1);
   });
 
   test("retries runtime-client factory initialization after a rejected attempt", async () => {

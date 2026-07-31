@@ -68,6 +68,7 @@ export interface RuntimeClientSessionFactory {
     readonly environmentId: string;
     readonly label: string;
     readonly socketUrl: string;
+    readonly timeoutMs?: number;
   }) => Promise<RuntimeClientSession>;
 }
 
@@ -80,6 +81,8 @@ export interface T3NativeRuntimeOptions {
    */
   readonly acquireSocketUrl: () => Promise<string>;
   readonly sessionFactory?: RuntimeClientSessionFactory;
+  readonly connectionTimeoutMs?: number;
+  readonly alignmentTimeoutMs?: number;
 }
 
 interface VersionedDetail {
@@ -103,6 +106,7 @@ interface ReconcileThreadOptions {
   readonly emitAfterSequence?: number;
   readonly resumeFromSequence?: number;
   readonly seed?: ReconciledThreadState;
+  readonly alignmentTimeoutMs?: number;
 }
 
 type TaggedNext =
@@ -118,6 +122,77 @@ type TaggedNext =
       readonly source: "detail" | "shell";
       readonly error: unknown;
     };
+
+const DEFAULT_CONNECTION_TIMEOUT_MS = 15_000;
+const DEFAULT_ALIGNMENT_TIMEOUT_MS = 5_000;
+const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
+
+function positiveBound(value: number | undefined, fallback: number): number {
+  const resolved = value ?? fallback;
+  if (
+    !Number.isSafeInteger(resolved) ||
+    resolved <= 0 ||
+    resolved > MAX_TIMER_TIMEOUT_MS
+  ) {
+    throw new NativeRuntimeAdapterError("transport_unavailable");
+  }
+  return resolved;
+}
+
+function remainingMillis(deadline: number): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new NativeRuntimeAdapterError("transport_unavailable");
+  }
+  return remaining;
+}
+
+// Initiates teardown synchronously, then detaches it. Callers may rely on the
+// attempt having started, but not on cleanup having completed successfully.
+function startBestEffortCleanup(cleanup: (() => unknown) | undefined): void {
+  if (cleanup === undefined) return;
+  try {
+    void Promise.resolve(cleanup()).catch(() => undefined);
+  } catch {
+    // Cleanup is initiated but deliberately neither awaited nor reported as
+    // complete; teardown failures must not mask or delay the request result.
+  }
+}
+
+function withTransportTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onLateResolve?: (value: T) => void | Promise<void>,
+  onTimeout?: () => void | Promise<void>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      startBestEffortCleanup(onTimeout);
+      reject(new NativeRuntimeAdapterError("transport_unavailable"));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        if (settled) {
+          if (onLateResolve !== undefined) {
+            startBestEffortCleanup(() => onLateResolve(value));
+          }
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 function taggedNext<T>(
   source: "detail" | "shell",
@@ -166,8 +241,14 @@ function dispatchError(error: unknown): Error {
   return new AmbiguousDispatchError();
 }
 
-async function runEffect<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
-  const exit = await Effect.runPromiseExit(effect);
+async function runEffect<A, E>(
+  effect: Effect.Effect<A, E>,
+  signal?: AbortSignal,
+): Promise<A> {
+  const exit = await Effect.runPromiseExit(
+    effect,
+    signal === undefined ? undefined : { signal },
+  );
   if (Exit.isSuccess(exit)) return exit.value;
   const error = Cause.findErrorOption(exit.cause);
   if (Option.isSome(error)) throw error.value;
@@ -187,6 +268,7 @@ function loadRuntimeClientFactory(): Promise<RuntimeClientRpcSessionFactory> {
 
 export function createDefaultSessionFactory(
   loadFactory: () => Promise<RuntimeClientRpcSessionFactory> = loadRuntimeClientFactory,
+  defaultTimeoutMs = DEFAULT_CONNECTION_TIMEOUT_MS,
 ): RuntimeClientSessionFactory {
   let factoryPromise: Promise<RuntimeClientRpcSessionFactory> | undefined;
   const getFactory = () => {
@@ -202,7 +284,22 @@ export function createDefaultSessionFactory(
 
   return {
     async connect(connection) {
-      const factory = await getFactory();
+      const timeoutMs = positiveBound(
+        connection.timeoutMs,
+        positiveBound(defaultTimeoutMs, DEFAULT_CONNECTION_TIMEOUT_MS),
+      );
+      const deadline = Date.now() + timeoutMs;
+      const factoryAttempt = getFactory();
+      let factory: RuntimeClientRpcSessionFactory;
+      try {
+        factory = await withTransportTimeout(
+          factoryAttempt,
+          remainingMillis(deadline),
+        );
+      } catch (error) {
+        if (factoryPromise === factoryAttempt) factoryPromise = undefined;
+        throw error;
+      }
       const scope = await runEffect(Scope.make());
       let closed = false;
       const close = async () => {
@@ -211,18 +308,31 @@ export function createDefaultSessionFactory(
         await runEffect(Scope.close(scope, Exit.succeed(undefined)));
       };
       try {
-        const session = await runEffect(
-          factory
-            .connect({
-              environmentId: Schema.decodeUnknownSync(EnvironmentId)(
-                connection.environmentId,
-              ),
-              label: connection.label,
-              socketUrl: connection.socketUrl,
-            })
-            .pipe(Effect.provideService(Scope.Scope, scope)),
+        const connectAbort = new AbortController();
+        const session = await withTransportTimeout(
+          runEffect(
+            factory
+              .connect({
+                environmentId: Schema.decodeUnknownSync(EnvironmentId)(
+                  connection.environmentId,
+                ),
+                label: connection.label,
+                socketUrl: connection.socketUrl,
+              })
+              .pipe(Effect.provideService(Scope.Scope, scope)),
+            connectAbort.signal,
+          ),
+          remainingMillis(deadline),
+          undefined,
+          () => connectAbort.abort(),
         );
-        await runEffect(session.ready);
+        const readyAbort = new AbortController();
+        await withTransportTimeout(
+          runEffect(session.ready, readyAbort.signal),
+          remainingMillis(deadline),
+          undefined,
+          () => readyAbort.abort(),
+        );
         return {
           dispatchCommand: (command) =>
             runEffect(
@@ -239,15 +349,15 @@ export function createDefaultSessionFactory(
           close,
         };
       } catch (error) {
-        await close().catch(() => undefined);
-        throw error;
+        startBestEffortCleanup(close);
+        throw adapterError(error, "transport_unavailable");
       }
     },
   };
 }
 
-async function closeQuietly(session: RuntimeClientSession): Promise<void> {
-  await session.close().catch(() => undefined);
+function closeQuietly(session: RuntimeClientSession): void {
+  startBestEffortCleanup(() => session.close());
 }
 
 function latestVersionAt<T extends { readonly sequence: number }>(
@@ -468,6 +578,7 @@ async function catchUpDetailThrough(
   threadId: string,
   afterSequence: number,
   versions: VersionedDetail[],
+  deadline: number,
 ): Promise<{ readonly deleted: boolean }> {
   const iterator = session
     .subscribeThread(
@@ -482,7 +593,10 @@ async function catchUpDetailThrough(
     while (true) {
       let next: IteratorResult<OrchestrationThreadStreamItem>;
       try {
-        next = await iterator.next();
+        next = await withTransportTimeout(
+          iterator.next(),
+          remainingMillis(deadline),
+        );
       } catch (error) {
         throw adapterError(error, "transport_unavailable");
       }
@@ -494,7 +608,7 @@ async function catchUpDetailThrough(
       if (update.synchronized) return { deleted: false };
     }
   } finally {
-    await iterator.return?.().catch(() => undefined);
+    startBestEffortCleanup(() => iterator.return?.());
   }
 }
 
@@ -502,6 +616,7 @@ async function catchUpShellThrough(
   session: RuntimeClientSession,
   afterSequence: number,
   versions: VersionedShell[],
+  deadline: number,
 ): Promise<{ readonly snapshotSequence: number | undefined }> {
   const iterator = session
     .subscribeShell({
@@ -514,7 +629,10 @@ async function catchUpShellThrough(
     while (true) {
       let next: IteratorResult<OrchestrationShellStreamItem>;
       try {
-        next = await iterator.next();
+        next = await withTransportTimeout(
+          iterator.next(),
+          remainingMillis(deadline),
+        );
       } catch (error) {
         throw adapterError(error, "transport_unavailable");
       }
@@ -532,7 +650,7 @@ async function catchUpShellThrough(
       }
     }
   } finally {
-    await iterator.return?.().catch(() => undefined);
+    startBestEffortCleanup(() => iterator.return?.());
   }
 }
 
@@ -541,7 +659,9 @@ async function alignInitialVersions(
   threadId: string,
   detailVersions: VersionedDetail[],
   shellVersions: VersionedShell[],
+  timeoutMs: number,
 ): Promise<{ readonly sequence: number; readonly deleted: boolean }> {
+  const deadline = Date.now() + timeoutMs;
   let detailValidatedThrough = detailVersions.at(-1)!.sequence;
   let shellValidatedThrough = shellVersions.at(-1)!.sequence;
   let targetSequence = Math.max(detailValidatedThrough, shellValidatedThrough);
@@ -556,6 +676,7 @@ async function alignInitialVersions(
         threadId,
         detailValidatedThrough,
         detailVersions,
+        deadline,
       );
       if (result.deleted) {
         return { sequence: targetSequence, deleted: true };
@@ -567,6 +688,7 @@ async function alignInitialVersions(
         session,
         shellValidatedThrough,
         shellVersions,
+        deadline,
       );
       shellValidatedThrough = targetSequence;
       if (
@@ -709,6 +831,10 @@ async function* reconcileThread(
           threadId,
           detailVersions,
           shellVersions,
+          positiveBound(
+            options.alignmentTimeoutMs,
+            DEFAULT_ALIGNMENT_TIMEOUT_MS,
+          ),
         );
         if (alignment.deleted) return;
         alignedInitialSequence = alignment.sequence;
@@ -792,10 +918,8 @@ async function* reconcileThread(
     }
     if (detailFailure !== undefined) throw detailFailure;
   } finally {
-    await Promise.allSettled([
-      detailIterator.return?.(),
-      shellIterator.return?.(),
-    ]);
+    startBestEffortCleanup(() => detailIterator.return?.());
+    startBestEffortCleanup(() => shellIterator.return?.());
   }
 }
 
@@ -832,14 +956,14 @@ async function readShellSnapshot(
       }
     }
   } finally {
-    await iterator.return?.().catch(() => undefined);
+    startBestEffortCleanup(() => iterator.return?.());
   }
 }
 
 function projectCommand(
   input: NativeCreateProjectInput,
 ): ClientOrchestrationCommand {
-  return Schema.decodeUnknownSync(ClientOrchestrationCommand)({
+  return decodeClientCommand({
     type: "project.create",
     commandId: input.commandId,
     projectId: input.projectId,
@@ -854,7 +978,7 @@ function projectCommand(
 function spawnCommand(
   input: NativeStartThreadInput,
 ): ClientOrchestrationCommand {
-  return Schema.decodeUnknownSync(ClientOrchestrationCommand)({
+  return decodeClientCommand({
     type: "thread.turn.start",
     commandId: input.commandId,
     threadId: input.threadId,
@@ -884,7 +1008,7 @@ function spawnCommand(
 }
 
 function turnCommand(input: NativeStartTurnInput): ClientOrchestrationCommand {
-  return Schema.decodeUnknownSync(ClientOrchestrationCommand)({
+  return decodeClientCommand({
     type: "thread.turn.start",
     commandId: input.commandId,
     threadId: input.threadId,
@@ -900,20 +1024,49 @@ function turnCommand(input: NativeStartTurnInput): ClientOrchestrationCommand {
   });
 }
 
+function decodeClientCommand(input: unknown): ClientOrchestrationCommand {
+  try {
+    return Schema.decodeUnknownSync(ClientOrchestrationCommand)(input);
+  } catch {
+    throw new NativeRuntimeAdapterError("command_rejected");
+  }
+}
+
 export function createT3NativeRuntime(
   options: T3NativeRuntimeOptions,
 ): NativeRuntime {
+  const connectionTimeoutMs = positiveBound(
+    options.connectionTimeoutMs,
+    DEFAULT_CONNECTION_TIMEOUT_MS,
+  );
+  const alignmentTimeoutMs = positiveBound(
+    options.alignmentTimeoutMs,
+    DEFAULT_ALIGNMENT_TIMEOUT_MS,
+  );
+  const ownsSessionFactory = options.sessionFactory === undefined;
   const sessionFactory =
-    options.sessionFactory ?? createDefaultSessionFactory();
+    options.sessionFactory ??
+    createDefaultSessionFactory(undefined, connectionTimeoutMs);
 
   const openSession = async (): Promise<RuntimeClientSession> => {
+    const deadline = Date.now() + connectionTimeoutMs;
     try {
-      const socketUrl = await options.acquireSocketUrl();
-      return await sessionFactory.connect({
+      const socketUrl = await withTransportTimeout(
+        Promise.resolve().then(options.acquireSocketUrl),
+        remainingMillis(deadline),
+      );
+      const connectPromise = sessionFactory.connect({
         environmentId: options.environmentId,
         label: options.label,
         socketUrl,
+        timeoutMs: remainingMillis(deadline),
       });
+      if (ownsSessionFactory) return await connectPromise;
+      return await withTransportTimeout(
+        connectPromise,
+        remainingMillis(deadline),
+        closeQuietly,
+      );
     } catch (error) {
       throw adapterError(error, "transport_unavailable");
     }
@@ -928,7 +1081,7 @@ export function createT3NativeRuntime(
     } catch (error) {
       throw dispatchError(error);
     } finally {
-      await closeQuietly(session);
+      closeQuietly(session);
     }
   };
 
@@ -942,7 +1095,7 @@ export function createT3NativeRuntime(
           workspaceRoot: entry.workspaceRoot,
         }));
       } finally {
-        await closeQuietly(session);
+        closeQuietly(session);
       }
     },
     createProject: (input) => dispatch(projectCommand(input)),
@@ -951,12 +1104,14 @@ export function createT3NativeRuntime(
     async getThread(threadId): Promise<NativeThreadSnapshot | undefined> {
       const session = await openSession();
       try {
-        for await (const state of reconcileThread(session, threadId)) {
+        for await (const state of reconcileThread(session, threadId, {
+          alignmentTimeoutMs,
+        })) {
           return state.observation.snapshot;
         }
         return undefined;
       } finally {
-        await closeQuietly(session);
+        closeQuietly(session);
       }
     },
     async *subscribeThread(
@@ -966,14 +1121,18 @@ export function createT3NativeRuntime(
       const session = await openSession();
       try {
         if (input.afterSequence === undefined) {
-          for await (const state of reconcileThread(session, threadId)) {
+          for await (const state of reconcileThread(session, threadId, {
+            alignmentTimeoutMs,
+          })) {
             yield state.observation;
           }
           return;
         }
 
         let initial: ReconciledThreadState | undefined;
-        for await (const state of reconcileThread(session, threadId)) {
+        for await (const state of reconcileThread(session, threadId, {
+          alignmentTimeoutMs,
+        })) {
           initial = state;
           break;
         }
@@ -986,11 +1145,12 @@ export function createT3NativeRuntime(
           seed: initial,
           resumeFromSequence,
           emitAfterSequence: Math.max(input.afterSequence, resumeFromSequence),
+          alignmentTimeoutMs,
         })) {
           yield state.observation;
         }
       } finally {
-        await closeQuietly(session);
+        closeQuietly(session);
       }
     },
   };
