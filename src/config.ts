@@ -5,6 +5,7 @@ export interface ConfigInput {
   readonly effort?: unknown;
   readonly contextWindow?: unknown;
   readonly runtimeMode?: unknown;
+  readonly interactionMode?: unknown;
   readonly [key: string]: unknown;
 }
 
@@ -15,6 +16,7 @@ export interface ExperimentConfig {
   readonly effort: "high";
   readonly contextWindow: "1m";
   readonly runtimeMode: "full-access";
+  readonly interactionMode: "default";
 }
 
 export function createConfig(input: ConfigInput): ExperimentConfig {
@@ -25,6 +27,7 @@ export function createConfig(input: ConfigInput): ExperimentConfig {
     "effort",
     "contextWindow",
     "runtimeMode",
+    "interactionMode",
   ]);
 
   for (const field of Object.keys(input)) {
@@ -75,6 +78,13 @@ export function createConfig(input: ConfigInput): ExperimentConfig {
     throw new TypeError("runtimeMode must be full-access");
   }
 
+  if (input.interactionMode === undefined) {
+    throw new TypeError("interactionMode is required");
+  }
+  if (input.interactionMode !== "default") {
+    throw new TypeError("interactionMode must be default");
+  }
+
   return Object.freeze({
     baseUrl: input.baseUrl,
     provider: input.provider,
@@ -82,5 +92,6 @@ export function createConfig(input: ConfigInput): ExperimentConfig {
     effort: input.effort,
     contextWindow: input.contextWindow,
     runtimeMode: input.runtimeMode,
+    interactionMode: input.interactionMode,
   });
 }

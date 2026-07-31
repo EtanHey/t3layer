@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { AmbiguousDispatchError, createT3Facade } from "../src/facade";
 
+const DISPATCH_MODES = {
+  runtimeMode: "full-access",
+  interactionMode: "default",
+} as const;
+
 describe("spawn", () => {
   test("discovers the project by exact workspace root and starts one explicit atomic turn", async () => {
     const calls: Array<{
@@ -49,6 +54,7 @@ describe("spawn", () => {
     };
     const ids = ["thread-1", "command-1", "message-1"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-30T18:00:00.000Z",
       evidence: (record) => evidence.push(record),
@@ -162,6 +168,7 @@ describe("spawn", () => {
     };
     const ids = ["thread-multibyte", "command-multibyte", "message-multibyte"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
       evidence: (record) => evidence.push(record),
@@ -246,6 +253,7 @@ describe("spawn", () => {
     };
     const ids = ["thread-1", "command-1", "message-1"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
       evidence: (record) => evidence.push(record),
@@ -326,6 +334,7 @@ describe("spawn", () => {
       "message-1",
     ];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-30T18:00:00.000Z",
     });
@@ -422,6 +431,7 @@ describe("spawn", () => {
       "message-stable",
     ];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -501,6 +511,7 @@ describe("spawn", () => {
     };
     const ids = ["thread-stable", "command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-30T18:00:00.000Z",
     });
@@ -566,6 +577,7 @@ describe("spawn", () => {
     };
     const ids = ["thread-stable", "command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -619,6 +631,7 @@ describe("spawn", () => {
     };
     const ids = ["thread-stable", "command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -707,6 +720,7 @@ describe("spawn", () => {
       };
       const ids = ["thread-stable", "command-stable", "message-stable"];
       const facade = createT3Facade(runtime, {
+        ...DISPATCH_MODES,
         id: () => ids.shift()!,
         now: () => "2026-07-31T00:00:00.000Z",
       });
@@ -800,6 +814,7 @@ describe("spawn", () => {
       };
       const ids = ["thread-stable", "command-stable", "message-stable"];
       const facade = createT3Facade(runtime, {
+        ...DISPATCH_MODES,
         id: () => ids.shift()!,
         now: () => "2026-07-31T00:00:00.000Z",
       });

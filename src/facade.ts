@@ -1,3 +1,8 @@
+import type { ExperimentConfig } from "./config";
+
+type RuntimeMode = ExperimentConfig["runtimeMode"];
+type InteractionMode = ExperimentConfig["interactionMode"];
+
 export interface NativeProject {
   readonly projectId: string;
   readonly workspaceRoot: string;
@@ -32,8 +37,8 @@ export interface NativeStartThreadInput {
   readonly title: string;
   readonly message: string;
   readonly modelSelection: ModelSelection;
-  readonly runtimeMode: string;
-  readonly interactionMode: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
   readonly branch: string | null;
   readonly worktreePath: string | null;
   readonly createdAt: string;
@@ -55,6 +60,8 @@ export interface NativeStartTurnInput {
   readonly threadId: string;
   readonly messageId: string;
   readonly message: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
   readonly createdAt: string;
   readonly attachments: readonly [];
 }
@@ -87,9 +94,9 @@ export interface NativeThreadObservation {
 export interface ModelSelection {
   readonly instanceId: string;
   readonly model: string;
-  readonly options: ReadonlyArray<{
+  readonly options?: ReadonlyArray<{
     readonly id: string;
-    readonly value: string;
+    readonly value: string | boolean;
   }>;
 }
 
@@ -98,8 +105,8 @@ export interface SpawnInput {
   readonly title: string;
   readonly message: string;
   readonly modelSelection: ModelSelection;
-  readonly runtimeMode: string;
-  readonly interactionMode: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
   readonly branch: string | null;
   readonly worktreePath: string | null;
 }
@@ -201,7 +208,10 @@ export class FacadeError extends Error {
   }
 }
 
-export interface FacadeOptions {
+export interface FacadeOptions extends Pick<
+  ExperimentConfig,
+  "runtimeMode" | "interactionMode"
+> {
   readonly id?: () => string;
   readonly now?: () => string;
   readonly evidence?: (record: Readonly<Record<string, unknown>>) => void;
@@ -384,10 +394,7 @@ function assertNonEmptyTerminal(snapshot: NativeThreadSnapshot): void {
   }
 }
 
-export function createT3Facade(
-  runtime: NativeRuntime,
-  options: FacadeOptions = {},
-) {
+export function createT3Facade(runtime: NativeRuntime, options: FacadeOptions) {
   const id = options.id ?? defaultId;
   const now = options.now ?? (() => new Date().toISOString());
   const evidence = options.evidence ?? (() => undefined);
@@ -483,7 +490,7 @@ export function createT3Facade(
         modelSelection: {
           instanceId: input.modelSelection.instanceId,
           model: input.modelSelection.model,
-          optionCount: input.modelSelection.options.length,
+          optionCount: input.modelSelection.options?.length ?? 0,
         },
         runtimeMode: input.runtimeMode,
         interactionMode: input.interactionMode,
@@ -570,6 +577,8 @@ export function createT3Facade(
         threadId: agentId,
         messageId,
         message,
+        runtimeMode: options.runtimeMode,
+        interactionMode: options.interactionMode,
         createdAt,
         attachments: [],
       };
@@ -578,6 +587,8 @@ export function createT3Facade(
         commandId,
         threadId: agentId,
         messageId,
+        runtimeMode: options.runtimeMode,
+        interactionMode: options.interactionMode,
         createdAt,
         attachments: 0,
         messageBytes: new TextEncoder().encode(message).byteLength,
