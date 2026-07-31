@@ -210,6 +210,101 @@ describe("wait", () => {
     });
   }
 
+  for (const divergence of [
+    {
+      label: "duplicates the initial snapshot sequence",
+      yieldsAdvancingObservation: false,
+      invalidEnvelopeSequence: 71,
+      invalidSnapshotSequence: 70,
+      expectedLastSequence: 70,
+    },
+    {
+      label: "regresses the snapshot after an accepted observation",
+      yieldsAdvancingObservation: true,
+      invalidEnvelopeSequence: 72,
+      invalidSnapshotSequence: 70,
+      expectedLastSequence: 71,
+    },
+  ] as const) {
+    test(`fails closed when an advancing envelope ${divergence.label}`, async () => {
+      const initial = {
+        threadId: "thread-1",
+        projectId: "project-1",
+        snapshotSequence: 70,
+        session: { status: "running", activeTurnId: "turn-1" },
+        latestTurn: {
+          turnId: "turn-1",
+          status: "running",
+          userMessageId: "message-1",
+          assistantMessage: null,
+        },
+        pendingApproval: null,
+        pendingInput: null,
+      };
+      const advancing = {
+        ...initial,
+        snapshotSequence: 71,
+      };
+      const invalid = {
+        ...initial,
+        snapshotSequence: divergence.invalidSnapshotSequence,
+        pendingApproval: {
+          requestId: "approval-invalid",
+          payload: "x".repeat(20_000),
+        },
+      };
+      const runtime = {
+        async listProjects() {
+          return [];
+        },
+        async createProject() {
+          return { sequence: 1 };
+        },
+        async startThread() {
+          return { sequence: 2 };
+        },
+        async startTurn() {
+          return { sequence: 3 };
+        },
+        async getThread() {
+          return initial;
+        },
+        async *subscribeThread() {
+          if (divergence.yieldsAdvancingObservation) {
+            yield { sequence: 71, snapshot: advancing };
+          }
+          yield {
+            sequence: divergence.invalidEnvelopeSequence,
+            snapshot: invalid,
+          };
+        },
+      };
+      const facade = createT3Facade(runtime);
+      const iterator = facade
+        .wait("thread-1", {
+          kind: "terminal",
+          timeoutMs: 1_000,
+          maxEvidenceBytes: 10_000,
+        })
+        [Symbol.asyncIterator]();
+
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { sequence: 70 },
+        done: false,
+      });
+      if (divergence.yieldsAdvancingObservation) {
+        await expect(iterator.next()).resolves.toMatchObject({
+          value: { sequence: 71 },
+          done: false,
+        });
+      }
+      await expect(iterator.next()).rejects.toMatchObject({
+        code: "transport_unavailable",
+        sequence: divergence.expectedLastSequence,
+      });
+    });
+  }
+
   test("fails closed when the initial lookup returns a different thread", async () => {
     const divergent = {
       threadId: "thread-other",

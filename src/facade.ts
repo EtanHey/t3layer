@@ -722,7 +722,10 @@ export function createT3Facade(
           if (next.value.snapshot.threadId !== agentId) {
             throw new FacadeError("transport_unavailable", next.value.snapshot);
           }
-          if (next.value.sequence <= lastObservationSequence) {
+          if (
+            next.value.sequence !== next.value.snapshot.snapshotSequence ||
+            next.value.sequence <= lastObservationSequence
+          ) {
             throw new FacadeError("transport_unavailable", lastSnapshot);
           }
           lastObservationSequence = next.value.sequence;
