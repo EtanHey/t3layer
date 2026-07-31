@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { FacadeError, createT3Facade, type AgentEvent } from "../src/facade";
 
+const DISPATCH_MODES = {
+  runtimeMode: "full-access",
+  interactionMode: "default",
+} as const;
+
 async function collect(
   iterable: AsyncIterable<AgentEvent>,
 ): Promise<AgentEvent[]> {
@@ -96,7 +101,7 @@ describe("wait", () => {
         throw new Error("wait consumed past completion");
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const events = [];
     for await (const event of facade.wait("thread-1", {
@@ -184,7 +189,7 @@ describe("wait", () => {
           yield { sequence: 70, snapshot: invalid };
         },
       };
-      const facade = createT3Facade(runtime);
+      const facade = createT3Facade(runtime, DISPATCH_MODES);
       const iterator = facade
         .wait("thread-1", {
           kind: "terminal",
@@ -279,7 +284,7 @@ describe("wait", () => {
           };
         },
       };
-      const facade = createT3Facade(runtime);
+      const facade = createT3Facade(runtime, DISPATCH_MODES);
       const iterator = facade
         .wait("thread-1", {
           kind: "terminal",
@@ -337,7 +342,7 @@ describe("wait", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-requested", {
@@ -377,7 +382,7 @@ describe("wait", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-requested", {
@@ -438,7 +443,7 @@ describe("wait", () => {
         yield { sequence: 26, snapshot: divergent };
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-requested", {
@@ -489,7 +494,7 @@ describe("wait", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -543,7 +548,7 @@ describe("wait", () => {
         throw new Error("missing assistant must fail before subscription");
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -602,7 +607,7 @@ describe("wait", () => {
           throw new Error("pending state must stop before subscription");
         },
       };
-      const facade = createT3Facade(runtime);
+      const facade = createT3Facade(runtime, DISPATCH_MODES);
 
       const events = await collect(
         facade.wait("thread-1", {
@@ -652,7 +657,7 @@ describe("wait", () => {
         throw new Error("pending approval must stop before subscription");
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const events = await collect(
       facade.wait("thread-1", {
@@ -705,7 +710,7 @@ describe("wait", () => {
           throw new Error("failed state must stop before subscription");
         },
       };
-      const facade = createT3Facade(runtime);
+      const facade = createT3Facade(runtime, DISPATCH_MODES);
 
       const events = await collect(
         facade.wait("thread-1", {
@@ -756,7 +761,7 @@ describe("wait", () => {
         yield { sequence: 33, snapshot: stopped };
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const events = await collect(
       facade.wait("thread-1", {
@@ -818,7 +823,7 @@ describe("wait", () => {
         yield { sequence: 41, snapshot: completed };
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -870,7 +875,7 @@ describe("wait", () => {
         throw new Error("late terminal lookup must not subscribe");
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
     const startedAt = performance.now();
 
     const result = collect(
@@ -922,7 +927,7 @@ describe("wait", () => {
         yield { sequence: 43, snapshot: running };
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
     const startedAt = performance.now();
 
     const result = collect(
@@ -976,7 +981,7 @@ describe("wait", () => {
         throw new Error(`transport rejected ${credential}`);
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -1030,7 +1035,7 @@ describe("wait", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -1081,7 +1086,7 @@ describe("wait", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -1138,7 +1143,7 @@ describe("wait", () => {
         );
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = collect(
       facade.wait("thread-1", {
@@ -1191,7 +1196,7 @@ describe("wait", () => {
         throw new Error("interrupted state must stop before subscription");
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const events = await collect(
       facade.wait("thread-1", {
@@ -1239,7 +1244,7 @@ describe("wait", () => {
         throw new Error("stopped state must stop before subscription");
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const events = await collect(
       facade.wait("thread-1", {

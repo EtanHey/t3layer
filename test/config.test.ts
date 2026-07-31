@@ -8,6 +8,7 @@ const VALID_CONFIG = {
   effort: "high",
   contextWindow: "1m",
   runtimeMode: "full-access",
+  interactionMode: "default",
 } as const;
 
 describe("createConfig", () => {
@@ -29,6 +30,7 @@ describe("createConfig", () => {
     "effort",
     "contextWindow",
     "runtimeMode",
+    "interactionMode",
   ] as const)("rejects a missing %s", (field) => {
     const input: Record<string, unknown> = { ...VALID_CONFIG };
     delete input[field];
@@ -37,11 +39,16 @@ describe("createConfig", () => {
   });
 
   test.each([
-    ["baseUrl", "http://127.0.0.1:3774", "baseUrl must be http://127.0.0.1:3773"],
+    [
+      "baseUrl",
+      "http://127.0.0.1:3774",
+      "baseUrl must be http://127.0.0.1:3773",
+    ],
     ["provider", "claudeDesktop", "provider must be claudeAgent"],
     ["effort", "medium", "effort must be high"],
     ["contextWindow", "200k", "contextWindow must be 1m"],
     ["runtimeMode", "approval-required", "runtimeMode must be full-access"],
+    ["interactionMode", "plan", "interactionMode must be default"],
   ] as const)("rejects invalid %s", (field, value, message) => {
     expect(() =>
       createConfig({

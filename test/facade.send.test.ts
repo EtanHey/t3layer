@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { AmbiguousDispatchError, createT3Facade } from "../src/facade";
 
+const DISPATCH_MODES = {
+  runtimeMode: "full-access",
+  interactionMode: "default",
+} as const;
+
 describe("send", () => {
   test("reuses the thread with fresh IDs and no bootstrap payload", async () => {
     const calls: unknown[] = [];
@@ -36,6 +41,7 @@ describe("send", () => {
     };
     const ids = ["command-2", "message-2"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-30T18:05:00.000Z",
       evidence: (record) => evidence.push(record),
@@ -49,6 +55,8 @@ describe("send", () => {
         threadId: "thread-1",
         messageId: "message-2",
         message: "secret follow-up",
+        runtimeMode: "full-access",
+        interactionMode: "default",
         createdAt: "2026-07-30T18:05:00.000Z",
         attachments: [],
       },
@@ -67,6 +75,8 @@ describe("send", () => {
         commandId: "command-2",
         threadId: "thread-1",
         messageId: "message-2",
+        runtimeMode: "full-access",
+        interactionMode: "default",
         createdAt: "2026-07-30T18:05:00.000Z",
         attachments: 0,
         messageBytes: 16,
@@ -108,6 +118,7 @@ describe("send", () => {
     };
     const ids = ["command-multibyte", "message-multibyte"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
       evidence: (record) => evidence.push(record),
@@ -122,6 +133,8 @@ describe("send", () => {
         commandId: "command-multibyte",
         threadId: "thread-1",
         messageId: "message-multibyte",
+        runtimeMode: "full-access",
+        interactionMode: "default",
         createdAt: "2026-07-31T00:00:00.000Z",
         attachments: 0,
         messageBytes: 6,
@@ -166,7 +179,7 @@ describe("send", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = facade.send("thread-requested", "follow-up");
     const error = await result.catch((reason: unknown) => reason);
@@ -203,7 +216,7 @@ describe("send", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     const result = facade.send("thread-requested", "follow-up");
 
@@ -268,6 +281,7 @@ describe("send", () => {
     };
     const ids = ["command-2", "message-2"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-30T18:05:00.000Z",
     });
@@ -323,6 +337,7 @@ describe("send", () => {
     };
     const ids = ["command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -336,6 +351,8 @@ describe("send", () => {
       threadId: "thread-1",
       messageId: "message-stable",
       message: "follow-up",
+      runtimeMode: "full-access",
+      interactionMode: "default",
       createdAt: "2026-07-31T00:00:00.000Z",
       attachments: [],
     });
@@ -396,6 +413,7 @@ describe("send", () => {
     };
     const ids = ["command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -450,6 +468,7 @@ describe("send", () => {
     };
     const ids = ["command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -506,6 +525,7 @@ describe("send", () => {
     };
     const ids = ["command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -613,6 +633,7 @@ describe("send", () => {
       };
       const ids = ["command-stable", "message-stable"];
       const facade = createT3Facade(runtime, {
+        ...DISPATCH_MODES,
         id: () => ids.shift()!,
         now: () => "2026-07-31T00:00:00.000Z",
       });
@@ -662,6 +683,7 @@ describe("send", () => {
     };
     const ids = ["command-stable", "message-stable"];
     const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
       id: () => ids.shift()!,
       now: () => "2026-07-31T00:00:00.000Z",
     });
@@ -713,6 +735,7 @@ describe("send", () => {
         },
       };
       const facade = createT3Facade(runtime, {
+        ...DISPATCH_MODES,
         id: () => ids.shift()!,
         evidence: (record) => evidence.push(record),
       });
@@ -765,7 +788,7 @@ describe("send", () => {
         return;
       },
     };
-    const facade = createT3Facade(runtime);
+    const facade = createT3Facade(runtime, DISPATCH_MODES);
 
     await expect(facade.send("thread-1", "duplicate")).rejects.toMatchObject({
       code: "turn_error",
