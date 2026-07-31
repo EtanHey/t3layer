@@ -16,6 +16,7 @@ export interface NativeThreadSnapshot {
     readonly status: string;
     readonly activeTurnId: string | null;
   };
+  readonly latestUserMessageId?: string;
   readonly latestTurn: {
     readonly turnId: string;
     readonly status: string;
@@ -275,10 +276,15 @@ function matchesSpawnIdentity(
   projectId: string,
   messageId: string,
 ): boolean {
+  const observedMessageIds = [
+    snapshot.latestUserMessageId,
+    snapshot.latestTurn?.userMessageId,
+  ].filter((candidate): candidate is string => candidate !== undefined);
   return (
     snapshot.threadId === threadId &&
     snapshot.projectId === projectId &&
-    snapshot.latestTurn?.userMessageId === messageId
+    observedMessageIds.length > 0 &&
+    observedMessageIds.every((candidate) => candidate === messageId)
   );
 }
 

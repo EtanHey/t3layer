@@ -662,6 +662,70 @@ describe("spawn", () => {
     expect(ids).toHaveLength(0);
   });
 
+  test("accepts an exact initial message before the provider assigns a turn id", async () => {
+    const runtime = {
+      async listProjects() {
+        return [{ projectId: "project-selected", workspaceRoot: "/work/app" }];
+      },
+      async createProject() {
+        return { sequence: 1 };
+      },
+      async startThread() {
+        return { sequence: 9 };
+      },
+      async startTurn() {
+        return { sequence: 10 };
+      },
+      async getThread() {
+        return {
+          threadId: "thread-stable",
+          projectId: "project-selected",
+          snapshotSequence: 9,
+          session: { status: "starting", activeTurnId: null },
+          latestUserMessageId: "message-stable",
+          latestTurn: null,
+          pendingApproval: null,
+          pendingInput: null,
+        };
+      },
+      async *subscribeThread() {
+        return;
+      },
+    };
+    const ids = ["thread-stable", "command-stable", "message-stable"];
+    const facade = createT3Facade(runtime, {
+      ...DISPATCH_MODES,
+      id: () => ids.shift()!,
+      now: () => "2026-07-31T00:00:00.000Z",
+    });
+
+    const snapshot = await facade.spawn({
+      workspaceRoot: "/work/app",
+      title: "worker",
+      message: "run once",
+      modelSelection: {
+        instanceId: "codex",
+        model: "gpt-5.6-sol",
+        options: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+    });
+
+    expect(snapshot).toMatchObject({
+      agentId: "thread-stable",
+      projectId: "project-selected",
+      sequence: 9,
+      native: {
+        latestUserMessageId: "message-stable",
+        latestTurn: null,
+      },
+    });
+    expect(ids).toHaveLength(0);
+  });
+
   for (const mismatch of [
     {
       label: "thread",
@@ -679,6 +743,13 @@ describe("spawn", () => {
       label: "initial message",
       threadId: "thread-stable",
       projectId: "project-selected",
+      userMessageId: "message-other",
+    },
+    {
+      label: "inconsistent message identity",
+      threadId: "thread-stable",
+      projectId: "project-selected",
+      latestUserMessageId: "message-stable",
       userMessageId: "message-other",
     },
   ]) {
@@ -704,6 +775,9 @@ describe("spawn", () => {
             projectId: mismatch.projectId,
             snapshotSequence: 9,
             session: { status: "running", activeTurnId: "turn-1" },
+            ...("latestUserMessageId" in mismatch
+              ? { latestUserMessageId: mismatch.latestUserMessageId }
+              : {}),
             latestTurn: {
               turnId: "turn-1",
               status: "running",
