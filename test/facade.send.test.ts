@@ -461,6 +461,61 @@ describe("send", () => {
     expect(ids).toHaveLength(0);
   });
 
+  for (const pendingKind of ["pendingApproval", "pendingInput"] as const) {
+    test(`refuses a new turn while native state reports ${pendingKind}`, async () => {
+      let attempts = 0;
+      const evidence: unknown[] = [];
+      const ids = ["command-unused", "message-unused"];
+      const runtime = {
+        async listProjects() {
+          return [];
+        },
+        async createProject() {
+          return { sequence: 1 };
+        },
+        async startThread() {
+          return { sequence: 2 };
+        },
+        async startTurn() {
+          attempts += 1;
+          return { sequence: 3 };
+        },
+        async getThread(threadId: string) {
+          return {
+            threadId,
+            projectId: "project-1",
+            snapshotSequence: 20,
+            session: { status: "ready", activeTurnId: null },
+            latestTurn: null,
+            pendingApproval:
+              pendingKind === "pendingApproval"
+                ? { requestId: "approval-1" }
+                : null,
+            pendingInput:
+              pendingKind === "pendingInput" ? { requestId: "input-1" } : null,
+          };
+        },
+        async *subscribeThread() {
+          return;
+        },
+      };
+      const facade = createT3Facade(runtime, {
+        id: () => ids.shift()!,
+        evidence: (record) => evidence.push(record),
+      });
+
+      await expect(
+        facade.send("thread-1", "must not dispatch"),
+      ).rejects.toMatchObject({
+        code: "turn_error",
+        sequence: 20,
+      });
+      expect(attempts).toBe(0);
+      expect(ids).toEqual(["command-unused", "message-unused"]);
+      expect(evidence).toEqual([]);
+    });
+  }
+
   test("refuses a second turn while native state reports one in flight", async () => {
     let attempts = 0;
     const runtime = {

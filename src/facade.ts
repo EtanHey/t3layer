@@ -542,7 +542,9 @@ export function createT3Facade(
         current.session.activeTurnId !== null ||
         current.session.status === "starting" ||
         current.session.status === "running" ||
-        current.latestTurn?.status === "running"
+        current.latestTurn?.status === "running" ||
+        current.pendingApproval != null ||
+        current.pendingInput != null
       ) {
         throw new FacadeError("turn_error", current);
       }
