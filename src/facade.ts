@@ -373,6 +373,8 @@ function eventEvidenceBytes(event: AgentEvent): number {
 function assertNonEmptyTerminal(snapshot: NativeThreadSnapshot): void {
   const assistant = snapshot.latestTurn?.assistantMessage;
   if (
+    snapshot.pendingApproval == null &&
+    snapshot.pendingInput == null &&
     snapshot.session.status === "ready" &&
     snapshot.latestTurn?.status === "completed" &&
     (assistant == null ||

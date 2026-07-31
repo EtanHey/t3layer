@@ -560,6 +560,63 @@ describe("wait", () => {
     expect(subscribed).toBe(false);
   });
 
+  for (const pendingKind of ["pendingApproval", "pendingInput"] as const) {
+    test(`yields awaiting_input when a completed empty assistant has ${pendingKind}`, async () => {
+      const pending = {
+        threadId: "thread-1",
+        projectId: "project-1",
+        snapshotSequence: 31,
+        session: { status: "ready", activeTurnId: null },
+        latestTurn: {
+          turnId: "turn-1",
+          status: "completed",
+          userMessageId: "message-1",
+          assistantMessage: { content: "   ", streaming: false },
+        },
+        pendingApproval:
+          pendingKind === "pendingApproval"
+            ? { requestId: "approval-pending" }
+            : null,
+        pendingInput:
+          pendingKind === "pendingInput"
+            ? { requestId: "input-pending" }
+            : null,
+      };
+      const runtime = {
+        async listProjects() {
+          return [];
+        },
+        async createProject() {
+          return { sequence: 1 };
+        },
+        async startThread() {
+          return { sequence: 2 };
+        },
+        async startTurn() {
+          return { sequence: 3 };
+        },
+        async getThread() {
+          return pending;
+        },
+        async *subscribeThread() {
+          throw new Error("pending state must stop before subscription");
+        },
+      };
+      const facade = createT3Facade(runtime);
+
+      const events = await collect(
+        facade.wait("thread-1", {
+          kind: "terminal",
+          timeoutMs: 1_000,
+          maxEvidenceBytes: 10_000,
+        }),
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.lifecycle).toBe("awaiting_input");
+    });
+  }
+
   test("stops on structured pending approval without inspecting provider text", async () => {
     const awaitingApproval = {
       threadId: "thread-1",
