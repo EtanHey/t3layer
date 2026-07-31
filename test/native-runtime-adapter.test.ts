@@ -522,6 +522,85 @@ describe("T3 native runtime adapter", () => {
     expect(closes).toBe(1);
   });
 
+  test("preserves initial user-message identity before a provider turn is assigned", async () => {
+    const unassignedThread = thread(4, {
+      latestTurn: null,
+      messages: [
+        {
+          id: "message-pending",
+          role: "user",
+          text: "start",
+          turnId: null,
+          streaming: false,
+          createdAt: NOW,
+          updatedAt: NOW,
+        },
+      ],
+      session: {
+        threadId: "thread-1",
+        status: "starting",
+        providerName: "codex",
+        providerInstanceId: "codex",
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: NOW,
+      },
+    } as unknown as Partial<OrchestrationThread>);
+    const unassignedShell = {
+      ...shellThread(4),
+      latestTurn: null,
+      session: unassignedThread.session,
+    } as unknown as OrchestrationThreadShell;
+    const runtime = createT3NativeRuntime({
+      environmentId: "environment-1",
+      label: "MacBook Pro",
+      acquireSocketUrl: async () => "ws://127.0.0.1/ephemeral",
+      sessionFactory: {
+        async connect() {
+          return {
+            async dispatchCommand() {
+              return { sequence: 1 };
+            },
+            subscribeShell() {
+              return stream([
+                {
+                  kind: "snapshot",
+                  snapshot: shellSnapshot(4, [unassignedShell]),
+                },
+                { kind: "synchronized" },
+              ]);
+            },
+            subscribeThread() {
+              return stream([
+                {
+                  kind: "snapshot",
+                  snapshot: {
+                    snapshotSequence: 4,
+                    thread: unassignedThread,
+                  },
+                },
+                { kind: "synchronized" },
+              ]);
+            },
+            async close() {},
+          };
+        },
+      },
+    });
+
+    const snapshot = await runtime.getThread("thread-1");
+
+    expect(snapshot).toMatchObject({
+      threadId: "thread-1",
+      projectId: "project-1",
+      snapshotSequence: 4,
+      session: { status: "starting", activeTurnId: null },
+      latestUserMessageId: "message-pending",
+      latestTurn: null,
+    });
+  });
+
   test("reconciles a synchronized detail snapshot ahead of a compatible shell snapshot", async () => {
     const runtime = createT3NativeRuntime({
       environmentId: "environment-1",

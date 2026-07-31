@@ -16,6 +16,7 @@ export interface NativeThreadSnapshot {
     readonly status: string;
     readonly activeTurnId: string | null;
   };
+  readonly latestUserMessageId?: string;
   readonly latestTurn: {
     readonly turnId: string;
     readonly status: string;
@@ -269,6 +270,20 @@ function toAgentSnapshot(snapshot: NativeThreadSnapshot): AgentSnapshot {
   };
 }
 
+function matchesMessageIdentity(
+  snapshot: NativeThreadSnapshot,
+  messageId: string,
+): boolean {
+  const observedMessageIds = [
+    snapshot.latestUserMessageId,
+    snapshot.latestTurn?.userMessageId,
+  ].filter((candidate): candidate is string => candidate !== undefined);
+  return (
+    observedMessageIds.length > 0 &&
+    observedMessageIds.every((candidate) => candidate === messageId)
+  );
+}
+
 function matchesSpawnIdentity(
   snapshot: NativeThreadSnapshot,
   threadId: string,
@@ -278,7 +293,7 @@ function matchesSpawnIdentity(
   return (
     snapshot.threadId === threadId &&
     snapshot.projectId === projectId &&
-    snapshot.latestTurn?.userMessageId === messageId
+    matchesMessageIdentity(snapshot, messageId)
   );
 }
 
@@ -604,7 +619,7 @@ export function createT3Facade(runtime: NativeRuntime, options: FacadeOptions) {
         );
         if (
           snapshot?.threadId === agentId &&
-          snapshot.latestTurn?.userMessageId === messageId
+          matchesMessageIdentity(snapshot, messageId)
         ) {
           return {
             agentId,
@@ -631,7 +646,7 @@ export function createT3Facade(runtime: NativeRuntime, options: FacadeOptions) {
           );
           if (
             finalSnapshot?.threadId !== agentId ||
-            finalSnapshot.latestTurn?.userMessageId !== messageId
+            !matchesMessageIdentity(finalSnapshot, messageId)
           ) {
             throw retryError;
           }

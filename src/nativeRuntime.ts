@@ -459,6 +459,9 @@ function toNativeSnapshot(
   shell: OrchestrationThreadShell,
 ): NativeThreadSnapshot {
   const latestTurn = detail.latestTurn;
+  const latestUserMessage = [...detail.messages]
+    .reverse()
+    .find((message) => message.role === "user");
   const userMessage =
     latestTurn === null
       ? undefined
@@ -484,6 +487,9 @@ function toNativeSnapshot(
       status: session?.status ?? "unknown",
       activeTurnId: session?.activeTurnId ?? null,
     },
+    ...(latestUserMessage === undefined
+      ? {}
+      : { latestUserMessageId: latestUserMessage.id }),
     latestTurn:
       latestTurn === null
         ? null
