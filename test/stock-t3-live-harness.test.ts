@@ -506,6 +506,19 @@ describe("stock live harness lifecycle", () => {
     expect(await Bun.file(fixture.log).exists()).toBe(false);
   });
 
+  test("execute mode invalidates a prior receipt before preflight can fail", async () => {
+    const fixture = await canaryFixture();
+    await Bun.write(fixture.receipt, '{"success":true}\n');
+
+    const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], {
+      ...fixture.env,
+      T3_STOCK_ROUTE_CANARY_COMMAND: join(fixture.root, "missing-canary-command"),
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(await Bun.file(fixture.receipt).exists()).toBe(false);
+  });
+
   test("SIGINT during execute mode recovers and exits 130", async () => {
     const fixture = await canaryFixture();
     await Bun.write(

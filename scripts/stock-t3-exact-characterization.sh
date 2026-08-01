@@ -12,7 +12,8 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
   exit 2
 fi
 
-if [[ -n $(/usr/bin/git -C "$stock_tree" status --porcelain --untracked-files=all) ]]; then
+status_output=$(/usr/bin/git -C "$stock_tree" status --porcelain --untracked-files=all)
+if [[ -n "$status_output" ]]; then
   echo "ERROR: exact stock worktree is not clean" >&2
   exit 3
 fi
@@ -22,15 +23,25 @@ if [[ -e "$generated_path" ]]; then
   exit 4
 fi
 
+runner_pid=''
+# shellcheck disable=SC2329 # Invoked by the EXIT trap.
 cleanup() {
   rm -f -- "$generated_path"
 }
+# shellcheck disable=SC2329 # Invoked by the INT/TERM traps.
 handle_signal() {
-  exit "$1"
+  local signal=$1
+  local exit_status=$2
+  trap - INT TERM
+  if [[ -n "$runner_pid" ]]; then
+    kill -s "$signal" "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+  fi
+  exit "$exit_status"
 }
 trap cleanup EXIT
-trap 'handle_signal 130' INT
-trap 'handle_signal 143' TERM
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
 
 /bin/cat >"$generated_path" <<'CHARACTERIZATION'
 import {
@@ -213,4 +224,12 @@ if [[ ${T3_STOCK_EXACT_FAIL_AT:-} == after-generated-fixture ]]; then
   exit 91
 fi
 
-(cd "$stock_tree" && corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts)
+(
+  cd "$stock_tree"
+  exec corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts
+) &
+runner_pid=$!
+runner_status=0
+wait "$runner_pid" || runner_status=$?
+runner_pid=''
+exit "$runner_status"

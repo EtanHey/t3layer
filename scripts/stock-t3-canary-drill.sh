@@ -20,6 +20,9 @@ if [[ "$mode" != "--execute" ]]; then
   exit 2
 fi
 
+: "${T3_STOCK_DRILL_RECEIPT_PATH:?required receipt path}"
+rm -f -- "$T3_STOCK_DRILL_RECEIPT_PATH"
+
 : "${T3_STOCK_ROUTE_OFF_COMMAND:?required executable path}"
 : "${T3_STOCK_ROUTE_CANARY_COMMAND:?required executable path}"
 : "${T3_STOCK_ROUTE_PROMOTE_COMMAND:?required executable path}"
@@ -32,7 +35,6 @@ fi
 : "${T3_STOCK_CONFIG_PATH:?required redacted config path}"
 : "${T3_STOCK_APPROVED_ARTIFACT_SHA256:?required approved artifact SHA-256}"
 : "${T3_STOCK_APPROVED_CONFIG_SHA256:?required approved config SHA-256}"
-: "${T3_STOCK_DRILL_RECEIPT_PATH:?required receipt path}"
 
 sha256_file() {
   local path=$1
