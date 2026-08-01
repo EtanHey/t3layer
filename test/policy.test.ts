@@ -308,6 +308,59 @@ describe("bounded orchestration policy", () => {
     policy.close();
   });
 
+  test("chunks far-future deadlines without timing out on timer overflow", async () => {
+    const maxTimerDelayMs = 2_147_483_647;
+    let now = 0;
+    const scheduled: Array<{ callback: () => void; milliseconds: number }> = [];
+    let observedAbort = false;
+    const policy = createOrchestrationPolicy({
+      maxActive: 1,
+      maxActivePerScope: 1,
+      maxQueued: 0,
+      now: () => now,
+      setTimer: (callback, milliseconds) => {
+        scheduled.push({ callback, milliseconds });
+        return scheduled.length;
+      },
+      clearTimer: () => {},
+    });
+    const deadlineMs = maxTimerDelayMs + 1_000;
+
+    const distant = policy.dispatch(
+      { scopeId: "lead", queue: "fail", deadlineMs },
+      ({ signal }) =>
+        new Promise<void>((resolve) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              observedAbort = true;
+              resolve();
+            },
+            { once: true },
+          );
+        }),
+    );
+    void distant.catch(() => {});
+
+    await nextTurn();
+    expect(scheduled.map(({ milliseconds }) => milliseconds)).toEqual([
+      maxTimerDelayMs,
+    ]);
+    now = maxTimerDelayMs;
+    scheduled[0]!.callback();
+    expect(observedAbort).toBe(false);
+    expect(scheduled.map(({ milliseconds }) => milliseconds)).toEqual([
+      maxTimerDelayMs,
+      1_000,
+    ]);
+
+    now = deadlineMs;
+    scheduled[1]!.callback();
+    await expect(distant).rejects.toMatchObject({ code: "timeout" });
+    expect(observedAbort).toBe(true);
+    policy.close();
+  });
+
   test("returns partial fan-out outcomes without exceeding policy caps", async () => {
     const policy = createOrchestrationPolicy({
       maxActive: 2,

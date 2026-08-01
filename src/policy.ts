@@ -7,6 +7,8 @@ import type { ThreadDetailSnapshot } from "./stockT3Contracts";
 
 export type QueuePolicy = "fifo" | "fail";
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 export class PolicyError extends Error {
   constructor(
     readonly code:
@@ -123,6 +125,29 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
     cleanup(task);
     task.controller.abort(error);
     task.reject(error);
+  }
+
+  function expireDeadline(task: DispatchTask<unknown>): void {
+    const error = abortReason("timeout");
+    if (task.state === "queued") {
+      rejectQueued(task, error);
+      pump();
+    } else if (task.state === "running") {
+      task.controller.abort(error);
+    }
+  }
+
+  function scheduleDeadline(task: DispatchTask<unknown>): void {
+    if (task.deadlineMs === undefined || task.state === "settled") return;
+    const remainingMs = task.deadlineMs - now();
+    if (remainingMs <= 0) {
+      expireDeadline(task);
+      return;
+    }
+    task.timer = setTimer(() => {
+      task.timer = undefined;
+      scheduleDeadline(task);
+    }, Math.min(remainingMs, MAX_TIMER_DELAY_MS));
   }
 
   function finishRunning(
@@ -250,17 +275,7 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
         timer: undefined,
       };
       dispatchOptions.signal?.addEventListener("abort", task.onAbort, { once: true });
-      if (task.deadlineMs !== undefined) {
-        task.timer = setTimer(() => {
-          const error = abortReason("timeout");
-          if (task.state === "queued") {
-            rejectQueued(task as DispatchTask<unknown>, error);
-            pump();
-          } else if (task.state === "running") {
-            task.controller.abort(error);
-          }
-        }, Math.max(0, task.deadlineMs - now()));
-      }
+      scheduleDeadline(task as DispatchTask<unknown>);
 
       if (queue.length === 0 && canStart(task as DispatchTask<unknown>)) {
         start(task as DispatchTask<unknown>);
