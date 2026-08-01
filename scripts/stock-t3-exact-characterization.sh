@@ -20,7 +20,12 @@ fi
 cleanup() {
   rm -f -- "$generated_path"
 }
-trap cleanup EXIT INT TERM
+handle_signal() {
+  exit "$1"
+}
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 /bin/cat >"$generated_path" <<'CHARACTERIZATION'
 import {

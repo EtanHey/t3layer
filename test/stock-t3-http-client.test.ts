@@ -93,6 +93,28 @@ describe("stock T3 HTTP client", () => {
     expect(requests[1]?.headers.get("authorization")).toBe("Bearer bearer-secret");
   });
 
+  test("preserves a reverse-proxy path prefix on every stock endpoint", async () => {
+    const paths: string[] = [];
+    const client = createStockT3HttpClient({
+      baseUrl: "https://relay.invalid/t3/environment-one///",
+      bearerToken: "secret",
+      fetch: async (input) => {
+        const path = new URL(input.toString()).pathname;
+        paths.push(path);
+        if (path.endsWith("/.well-known/t3/environment")) return Response.json(descriptor);
+        return Response.json({ snapshotSequence: 0, projects: [], threads: [], updatedAt: "2026-07-31T18:00:00.000Z" });
+      },
+    });
+
+    await client.getDescriptor();
+    await client.getShell();
+
+    expect(paths).toEqual([
+      "/t3/environment-one/.well-known/t3/environment",
+      "/t3/environment-one/api/orchestration/shell",
+    ]);
+  });
+
   test("sanitizes bearer values and response bodies from typed failures", async () => {
     const fetch = async () =>
       new Response(
@@ -225,6 +247,68 @@ describe("stock T3 HTTP client", () => {
       await Promise.allSettled([...occupying, queued]);
     }
     expect(client.observations()).toMatchObject({ inFlight: 0 });
+  });
+
+  test("hands capacity off FIFO without stalling after an expired queued request", async () => {
+    let current = 0;
+    const starts: string[] = [];
+    const releases = new Map<string, () => void>();
+    const clearedTimers: unknown[] = [];
+    const client = createStockT3HttpClient({
+      baseUrl: "http://127.0.0.1:3774",
+      clock: () => current,
+      setTimer: () => Symbol("timer"),
+      clearTimer: (timer) => clearedTimers.push(timer),
+      fetch: async (_input, init) => {
+        const command = JSON.parse(String(init?.body)) as { id: string };
+        starts.push(command.id);
+        await new Promise<void>((resolve) => releases.set(command.id, resolve));
+        return Response.json({ sequence: 1 });
+      },
+    });
+    const occupying = Array.from({ length: 8 }, (_, index) =>
+      client.dispatch({ id: `held-${index}` }),
+    );
+    while (starts.length < 8) await Promise.resolve();
+    const expired = client.dispatch({ id: "expired" }, { deadlineMs: 5 }).catch((error) => error);
+    const first = client.dispatch({ id: "first" }, { deadlineMs: 100 });
+    const second = client.dispatch({ id: "second" }, { deadlineMs: 100 });
+
+    current = 10;
+    releases.get("held-0")?.();
+    for (let spin = 0; spin < 20 && !starts.includes("first"); spin += 1) {
+      await Promise.resolve();
+    }
+    expect(await expired).toMatchObject({
+      code: "transport_unavailable",
+      detail: { reason: "deadline" },
+    });
+    expect(starts).toContain("first");
+    expect(starts).not.toContain("second");
+    expect(client.observations().peakInFlight).toBe(8);
+
+    releases.get("first")?.();
+    for (let spin = 0; spin < 20 && !starts.includes("second"); spin += 1) {
+      await Promise.resolve();
+    }
+    expect(starts).toContain("second");
+
+    releases.get("second")?.();
+    for (let index = 1; index < 8; index += 1) releases.get(`held-${index}`)?.();
+    await Promise.all([...occupying, first, second]);
+    expect(client.observations()).toMatchObject({ inFlight: 0, peakInFlight: 8 });
+    expect(clearedTimers).toHaveLength(11);
+  });
+
+  test("bounds the retained endpoint trace while preserving the total request count", async () => {
+    const client = createStockT3HttpClient({
+      baseUrl: "http://127.0.0.1:3774",
+      fetch: async () => Response.json(descriptor),
+    });
+    for (let index = 0; index < 2_050; index += 1) await client.getDescriptor();
+
+    expect(client.observations()).toMatchObject({ requestCount: 2_050 });
+    expect(client.observations().endpointStatusTrace).toHaveLength(2_048);
   });
 
   test.each([

@@ -5,7 +5,7 @@ import {
   validateProofEnvelope,
 } from "../src/stockProof";
 
-const [command, source, first, second] = process.argv.slice(2);
+const [command, source, first, second, third] = process.argv.slice(2);
 if (!command || !source) throw new TypeError("usage: stock-proof-cli.ts <command> <source> ...");
 const value = await Bun.file(source).json();
 
@@ -14,7 +14,7 @@ if (command === "validate-provisional") {
   canonicalProvisionalProof(value, first);
 } else if (command === "publish") {
   if (!first || !second) throw new TypeError("output path and expected identity are required");
-  const candidateSha = process.argv[6];
+  const candidateSha = third;
   if (!candidateSha) throw new TypeError("candidate SHA is required");
   const checksum = await proofChecksum(value);
   await Bun.write(first, canonicalProofEnvelopeJson(value, checksum));

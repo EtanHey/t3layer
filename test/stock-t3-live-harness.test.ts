@@ -54,6 +54,12 @@ async function canaryFixture(prefix = "t3layer-canary.") {
   const config = join(root, "config.json");
   await Bun.write(artifact, "immutable artifact\n");
   await Bun.write(config, '{"schema":"stock-http-v1","acceleration":"off"}\n');
+  const artifactDigest = new Bun.CryptoHasher("sha256")
+    .update(await Bun.file(artifact).arrayBuffer())
+    .digest("hex");
+  const configDigest = new Bun.CryptoHasher("sha256")
+    .update(await Bun.file(config).arrayBuffer())
+    .digest("hex");
   return {
     root,
     log,
@@ -71,6 +77,8 @@ async function canaryFixture(prefix = "t3layer-canary.") {
       T3_STOCK_CANCEL_WAITS_COMMAND: paths.cancel!,
       T3_STOCK_ARTIFACT_PATH: artifact,
       T3_STOCK_CONFIG_PATH: config,
+      T3_STOCK_APPROVED_ARTIFACT_SHA256: artifactDigest,
+      T3_STOCK_APPROVED_CONFIG_SHA256: configDigest,
       T3_STOCK_DRILL_RECEIPT_PATH: join(root, "receipt.json"),
     },
   };
@@ -148,7 +156,7 @@ describe("stock live harness lifecycle", () => {
     expect(source).toContain('validate-provisional');
     expect(source).toContain('validate-envelope');
     expect(source).toContain("stat -f '%Lp'");
-    expect(source).toContain('staging_bytes=$(shasum -a 256');
+    expect(source).toContain('staging_bytes=$(sha256_file "$final_staging")');
     expect(source).toContain('if [[ ! -e "$proof_root" ]]');
     expect(source).not.toContain('--header "Authorization: Bearer $http_token"');
     expect(source).toContain('--header @-');
@@ -242,6 +250,32 @@ describe("stock live harness lifecycle", () => {
     });
   });
 
+  test("test-mode teardown failure cannot exit zero or publish a receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-teardown-failure."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const rootRecord = join(root, "proof-root.txt");
+    const runner = join(root, "runner");
+    await Bun.write(
+      runner,
+      `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s' "$2" > '${rootRecord}'\n`,
+    );
+    await chmod(runner, 0o700);
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: runner,
+      T3_STOCK_FAIL_TEARDOWN_AT: "root",
+      T3_STOCK_PROOF_TARGET: target,
+    });
+    const strandedRoot = await Bun.file(rootRecord).text();
+    temporaryRoots.push(strandedRoot);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("cleanup root_removed=false");
+    expect(await Bun.file(target).exists()).toBe(false);
+  });
+
   test("requires caller-held runId and candidateSha instead of trusting a stale path", async () => {
     const prior = canonicalProofBody({ ...completeBody(), runId: "prior-run" });
     expect(() =>
@@ -256,6 +290,11 @@ describe("stock live harness lifecycle", () => {
     const body = completeBody();
     expect(() => canonicalProofBody({ ...body, live: { ...body.live, endpointStatusTrace: [] } })).toThrow(ProofReceiptError);
     expect(() => canonicalProofBody({ ...body, provenance: undefined })).toThrow(ProofReceiptError);
+    expect(() => canonicalProofBody({ ...body, forgedTopLevel: true })).toThrow(ProofReceiptError);
+    expect(() => canonicalProofJson({
+      ...body,
+      live: { ...body.live, unexpectedUndefined: undefined },
+    })).toThrow(ProofReceiptError);
     const checksum = await proofChecksum(body);
     const envelope = { ...body, checksum };
     expect(await validateProofEnvelope(envelope, { runId: body.runId, candidateSha: body.candidateSha })).toEqual(canonicalProofBody(body));
@@ -419,6 +458,42 @@ describe("stock live harness lifecycle", () => {
     const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], fixture.env);
     expect(result.exitCode, result.stderr).toBe(0);
     await expect(Bun.file(fixture.receipt).json()).resolves.toMatchObject({ success: true });
+  });
+
+  test("execute mode rejects unapproved artifact or config bytes before routing", async () => {
+    const fixture = await canaryFixture();
+    const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], {
+      ...fixture.env,
+      T3_STOCK_APPROVED_ARTIFACT_SHA256: "0".repeat(64),
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("approved digest mismatch");
+    expect(await Bun.file(fixture.log).exists()).toBe(false);
+  });
+
+  test("SIGINT during execute mode recovers and exits 130", async () => {
+    const fixture = await canaryFixture();
+    await Bun.write(
+      fixture.paths.canary!,
+      `#!/usr/bin/env bash\nset -euo pipefail\nsleep 0.2\nprintf '%s\\n' canary >> '${fixture.log}'\n`,
+    );
+    await chmod(fixture.paths.canary!, 0o700);
+    const child = Bun.spawn(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...Bun.env, ...fixture.env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    child.kill("SIGINT");
+    const [exitCode, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+    ]);
+
+    expect(exitCode).toBe(130);
+    expect(stderr).toContain("CANARY_RECOVERY:");
   });
 
   test("execute mode rejects artifact drift and environment identity drift", async () => {

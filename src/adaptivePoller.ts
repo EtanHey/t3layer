@@ -64,6 +64,8 @@ export interface AdaptivePollerOptions {
   ) => Promise<ThreadDetailSnapshot | undefined>;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  readonly setTimer?: (callback: () => void, milliseconds: number) => unknown;
+  readonly clearTimer?: (timer: unknown) => void;
   /** Returns a signed jitter delta. It is clamped to +/-10% of the delay. */
   readonly jitter?: (delayMs: number, failureIndex: number) => number;
 }
@@ -100,6 +102,7 @@ interface EnvironmentState {
   lastScheduledStart: number | null;
   lastCompletionAt: number;
   lastShellSequence: number | null;
+  sleepController: AbortController | null;
 }
 
 interface SlotWaiter {
@@ -108,6 +111,7 @@ interface SlotWaiter {
   readonly resolve: (release: () => void) => void;
   readonly reject: (error: PollerError) => void;
   readonly onAbort: () => void;
+  timer: unknown;
 }
 
 function defaultSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -116,9 +120,14 @@ function defaultSleep(milliseconds: number, signal: AbortSignal): Promise<void> 
       reject(new PollerError("cancelled"));
       return;
     }
-    const timer = setTimeout(resolve, Math.max(0, milliseconds));
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, Math.max(0, milliseconds));
     const onAbort = () => {
       clearTimeout(timer);
+      cleanup();
       reject(new PollerError("cancelled"));
     };
     signal.addEventListener("abort", onAbort, { once: true });
@@ -147,6 +156,11 @@ function retryMetadata(error: unknown): { retryAfterMs: number } | null {
 export function createAdaptivePoller(options: AdaptivePollerOptions) {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
+  const setTimer =
+    options.setTimer ??
+    ((callback: () => void, milliseconds: number) => setTimeout(callback, milliseconds));
+  const clearTimer =
+    options.clearTimer ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
   const jitter =
     options.jitter ??
     ((delayMs: number) => delayMs * (Math.random() * 0.2 - 0.1));
@@ -168,6 +182,7 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
     while (httpInFlight < POLICY.maxHttpInFlight && slotWaiters.length > 0) {
       const waiter = slotWaiters.shift()!;
       waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      clearTimer(waiter.timer);
       if (waiter.signal?.aborted) {
         waiter.reject(new PollerError("cancelled"));
         continue;
@@ -200,11 +215,22 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
         onAbort: () => {
           const index = slotWaiters.indexOf(waiter);
           if (index >= 0) slotWaiters.splice(index, 1);
+          clearTimer(waiter.timer);
           reject(new PollerError("cancelled"));
+          pumpSlots();
         },
+        timer: undefined,
       };
       slotWaiters.push(waiter);
       signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      waiter.timer = setTimer(() => {
+        const index = slotWaiters.indexOf(waiter);
+        if (index < 0) return;
+        slotWaiters.splice(index, 1);
+        signal?.removeEventListener("abort", waiter.onAbort);
+        reject(new PollerError("timeout"));
+        pumpSlots();
+      }, Math.max(0, deadlineMs - now()));
       pumpSlots();
     });
   }
@@ -299,6 +325,22 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
     }
   }
 
+  async function sleepUntilNextCycle(
+    state: EnvironmentState,
+    milliseconds: number,
+  ): Promise<void> {
+    const controller = new AbortController();
+    const onEnvironmentAbort = () => controller.abort(state.controller.signal.reason);
+    state.controller.signal.addEventListener("abort", onEnvironmentAbort, { once: true });
+    state.sleepController = controller;
+    try {
+      await sleep(milliseconds, controller.signal);
+    } finally {
+      state.controller.signal.removeEventListener("abort", onEnvironmentAbort);
+      if (state.sleepController === controller) state.sleepController = null;
+    }
+  }
+
   function evaluate<T>(
     state: EnvironmentState,
     subscriber: Subscriber<T>,
@@ -360,14 +402,15 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
       expireSubscribers(state);
       return;
     }
-    detailStarts += 1;
     try {
       const detail = await tracked(
-        () =>
-          options.getThread(threadId, {
+        () => {
+          detailStarts += 1;
+          return options.getThread(threadId, {
             deadlineMs,
             signal: state.controller.signal,
-          }),
+          });
+        },
         deadlineMs,
         state.controller.signal,
       );
@@ -381,6 +424,11 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
       }
     } catch (error) {
       if (state.controller.signal.aborted) return;
+      if (error instanceof PollerError && error.code === "timeout") {
+        state.details.delete(threadId);
+        expireSubscribers(state);
+        return;
+      }
       if (retryMetadata(error) !== null) {
         state.details.delete(threadId);
         return;
@@ -443,7 +491,7 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
         const desiredDelay = nextDelay(state);
         const delay = Math.min(desiredDelay, Math.max(0, earliestDeadline - now()));
         try {
-          await sleep(delay, state.controller.signal);
+          await sleepUntilNextCycle(state, delay);
         } catch {
           if (state.subscribers.size === 0 || closed) break;
         }
@@ -482,6 +530,10 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
         } catch (error) {
           state.lastCompletionAt = now();
           if (state.controller.signal.aborted) break;
+          if (error instanceof PollerError && error.code === "timeout") {
+            expireSubscribers(state);
+            continue;
+          }
           const retry = retryMetadata(error);
           if (retry === null) {
             const failure =
@@ -534,6 +586,7 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
       lastScheduledStart: null,
       lastCompletionAt: now(),
       lastShellSequence: null,
+      sleepController: null,
     };
     environments.set(environmentId, state);
     return state;
@@ -576,6 +629,7 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
         state.cadenceIndex = 0;
         state.failureIndex = 0;
         state.failureDelayMs = null;
+        state.sleepController?.abort(new PollerError("cancelled"));
       }
     },
 
@@ -603,6 +657,7 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
       }
       for (const waiter of slotWaiters.splice(0)) {
         waiter.signal?.removeEventListener("abort", waiter.onAbort);
+        clearTimer(waiter.timer);
         waiter.reject(new PollerError("closed"));
       }
       environments.clear();

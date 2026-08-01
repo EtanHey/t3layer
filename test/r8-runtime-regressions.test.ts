@@ -472,10 +472,7 @@ describe("round 8 all-mutation result invariant over stock HTTP", () => {
     const runtime = createStockT3NativeRuntime({
       baseUrl: "http://stock.invalid",
       fetch: fixture.fetch,
-      id:
-        stage === "project.create"
-          ? ids("create-1", "thread-1", "turn-1", "message-1", "lease-1")
-          : ids("create-1", "thread-1", "turn-1", "message-1", "lease-1"),
+      id: ids("create-1", "thread-1", "turn-1", "message-1", "lease-1"),
       now: () => iso,
     });
 

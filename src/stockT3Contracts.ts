@@ -41,7 +41,7 @@ function nullableString(value: unknown, path: string): string | null {
   return value === null ? null : string(value, path);
 }
 
-function optionalNullableString(value: unknown, path: string): string | null | undefined {
+export function nullableOptional(value: unknown, path: string): string | null | undefined {
   return value === undefined ? undefined : nullableString(value, path);
 }
 
@@ -360,8 +360,4 @@ export function decodeTokenResult(value: unknown): {
     tokenType: literal(input.tokenType, ["Bearer"], "token.tokenType"),
     expiresIn: integer(input.expiresIn, "token.expiresIn"),
   };
-}
-
-export function nullableOptional(value: unknown, path: string): string | null | undefined {
-  return optionalNullableString(value, path);
 }

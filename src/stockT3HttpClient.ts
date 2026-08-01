@@ -77,6 +77,14 @@ function requestBudget(profile: ConnectionProfile): number {
 }
 
 const MAX_HTTP_IN_FLIGHT = 8;
+const MAX_ENDPOINT_STATUS_TRACE = 2_048;
+
+interface CapacityWaiter {
+  readonly boundary: RequestBoundaryOptions;
+  readonly resolve: (release: () => void) => void;
+  readonly reject: (error: StockT3HttpError) => void;
+  readonly onAbort: () => void;
+}
 
 function linkedAttemptSignal(
   external: AbortSignal | undefined,
@@ -112,45 +120,27 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
   let requestCount = 0;
   let inFlight = 0;
   let peakInFlight = 0;
-  const capacityWaiters: Array<() => void> = [];
+  const capacityWaiters: CapacityWaiter[] = [];
 
-  function capacityFailure(signal: AbortSignal | undefined): StockT3HttpError {
-    const reason = signal?.reason;
+  function capacityFailure(boundary: RequestBoundaryOptions): StockT3HttpError {
+    const reason = boundary.signal?.reason;
     return new StockT3HttpError("transport_unavailable", null, {
       reason:
-        reason instanceof DOMException && reason.name === "TimeoutError"
+        (reason instanceof DOMException && reason.name === "TimeoutError") ||
+        (boundary.deadlineMs !== undefined && clock() >= boundary.deadlineMs)
           ? "deadline"
           : "cancelled",
     });
   }
 
-  async function acquireCapacity(boundary: RequestBoundaryOptions): Promise<() => void> {
-    if (boundary.signal?.aborted) {
-      throw capacityFailure(boundary.signal);
+  function trace(entry: EndpointStatusTrace): void {
+    endpointStatusTrace.push(entry);
+    if (endpointStatusTrace.length > MAX_ENDPOINT_STATUS_TRACE) {
+      endpointStatusTrace.splice(0, endpointStatusTrace.length - MAX_ENDPOINT_STATUS_TRACE);
     }
-    if (inFlight >= MAX_HTTP_IN_FLIGHT) {
-      await new Promise<void>((resolve, reject) => {
-        const onAbort = () => {
-          const index = capacityWaiters.indexOf(resume);
-          if (index >= 0) capacityWaiters.splice(index, 1);
-          reject(capacityFailure(boundary.signal));
-        };
-        const resume = () => {
-          boundary.signal?.removeEventListener("abort", onAbort);
-          resolve();
-        };
-        capacityWaiters.push(resume);
-        boundary.signal?.addEventListener("abort", onAbort, { once: true });
-      });
-    }
-    if (
-      boundary.signal?.aborted ||
-      (boundary.deadlineMs !== undefined && clock() >= boundary.deadlineMs)
-    ) {
-      throw new StockT3HttpError("transport_unavailable", null, {
-        reason: boundary.signal?.aborted ? "cancelled" : "deadline",
-      });
-    }
+  }
+
+  function claimCapacity(): () => void {
     inFlight += 1;
     peakInFlight = Math.max(peakInFlight, inFlight);
     let released = false;
@@ -158,8 +148,51 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
       if (released) return;
       released = true;
       inFlight -= 1;
-      capacityWaiters.shift()?.();
+      pumpCapacity();
     };
+  }
+
+  function pumpCapacity(): void {
+    while (inFlight < MAX_HTTP_IN_FLIGHT && capacityWaiters.length > 0) {
+      const waiter = capacityWaiters.shift()!;
+      waiter.boundary.signal?.removeEventListener("abort", waiter.onAbort);
+      if (
+        waiter.boundary.signal?.aborted ||
+        (waiter.boundary.deadlineMs !== undefined && clock() >= waiter.boundary.deadlineMs)
+      ) {
+        waiter.reject(capacityFailure(waiter.boundary));
+        continue;
+      }
+      waiter.resolve(claimCapacity());
+    }
+  }
+
+  async function acquireCapacity(boundary: RequestBoundaryOptions): Promise<() => void> {
+    if (
+      boundary.signal?.aborted ||
+      (boundary.deadlineMs !== undefined && clock() >= boundary.deadlineMs)
+    ) {
+      throw capacityFailure(boundary);
+    }
+    if (inFlight < MAX_HTTP_IN_FLIGHT && capacityWaiters.length === 0) {
+      return claimCapacity();
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: CapacityWaiter = {
+        boundary,
+        resolve,
+        reject,
+        onAbort: () => {
+          const index = capacityWaiters.indexOf(waiter);
+          if (index >= 0) capacityWaiters.splice(index, 1);
+          reject(capacityFailure(boundary));
+          pumpCapacity();
+        },
+      };
+      capacityWaiters.push(waiter);
+      boundary.signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      pumpCapacity();
+    });
   }
 
   async function requestJson(
@@ -178,7 +211,6 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
     }
     const attempt = linkedAttemptSignal(boundary.signal, timeoutMs, setTimer, clearTimer);
     const method = init.method ?? "GET";
-    requestCount += 1;
     let releaseCapacity: (() => void) | undefined;
     try {
       releaseCapacity = await acquireCapacity({ ...boundary, signal: attempt.signal });
@@ -188,8 +220,12 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
       if (authenticated && options.bearerToken !== undefined) {
         headers.set("authorization", `Bearer ${options.bearerToken}`);
       }
-      const response = await fetchImpl(new URL(path, baseUrl), { ...init, headers, signal: attempt.signal });
-      endpointStatusTrace.push({ method, path, status: response.status });
+      requestCount += 1;
+      const response = await fetchImpl(
+        new URL(path.replace(/^\/+/, ""), baseUrl),
+        { ...init, headers, signal: attempt.signal },
+      );
+      trace({ method, path, status: response.status });
       let body: unknown;
       try {
         const text = await response.text();
@@ -208,9 +244,15 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
       if (error instanceof ProtocolMismatchError) {
         throw new StockT3HttpError("protocol_mismatch", null, { path: error.path });
       }
-      endpointStatusTrace.push({ method, path, status: null });
+      trace({ method, path, status: null });
       throw new StockT3HttpError("transport_unavailable", null, {
-        reason: boundary.signal?.aborted ? "cancelled" : "request_failed",
+        reason:
+          attempt.signal.reason instanceof DOMException &&
+          attempt.signal.reason.name === "TimeoutError"
+            ? "deadline"
+            : boundary.signal?.aborted
+              ? "cancelled"
+              : "request_failed",
       });
     } finally {
       releaseCapacity?.();

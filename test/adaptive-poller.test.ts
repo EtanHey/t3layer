@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { getEventListeners } from "node:events";
 
 import { createAdaptivePoller } from "../src/adaptivePoller";
 import { StockT3HttpError } from "../src/stockT3HttpClient";
@@ -204,6 +205,141 @@ describe("environment-coalesced adaptive poller", () => {
       500, 1_000, 2_000, 4_000, 8_000, 8_000,
     ]);
     expect(policy.backoffMs(4, 20_000)).toBe(8_000);
+  });
+
+  test("removes each resolved default-sleep abort listener", async () => {
+    let sequence = 0;
+    let maximumAbortListeners = 0;
+    const poller = createAdaptivePoller({
+      getShell: async ({ signal }) => {
+        maximumAbortListeners = Math.max(
+          maximumAbortListeners,
+          signal === undefined ? 0 : getEventListeners(signal, "abort").length,
+        );
+        sequence += 1;
+        return {
+          snapshotSequence: sequence,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-07-31T18:00:00.000Z",
+        };
+      },
+      getThread: async () => undefined,
+    });
+
+    await expect(
+      poller.waitFor({
+        environmentId: "env-listeners",
+        threadId: "thread-listeners",
+        deadlineMs: Date.now() + 2_000,
+        evaluate: ({ shell }) =>
+          shell.snapshotSequence >= 2 ? { done: true, value: "done" } : { done: false },
+      }),
+    ).resolves.toBe("done");
+    expect(maximumAbortListeners).toBeLessThanOrEqual(1);
+    poller.close();
+  }, 3_000);
+
+  test("dispatch observation interrupts stale failure backoff and resumes fast cadence", async () => {
+    let sleepCount = 0;
+    let shellCount = 0;
+    let backoffStarted!: () => void;
+    const enteredBackoff = new Promise<void>((resolve) => {
+      backoffStarted = resolve;
+    });
+    const poller = createAdaptivePoller({
+      sleep: (milliseconds, signal) => {
+        sleepCount += 1;
+        if (sleepCount === 1 || sleepCount >= 3) return Promise.resolve();
+        expect(milliseconds).toBe(500);
+        backoffStarted();
+        return new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+      jitter: () => 0,
+      getShell: async () => {
+        shellCount += 1;
+        if (shellCount === 1) {
+          throw new StockT3HttpError("transport_unavailable", 503, { transient: true });
+        }
+        return {
+          snapshotSequence: shellCount,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-07-31T18:00:00.000Z",
+        };
+      },
+      getThread: async () => undefined,
+    });
+    const wait = poller.waitFor({
+      environmentId: "env-dispatch-wake",
+      threadId: "thread-dispatch-wake",
+      deadlineMs: Date.now() + 2_000,
+      evaluate: ({ shell }) =>
+        shell.snapshotSequence >= 2 ? { done: true, value: "done" } : { done: false },
+    });
+    await enteredBackoff;
+    poller.dispatchObserved("env-dispatch-wake");
+
+    try {
+      const outcome = await Promise.race([
+        wait,
+        new Promise<string>((resolve) => setTimeout(() => resolve("stalled"), 100)),
+      ]);
+      expect(outcome).toBe("done");
+      expect(sleepCount).toBe(2);
+    } finally {
+      poller.close();
+      await Promise.allSettled([wait]);
+    }
+  });
+
+  test("a detail-slot timeout expires only the earliest subscriber", async () => {
+    let current = 0;
+    let scriptedNow: number[] = [];
+    let shellSequence = 0;
+    const now = () => {
+      const next = scriptedNow.shift();
+      if (next !== undefined) current = next;
+      return current;
+    };
+    const poller = createAdaptivePoller({
+      now,
+      sleep: async (milliseconds) => {
+        current += milliseconds;
+      },
+      getShell: async () => ({
+        snapshotSequence: ++shellSequence,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-07-31T18:00:00.000Z",
+      }),
+      getThread: async () => ({ ...emptyDetail, snapshotSequence: shellSequence }),
+    });
+    const earliest = poller.waitFor({
+      environmentId: "env-detail-deadline",
+      threadId: "thread-1",
+      deadlineMs: 251,
+      evaluate: ({ detail }) =>
+        detail === undefined ? { done: false, detail: true } : { done: true, value: "earliest" },
+    }).catch((error) => error);
+    const survivor = poller.waitFor({
+      environmentId: "env-detail-deadline",
+      threadId: "thread-1",
+      deadlineMs: 2_000,
+      evaluate: ({ detail }) => {
+        if (detail === undefined) {
+          if (shellSequence === 1) scriptedNow = [250, 250, 250, 251];
+          return { done: false, detail: true };
+        }
+        return { done: true, value: "survivor" };
+      },
+    });
+
+    await expect(earliest).resolves.toMatchObject({ code: "timeout" });
+    await expect(survivor).resolves.toBe("survivor");
+    poller.close();
   });
 
   test("coalesces same-thread detail work and fans one observation to every waiter", async () => {

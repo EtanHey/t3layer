@@ -30,7 +30,18 @@ fi
 : "${T3_STOCK_CANCEL_WAITS_COMMAND:?required executable path}"
 : "${T3_STOCK_ARTIFACT_PATH:?required artifact path}"
 : "${T3_STOCK_CONFIG_PATH:?required redacted config path}"
+: "${T3_STOCK_APPROVED_ARTIFACT_SHA256:?required approved artifact SHA-256}"
+: "${T3_STOCK_APPROVED_CONFIG_SHA256:?required approved config SHA-256}"
 : "${T3_STOCK_DRILL_RECEIPT_PATH:?required receipt path}"
+
+sha256_file() {
+  local path=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | /usr/bin/awk '{print $1}'
+  else
+    shasum -a 256 "$path" | /usr/bin/awk '{print $1}'
+  fi
+}
 
 commands=(
   "$T3_STOCK_ROUTE_OFF_COMMAND"
@@ -53,8 +64,12 @@ if [[ ! -f "$T3_STOCK_ARTIFACT_PATH" || ! -f "$T3_STOCK_CONFIG_PATH" ]]; then
   exit 2
 fi
 
-artifact_digest=$(shasum -a 256 "$T3_STOCK_ARTIFACT_PATH" | /usr/bin/awk '{print $1}')
-config_before=$(shasum -a 256 "$T3_STOCK_CONFIG_PATH" | /usr/bin/awk '{print $1}')
+artifact_digest=$(sha256_file "$T3_STOCK_ARTIFACT_PATH")
+config_before=$(sha256_file "$T3_STOCK_CONFIG_PATH")
+if [[ "$artifact_digest" != "$T3_STOCK_APPROVED_ARTIFACT_SHA256" || "$config_before" != "$T3_STOCK_APPROVED_CONFIG_SHA256" ]]; then
+  echo "ERROR: approved digest mismatch" >&2
+  exit 2
+fi
 command_statuses='[]'
 descriptor_evidence='[]'
 thread_evidence='[]'
@@ -66,8 +81,9 @@ expected_thread_id=''
 cancellation_evidence=''
 
 verify_artifact() {
-  artifact_stage=$1
-  current_digest=$(shasum -a 256 "$T3_STOCK_ARTIFACT_PATH" | /usr/bin/awk '{print $1}')
+  local artifact_stage=$1
+  local current_digest
+  current_digest=$(sha256_file "$T3_STOCK_ARTIFACT_PATH")
   artifact_evidence=$(/usr/bin/jq -c --arg stage "$artifact_stage" --arg digest "$current_digest" '. + [{stage:$stage,digest:$digest}]' <<<"$artifact_evidence")
   if [[ "$current_digest" != "$artifact_digest" ]]; then
     echo "ERROR: artifact drift detected at $artifact_stage" >&2
@@ -80,9 +96,9 @@ record_status() {
 }
 
 run_step() {
-  step_name=$1
-  step_command=$2
-  step_status=0
+  local step_name=$1
+  local step_command=$2
+  local step_status=0
   "$step_command" || step_status=$?
   record_status "$step_name" "$step_status"
   if [[ "$step_status" -ne 0 ]]; then return "$step_status"; fi
@@ -94,16 +110,17 @@ run_step() {
 }
 
 recover() {
-  exit_status=$?
+  local exit_status=$?
+  if [[ $# -eq 1 ]]; then exit_status=$1; fi
   trap - EXIT INT TERM
   if [[ "$drill_complete" != true && "$recovery_armed" == true ]]; then
-    prior_status=0
+    local prior_status=0
     "$T3_STOCK_ROUTE_PRIOR_CONFIG_COMMAND" || prior_status=$?
     record_status recovery-prior-config "$prior_status"
-    off_status=0
+    local off_status=0
     "$T3_STOCK_ROUTE_OFF_COMMAND" || off_status=$?
     record_status recovery-off "$off_status"
-    cancel_status=0
+    local cancel_status=0
     "$T3_STOCK_CANCEL_WAITS_COMMAND" >/dev/null || cancel_status=$?
     record_status recovery-cancel-waits "$cancel_status"
     echo "CANARY_RECOVERY: prior_config=$prior_status routing_off=$off_status cancel_waits=$cancel_status" >&2
@@ -111,11 +128,18 @@ recover() {
   exit "$exit_status"
 }
 
+handle_signal() {
+  recover "$1"
+}
+
 # Recovery is armed before the first routing mutation.
-trap recover EXIT INT TERM
+trap recover EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 verify_health() {
-  stage=$1
+  local stage=$1
+  local descriptor current_environment_id thread current_thread_id
   run_step "$stage-readiness" "$T3_STOCK_READINESS_COMMAND"
   descriptor=$("$T3_STOCK_DESCRIPTOR_COMMAND")
   if ! /usr/bin/jq -e 'type == "object" and (.environmentId|type == "string" and length > 0) and (.serverVersion|type == "string" and length > 0)' <<<"$descriptor" >/dev/null; then
@@ -156,7 +180,7 @@ verify_health canary
 run_step route-promote "$T3_STOCK_ROUTE_PROMOTE_COMMAND"
 verify_health promoted
 run_step restore-prior-config "$T3_STOCK_ROUTE_PRIOR_CONFIG_COMMAND"
-config_after_restore=$(shasum -a 256 "$T3_STOCK_CONFIG_PATH" | /usr/bin/awk '{print $1}')
+config_after_restore=$(sha256_file "$T3_STOCK_CONFIG_PATH")
 if [[ "$config_after_restore" != "$config_before" ]]; then
   echo "ERROR: prior configuration digest was not restored" >&2
   exit 2
@@ -176,7 +200,7 @@ if [[ ${T3_STOCK_FAIL_AT:-} == cancel-waits ]]; then
   exit 91
 fi
 verify_artifact cancel-waits
-config_after=$(shasum -a 256 "$T3_STOCK_CONFIG_PATH" | /usr/bin/awk '{print $1}')
+config_after=$(sha256_file "$T3_STOCK_CONFIG_PATH")
 [[ "$config_after" == "$config_before" ]]
 
 receipt_dir=$(dirname "$T3_STOCK_DRILL_RECEIPT_PATH")
@@ -195,7 +219,7 @@ chmod 600 "$body_staging" "$staging"
   --argjson artifacts "$artifact_evidence" \
   --argjson cancellation "$cancellation_evidence" \
   '{success:true,transitions:$transitions,artifactDigest:$digest,configDigestBefore:$before,configDigestAfter:$after,schema:"stock-http-v1",acceleration:"off",cancellation:$cancellation,commandStatuses:$statuses,descriptors:$descriptors,threadReadability:$threads,artifactChecks:$artifacts}' >"$body_staging"
-checksum=$(shasum -a 256 "$body_staging" | /usr/bin/awk '{print $1}')
+checksum=$(sha256_file "$body_staging")
 /usr/bin/jq -cS --arg checksum "$checksum" '. + {checksum:$checksum}' "$body_staging" >"$staging"
 mv -f -- "$staging" "$T3_STOCK_DRILL_RECEIPT_PATH"
 chmod 600 "$T3_STOCK_DRILL_RECEIPT_PATH"
@@ -206,12 +230,13 @@ if [[ $(/usr/bin/stat -f '%Lp' "$T3_STOCK_DRILL_RECEIPT_PATH") != 600 ]]; then
 fi
 reread_body=$(mktemp "$receipt_dir/.stock-t3-drill-reread.XXXXXX")
 /usr/bin/jq -cS 'del(.checksum)' "$T3_STOCK_DRILL_RECEIPT_PATH" >"$reread_body"
-reread_checksum=$(shasum -a 256 "$reread_body" | /usr/bin/awk '{print $1}')
+reread_checksum=$(sha256_file "$reread_body")
 rm -f -- "$reread_body"
 if [[ "$reread_checksum" != "$checksum" ]] || ! /usr/bin/jq -e --arg checksum "$checksum" '.success == true and .schema == "stock-http-v1" and .acceleration == "off" and .checksum == $checksum and .cancellation.replayed == 0' "$T3_STOCK_DRILL_RECEIPT_PATH" >/dev/null; then
   echo "ERROR: canary receipt checksum or reread mismatch" >&2
   exit 2
 fi
 drill_complete=true
+recovery_armed=false
 trap - EXIT INT TERM
 echo "STOCK_T3_CANARY_DRILL: PASS"

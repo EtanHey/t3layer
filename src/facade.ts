@@ -11,12 +11,27 @@ export {
   allocateProjectCreateIdentity,
   canonicalizeWorkspaceRoot,
   parseProjectCreateIdentity,
+  StockRuntimeError,
 } from "./nativeRuntime";
 export type {
+  AgentRef,
+  CreateAttemptReceipt,
+  CreateReconciliationPending,
+  CreateReconciliationState,
   ProjectCreateIdentity,
   ProjectCreateIdentityAllocationOptions,
   ProjectCreateIdentityExpectation,
   ProjectCreateIdentityInput,
+  RetryState,
+  RuntimeModelSelection,
+  RuntimeOperationOptions,
+  SanitizedRetryError,
+  SpawnResult,
+  StockRuntimeErrorCode,
+  StockSpawnInput,
+  T3NativeRuntime,
+  ThreadCreateReceipt,
+  TurnReceipt,
   WorkspaceCanonicalizationOptions,
 } from "./nativeRuntime";
 
@@ -37,5 +52,8 @@ export function createStockT3Facade(runtime: T3NativeRuntime) {
     observe: (ref: AgentRef, options?: RuntimeOperationOptions) =>
       runtime.observe(ref, options),
     releaseReceipt: (receipt: TurnReceipt) => runtime.releaseReceipt(receipt),
+    pollMetrics: () => runtime.pollMetrics(),
+    httpObservations: () => runtime.httpObservations(),
+    close: () => runtime.close(),
   });
 }

@@ -57,6 +57,10 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
     if (detail === undefined) throw new Error("live thread disappeared before receipt capture");
     const http = runtime.httpObservations();
     const polls = runtime.pollMetrics();
+    const requiredSequence = (value: number | null, label: string): number => {
+      if (value === null) throw new Error(`${label} accepted sequence is required`);
+      return value;
+    };
 
     const provisional = canonicalProvisionalProof({
         provisional: true,
@@ -75,9 +79,9 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
           followupMessageId: sent.messageId,
         },
         sequences: {
-          create: spawned.createReceipt.acceptedSequence,
-          initial: spawned.turnReceipt.acceptedSequence,
-          followup: sent.acceptedSequence,
+          create: requiredSequence(spawned.createReceipt.acceptedSequence, "create"),
+          initial: requiredSequence(spawned.turnReceipt.acceptedSequence, "initial"),
+          followup: requiredSequence(sent.acceptedSequence, "followup"),
         },
         terminalKinds: [first.kind, second.kind],
         counters: {

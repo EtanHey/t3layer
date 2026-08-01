@@ -22,6 +22,23 @@ run_id=''
 finalizer_source=''
 test_mode=${T3_STOCK_HARNESS_TEST_MODE:-0}
 
+sha256_file() {
+  local path=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | /usr/bin/awk '{print $1}'
+  else
+    shasum -a 256 "$path" | /usr/bin/awk '{print $1}'
+  fi
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | /usr/bin/awk '{print $1}'
+  else
+    shasum -a 256 | /usr/bin/awk '{print $1}'
+  fi
+}
+
 run_finalizer() {
   printf '%s' "$finalizer_source" | bun run - "$@"
 }
@@ -79,9 +96,12 @@ cleanup() {
   elif [[ -z "$stock_tree" || ! -e "$stock_tree" ]]; then
     worktree_removed=true
   fi
-  if [[ "$cleanup_root_valid" == true && -n "$proof_root" && "$proof_root" != / && "$proof_root" != "$HOME" && ! -L "$proof_root" ]]; then
+  if [[ ${T3_STOCK_FAIL_TEARDOWN_AT:-} != root && "$cleanup_root_valid" == true && -n "$proof_root" && "$proof_root" != / && "$proof_root" != "$HOME" && ! -L "$proof_root" ]]; then
     rm -rf -- "$proof_root"
     if [[ ! -e "$proof_root" ]]; then root_removed=true; fi
+  fi
+  if [[ "$cleanup_status" -eq 0 && ("$pid_stopped" != true || "$worktree_removed" != true || "$root_removed" != true) ]]; then
+    cleanup_status=2
   fi
   if [[ "$cleanup_status" -eq 0 && "$proof_ready" == true && "$pid_stopped" == true && "$worktree_removed" == true && "$root_removed" == true ]]; then
     proof_dir=$(dirname "$proof_target")
@@ -113,8 +133,16 @@ cleanup() {
       echo "ERROR: injected failure: after-final-body-validation" >&2
       exit 91
     fi
-    [[ $(/usr/bin/stat -f '%Lp' "$final_staging") == 600 ]]
-    staging_bytes=$(shasum -a 256 "$final_staging" | /usr/bin/awk '{print $1}')
+    if [[ $(/usr/bin/stat -f '%Lp' "$final_staging") != 600 ]]; then
+      rm -f -- "$final_body_staging" "$final_staging"
+      cleanup_status=2
+    fi
+    if [[ "$cleanup_status" -ne 0 ]]; then
+      echo "ERROR: final proof staging mode mismatch" >&2
+      echo "cleanup root_removed=$root_removed worktree_removed=$worktree_removed pid_stopped=$pid_stopped" >&2
+      exit "$cleanup_status"
+    fi
+    staging_bytes=$(sha256_file "$final_staging")
     if ! node -e 'const fs=require("node:fs");const [source,target]=process.argv.slice(1);const fd=fs.openSync(source,"r+");fs.fsyncSync(fd);fs.closeSync(fd);fs.renameSync(source,target);const check=fs.openSync(target,"r");fs.fsyncSync(check);fs.closeSync(check)' "$final_staging" "$proof_target"; then
       rm -f -- "$final_body_staging" "$final_staging"
       exit 2
@@ -126,7 +154,7 @@ cleanup() {
       exit 91
     fi
     chmod 600 "$proof_target"
-    final_bytes=$(shasum -a 256 "$proof_target" | /usr/bin/awk '{print $1}')
+    final_bytes=$(sha256_file "$proof_target")
     if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha"; then
       rm -f -- "$proof_target"
       echo "ERROR: final proof bytes, mode, checksum, identity, or teardown mismatch" >&2
@@ -193,7 +221,7 @@ if [[ "$test_mode" == 1 ]]; then
 else
   candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)
   /usr/bin/git -C "$candidate_repo" archive HEAD | /usr/bin/tar -x -C "$t3layer_clean"
-  artifact_digest=$(/usr/bin/git -C "$candidate_repo" archive HEAD | shasum -a 256 | /usr/bin/awk '{print $1}')
+  artifact_digest=$(/usr/bin/git -C "$candidate_repo" archive HEAD | sha256_stream)
 fi
 run_stage_seam after-archive-extract
 if [[ "$test_mode" != 1 ]]; then
@@ -279,18 +307,20 @@ else
   negative_body="$proof_root/exact-http-negative.json"
   : >"$negative_body"
   chmod 600 "$negative_body"
-  negative_payload=$(/usr/bin/jq -n \
+  negative_request="$proof_root/exact-http-negative-input.json"
+  /usr/bin/jq -n \
   --arg commandId "$negative_command_id" \
   --arg threadId "$negative_thread_id" \
   --arg messageId "$negative_message_id" \
   --arg createdAt "$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')" \
   --arg workspace "$workspace" \
-  '{type:"thread.turn.start",commandId:$commandId,threadId:$threadId,message:{messageId:$messageId,role:"user",text:"negative",attachments:[]},runtimeMode:"full-access",interactionMode:"default",bootstrap:{createThread:{projectId:"00000000-0000-4000-8000-000000000000",title:"negative",modelSelection:{instanceId:"claudeAgent",model:"claude-sonnet-4-5"},runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,createdAt:$createdAt}},createdAt:$createdAt}')
+  '{type:"thread.turn.start",commandId:$commandId,threadId:$threadId,message:{messageId:$messageId,role:"user",text:"negative",attachments:[]},runtimeMode:"full-access",interactionMode:"default",bootstrap:{createThread:{projectId:"00000000-0000-4000-8000-000000000000",title:"negative",modelSelection:{instanceId:"claudeAgent",model:"claude-sonnet-4-5"},runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,createdAt:$createdAt}},createdAt:$createdAt}' >"$negative_request"
+  chmod 600 "$negative_request"
 negative_status=$(authenticated_curl --silent --show-error --output "$negative_body" --write-out '%{http_code}' \
   --max-time 5 \
   --request POST \
   --header 'Content-Type: application/json' \
-  --data "$negative_payload" \
+  --data-binary "@$negative_request" \
   http://127.0.0.1:3774/api/orchestration/dispatch)
   if [[ "$negative_status" != 500 ]] || ! /usr/bin/jq -e '.code == "internal_error" and .reason == "orchestration_dispatch_failed"' "$negative_body" >/dev/null; then
   echo "ERROR: exact HTTP bootstrap negative did not match stock" >&2

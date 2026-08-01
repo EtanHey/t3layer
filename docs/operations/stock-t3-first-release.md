@@ -14,7 +14,10 @@ the stock T3 server.
   config restoration, readiness, descriptor inspection, and an existing-thread
   read, plus a cancellation command that returns redacted
   `{cancelled, replayed: 0}` evidence. Also supply the immutable artifact and
-  redacted configuration files.
+  redacted configuration files. Set `T3_STOCK_APPROVED_ARTIFACT_SHA256` and
+  `T3_STOCK_APPROVED_CONFIG_SHA256` to the independently reviewed 64-character
+  lowercase SHA-256 values; execute mode rejects mismatched bytes before the
+  first routing command.
   The drill refuses shell snippets.
 
 Without a real routing controller and these commands, only `--dry-run` is valid

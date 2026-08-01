@@ -5,6 +5,7 @@ import type {
   StockThreadDetail,
   StockThreadShell,
   ThreadDetailSnapshot,
+  ConnectionProfile,
 } from "./stockT3Contracts";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
@@ -199,6 +200,7 @@ export type StockRuntimeErrorCode =
   | "authentication_failed"
   | "permission_denied"
   | "server_internal"
+  | "internal_error"
   | "transport_unavailable"
   | "protocol_mismatch"
   | "environment_changed"
@@ -245,25 +247,43 @@ function identifier(value: unknown, field: string): string {
   return parsed;
 }
 
-function jsonValue(value: unknown, field: string): unknown {
+function jsonValue(
+  value: unknown,
+  field: string,
+  ancestors: Set<object> = new Set(),
+): unknown {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) identityConflict(`${field}_must_be_json`);
     return value;
   }
-  if (Array.isArray(value)) return value.map((entry, index) => jsonValue(entry, `${field}[${index}]`));
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) identityConflict(`${field}_must_be_acyclic_json`);
+    ancestors.add(value);
+    try {
+      return value.map((entry, index) => jsonValue(entry, `${field}[${index}]`, ancestors));
+    } finally {
+      ancestors.delete(value);
+    }
+  }
   if (typeof value === "object") {
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) identityConflict(`${field}_must_be_json`);
+    if (ancestors.has(value)) identityConflict(`${field}_must_be_acyclic_json`);
+    ancestors.add(value);
     const result: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (entry === undefined) identityConflict(`${field}.${key}_must_be_json`);
-      Object.defineProperty(result, key, {
-        value: jsonValue(entry, `${field}.${key}`),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+    try {
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        if (entry === undefined) identityConflict(`${field}.${key}_must_be_json`);
+        Object.defineProperty(result, key, {
+          value: jsonValue(entry, `${field}.${key}`, ancestors),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
+    } finally {
+      ancestors.delete(value);
     }
     return result;
   }
@@ -288,7 +308,18 @@ export function canonicalizeWorkspaceRoot(
   options: WorkspaceCanonicalizationOptions = {},
 ): string {
   const input = nonBlank(value, "workspace_root").trim();
-  const path = options.platform === "windows" || options.platform === "win32" ? win32 : posix;
+  const requestedPlatform = options.platform === "windows" ? "win32" : options.platform;
+  const localPlatform = process.platform === "win32" ? "win32" : process.platform;
+  const targetPlatform = requestedPlatform ?? localPlatform;
+  const path = targetPlatform === "win32" ? win32 : posix;
+  const crossPlatform = requestedPlatform !== undefined && targetPlatform !== localPlatform;
+  const usesHome = input === "~" || input.startsWith("~/") || input.startsWith("~\\");
+  if (crossPlatform && usesHome && options.homeDirectory === undefined) {
+    identityConflict("workspace_root_cross_platform_home_required");
+  }
+  if (crossPlatform && !path.isAbsolute(input) && !usesHome && options.cwd === undefined) {
+    identityConflict("workspace_root_cross_platform_absolute_required");
+  }
   const home = options.homeDirectory ?? homedir();
   const expanded = input === "~"
     ? home
@@ -407,7 +438,7 @@ export interface StockT3NativeRuntimeOptions {
   readonly baseUrl?: string | URL;
   readonly bearerToken?: string;
   readonly fetch?: FetchLike;
-  readonly connectionProfile?: "local" | "relay" | "tunnel";
+  readonly connectionProfile?: ConnectionProfile;
   readonly id?: () => string;
   readonly now?: () => string;
   readonly clock?: () => number;
@@ -527,7 +558,9 @@ function mapReceivedError(error: unknown): StockRuntimeError {
       return new StockRuntimeError(error.code, { status: error.status });
     }
   }
-  return new StockRuntimeError("transport_unavailable");
+  return new StockRuntimeError("internal_error", {
+    errorName: error instanceof Error ? error.name : typeof error,
+  });
 }
 
 function readFailureEvidence(
@@ -549,16 +582,34 @@ function turnReceiptError(
   return new StockRuntimeError(code, { ...evidence, receipt });
 }
 
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+function canonical(value: unknown, ancestors: Set<object> = new Set()): string {
+  if (value === undefined) return "null";
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) identityConflict("digest_input_must_be_acyclic_json");
+    ancestors.add(value);
+    try {
+      return `[${value.map((entry) => canonical(entry, ancestors)).join(",")}]`;
+    } finally {
+      ancestors.delete(value);
+    }
+  }
   if (typeof value === "object" && value !== null) {
     const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`)
-      .join(",")}}`;
+    if (ancestors.has(record)) identityConflict("digest_input_must_be_acyclic_json");
+    ancestors.add(record);
+    try {
+      return `{${Object.keys(record)
+        .filter((key) => record[key] !== undefined)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonical(record[key], ancestors)}`)
+        .join(",")}}`;
+    } finally {
+      ancestors.delete(record);
+    }
   }
-  return JSON.stringify(value);
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) identityConflict("digest_input_must_be_json");
+  return encoded;
 }
 
 function digestSync(value: unknown): string {
@@ -1564,9 +1615,25 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
         provisionalProjectId: identity.projectId,
       });
     }
-    const workspaceMatches = (value: string): boolean =>
-      workspaceComparisonKey(value, { platform: platform === "unknown" ? undefined : platform }) ===
-      workspaceComparisonKey(input.workspaceRoot, { platform: platform === "unknown" ? undefined : platform });
+    const workspaceMatches = (value: string): boolean => {
+      try {
+        const comparisonPlatform = platform === "unknown" ? undefined : platform;
+        const path = comparisonPlatform === "windows" ? win32 : posix;
+        if (!path.isAbsolute(value.trim())) return false;
+        return workspaceComparisonKey(
+          value,
+          { platform: comparisonPlatform },
+        ) === workspaceComparisonKey(
+          input.workspaceRoot,
+          { platform: comparisonPlatform },
+        );
+      } catch (error) {
+        if (error instanceof StockRuntimeError && error.code === "identity_conflict") {
+          return false;
+        }
+        throw error;
+      }
+    };
     let attempt: ProjectCreateAttemptState | undefined =
       identity === undefined
         ? undefined

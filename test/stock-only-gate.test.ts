@@ -90,4 +90,20 @@ describe("stock-only gate", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("forbidden candidate reference");
   });
+
+  test("fails when the protected historical SHA-256 does not match", async () => {
+    const root = await fixtureRepo({
+      "package.json": "{}\n",
+      "historical.test.ts": "historical evidence\n",
+    });
+    const historical = join(root, "historical.test.ts");
+    const result = await run(
+      ["bash", join(import.meta.dir, "../scripts/check-stock-only.sh")],
+      root,
+      { STOCK_ONLY_HISTORICAL_PATH: historical, STOCK_ONLY_HISTORICAL_SHA256: "0".repeat(64) },
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("historical evidence SHA-256 mismatch");
+  });
 });

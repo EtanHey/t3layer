@@ -13,7 +13,9 @@ describe("exact-stock characterization driver", () => {
     expect(source).toContain(
       "corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts",
     );
-    expect(source).toContain("trap cleanup EXIT INT TERM");
+    expect(source).toContain("trap cleanup EXIT");
+    expect(source).toContain("trap 'handle_signal 130' INT");
+    expect(source).toContain("trap 'handle_signal 143' TERM");
     expect(source).toContain('rm -f -- "$generated_path"');
     expect(source).toContain('if [[ -e "$generated_path" ]]');
     expect(source).toContain("generated characterization path already exists");

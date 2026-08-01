@@ -102,6 +102,19 @@ const EXPECTED_ISOLATED_BASENAMES = Object.freeze([
   "server-home",
   "workspace",
 ]);
+const PROOF_BODY_KEYS = new Set([
+  "runId",
+  "candidateSha",
+  "stockSha",
+  "success",
+  "cleanBeforeBuild",
+  "artifactDigest",
+  "privateResolution",
+  "provenance",
+  "exactHttpNegative",
+  "live",
+  "teardown",
+]);
 
 function record(value: unknown, reason = "not_object"): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -240,6 +253,9 @@ function commandResult(
 
 export function canonicalProofBody(value: unknown): StockProofBody {
   const input = record(value);
+  if (Object.keys(input).some((key) => !PROOF_BODY_KEYS.has(key))) {
+    throw new ProofReceiptError("unknown_top_level_key");
+  }
   if (typeof input.runId !== "string" || input.runId.length < 8) throw new ProofReceiptError("run_id");
   if (typeof input.candidateSha !== "string" || !SHA40.test(input.candidateSha)) throw new ProofReceiptError("candidate_sha");
   if (input.stockSha !== EXPECTED_STOCK_SHA) throw new ProofReceiptError("stock_sha");
@@ -283,12 +299,15 @@ export function validateProofReceipt(value: unknown, expected: ExpectedProofIden
 }
 
 function canonical(value: unknown): string {
+  if (value === undefined) throw new ProofReceiptError("canonical_undefined");
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (typeof value === "object" && value !== null) {
     const input = value as Record<string, unknown>;
     return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${canonical(input[key])}`).join(",")}}`;
   }
-  return JSON.stringify(value);
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new ProofReceiptError("canonical_undefined");
+  return encoded;
 }
 
 export function canonicalProofEnvelopeJson(bodyValue: unknown, checksum: string): string {
