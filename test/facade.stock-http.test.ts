@@ -14,8 +14,8 @@ import type {
   ThreadDetailSnapshot,
 } from "../src/stockT3Contracts";
 import { StockT3HttpError } from "../src/stockT3HttpClient";
-import { createStockT3Facade } from "../src/facade";
-import { WorkerOverlayError } from "../src/overlay";
+import { createStockT3Facade, type StockFacadeSpawnInput } from "../src/facade";
+import { WorkerOverlayError, createWorkerOverlay } from "../src/overlay";
 
 const iso = "2026-07-31T18:00:00.000Z";
 const selection = { instanceId: "claudeAgent", model: "claude-opus-5" };
@@ -117,6 +117,28 @@ function client(overrides: Partial<StockT3RuntimeClient> = {}): StockT3RuntimeCl
   };
 }
 
+function captureOverlayError(operation: () => unknown): WorkerOverlayError {
+  try {
+    operation();
+  } catch (error) {
+    expect(error).toBeInstanceOf(WorkerOverlayError);
+    return error as WorkerOverlayError;
+  }
+  throw new Error("expected a WorkerOverlayError");
+}
+
+async function captureOverlayRejection(
+  operation: () => Promise<unknown>,
+): Promise<WorkerOverlayError> {
+  try {
+    await operation();
+  } catch (error) {
+    expect(error).toBeInstanceOf(WorkerOverlayError);
+    return error as WorkerOverlayError;
+  }
+  throw new Error("expected a WorkerOverlayError");
+}
+
 const spawnInput = {
   workspaceRoot: project.workspaceRoot,
   title: "worker",
@@ -127,6 +149,14 @@ const spawnInput = {
   branch: null,
   worktreePath: null,
 };
+
+// @ts-expect-error Overlay metadata is all-or-nothing: parentRef requires role.
+const parentOnlyFacadeInput: StockFacadeSpawnInput = { ...spawnInput, parentRef: null };
+void parentOnlyFacadeInput;
+
+// @ts-expect-error Overlay metadata is all-or-nothing: role requires parentRef.
+const roleOnlyFacadeInput: StockFacadeSpawnInput = { ...spawnInput, role: "worker" };
+void roleOnlyFacadeInput;
 
 describe("stock HTTP runtime state machine", () => {
   test("exposes the stock runtime through the public facade seam", async () => {
@@ -900,6 +930,27 @@ describe("stock HTTP runtime state machine", () => {
 });
 
 describe("facade worker hierarchy overlay", () => {
+  test("requires role and parentRef together before native dispatch", async () => {
+    let dispatches = 0;
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 1 };
+        },
+      }),
+    });
+    const facade = createStockT3Facade(runtime);
+
+    await expect(
+      facade.spawn({ ...spawnInput, parentRef: null } as unknown as StockFacadeSpawnInput),
+    ).rejects.toMatchObject({ code: "overlay_invalid_role" });
+    await expect(
+      facade.spawn({ ...spawnInput, role: "worker" } as unknown as StockFacadeSpawnInput),
+    ).rejects.toMatchObject({ code: "overlay_invalid_ref" });
+    expect(dispatches).toBe(0);
+  });
+
   test("installs role and parent metadata only after a reconciled stock spawn", async () => {
     const commands: Array<Record<string, unknown>> = [];
     const childDetails = [
@@ -1003,9 +1054,13 @@ describe("facade worker hierarchy overlay", () => {
     phase = "resume";
     const result = await facade.resumeCreateReconciliation(pending, input);
 
-    expect(result.kind).toBe("spawned");
-    expect(facade.getWorker(result.kind === "spawned" ? result.agentRef : pending.provisionalRef))
-      .toMatchObject({ role: "worker", parentRef: null, creation: { source: "spawn" } });
+    if (result.kind !== "spawned") throw new Error("expected a spawned result");
+    expect(result.agentRef).toEqual(pending.provisionalRef);
+    expect(facade.getWorker(result.agentRef)).toMatchObject({
+      role: "worker",
+      parentRef: null,
+      creation: { source: "spawn" },
+    });
     expect(commands.map((command) => command.type)).toEqual([
       "thread.create",
       "thread.turn.start",
@@ -1028,13 +1083,85 @@ describe("facade worker hierarchy overlay", () => {
 
     const restartedProcess = createStockT3Facade(runtime);
     await expect(restartedProcess.observe(ref)).resolves.toMatchObject({ snapshotSequence: 3 });
-    expect(() => restartedProcess.getWorker(ref)).toThrow(WorkerOverlayError);
-    try {
-      restartedProcess.getWorker(ref);
-    } catch (error) {
-      expect(error).toMatchObject({ code: "overlay_unknown" });
-    }
+    expect(captureOverlayError(() => restartedProcess.getWorker(ref))).toMatchObject({
+      code: "overlay_unknown",
+    });
     expect(restartedProcess.listWorkers()).toEqual([]);
+  });
+
+  test("shares an injected overlay and rejects a non-canonical attach target", async () => {
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getThread: async (threadId) =>
+          threadId === "shared" ? detailFor("shared", 3) : undefined,
+      }),
+    });
+    const overlay = createWorkerOverlay();
+    const writer = createStockT3Facade(runtime, { overlay });
+    const reader = createStockT3Facade(runtime, { overlay });
+    const sharedRef = { environmentId: "env-1", threadId: "shared" };
+
+    await writer.attach(sharedRef, { role: "worker", parentRef: null });
+    expect(reader.getWorker(sharedRef)).toMatchObject({ role: "worker", depth: 0 });
+    await expect(
+      reader.attach(
+        { environmentId: "env-1", threadId: "missing" },
+        { role: "worker", parentRef: null },
+      ),
+    ).rejects.toMatchObject({ code: "overlay_canonical_not_found" });
+    expect(reader.listWorkers()).toHaveLength(1);
+  });
+
+  test("preserves a completed stock spawn ref when overlay commit fails", async () => {
+    const commands: Array<Record<string, unknown>> = [];
+    const childDetails = [
+      detailFor("thread-1", 2),
+      detailFor("thread-1", 2),
+      {
+        ...detailFor("thread-1", 4),
+        thread: {
+          ...detailFor("thread-1", 4).thread,
+          messages: [message("message-1", "initial")],
+        },
+      },
+    ];
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => shell(4, [threadIdentity()]),
+        getThread: async (threadId) =>
+          threadId === "parent" ? detailFor("parent", 1) : childDetails.shift(),
+        dispatch: async (command) => {
+          commands.push(command);
+          return { sequence: commands.length === 1 ? 2 : 4 };
+        },
+      }),
+      id: (() => {
+        const ids = ["thread-create-1", "thread-1", "turn-command-1", "message-1", "lease-1"];
+        return () => ids.shift()!;
+      })(),
+      now: () => iso,
+    });
+    const overlay = createWorkerOverlay();
+    const parentRef = { environmentId: "env-1", threadId: "parent" };
+    const createdRef = { environmentId: "env-1", threadId: "thread-1" };
+    overlay.attach(parentRef, { role: "lead", parentRef: createdRef });
+    const facade = createStockT3Facade(runtime, { overlay });
+
+    const error = await captureOverlayRejection(() =>
+      facade.spawn({ ...spawnInput, role: "worker", parentRef }),
+    );
+
+    expect(error).toMatchObject({
+      code: "overlay_cycle",
+      details: { agentRef: createdRef },
+    });
+    expect(commands.map((command) => command.type)).toEqual([
+      "thread.create",
+      "thread.turn.start",
+    ]);
+    expect(captureOverlayError(() => facade.getWorker(createdRef))).toMatchObject({
+      code: "overlay_unknown",
+    });
   });
 
   test("fails missing canonical parents and hierarchy capacity before spawn dispatch", async () => {

@@ -14,6 +14,7 @@ import {
   type WorkerOverlayIdentity,
   type WorkerOverlayOptions,
   type WorkerOverlayRecord,
+  type WorkerOverlayReservation,
 } from "./overlay";
 
 export {
@@ -58,11 +59,18 @@ export type {
   WorkerOverlayReservation,
 } from "./overlay";
 
-export interface StockFacadeSpawnInput extends StockSpawnInput {
-  /** Omit both overlay fields to preserve the stock-only facade behavior. */
-  readonly role?: string;
-  readonly parentRef?: AgentRef | null;
-}
+export type StockFacadeSpawnInput = StockSpawnInput &
+  (
+    | {
+        /** Omit both overlay fields to preserve the stock-only facade behavior. */
+        readonly role?: never;
+        readonly parentRef?: never;
+      }
+    | {
+        readonly role: string;
+        readonly parentRef: AgentRef | null;
+      }
+  );
 
 export interface StockT3FacadeOptions {
   readonly overlay?: WorkerOverlay | WorkerOverlayOptions;
@@ -95,11 +103,23 @@ function stockSpawnInput(input: StockFacadeSpawnInput): StockSpawnInput {
 }
 
 function requestedOverlayIdentity(input: StockFacadeSpawnInput): WorkerOverlayIdentity | null {
-  if (!Object.hasOwn(input, "role") && !Object.hasOwn(input, "parentRef")) return null;
+  const hasRole = Object.hasOwn(input, "role");
+  const hasParentRef = Object.hasOwn(input, "parentRef");
+  if (!hasRole && !hasParentRef) return null;
+  if (typeof input.role !== "string") {
+    throw new WorkerOverlayError("overlay_invalid_role", {
+      reason: "overlay_fields_incomplete",
+    });
+  }
+  if (!hasParentRef || input.parentRef === undefined) {
+    throw new WorkerOverlayError("overlay_invalid_ref", {
+      reason: "overlay_fields_incomplete",
+    });
+  }
   return {
-    role: input.role as string,
+    role: input.role,
     parentRef:
-      input.parentRef == null
+      input.parentRef === null
         ? null
         : Object.freeze({
             environmentId: input.parentRef.environmentId,
@@ -117,6 +137,23 @@ function stableIdentity(identity: WorkerOverlayIdentity): WorkerOverlayIdentity 
     role: identity.role,
     parentRef: identity.parentRef === null ? null : stableRef(identity.parentRef),
   });
+}
+
+function commitSpawnIdentity(
+  reservation: WorkerOverlayReservation,
+  agentRef: AgentRef,
+): void {
+  try {
+    reservation.commit(agentRef, { source: "spawn" });
+  } catch (error) {
+    if (error instanceof WorkerOverlayError) {
+      throw new WorkerOverlayError(error.code, {
+        ...error.details,
+        agentRef: stableRef(agentRef),
+      });
+    }
+    throw error;
+  }
 }
 
 function reconciledRef(result: SpawnResult): AgentRef | null {
@@ -160,7 +197,7 @@ export function createStockT3Facade(
       }
       const result = await runtime.spawn(nativeInput, operation);
       const ref = reconciledRef(result);
-      if (ref !== null) reservation.commit(ref, { source: "spawn" });
+      if (ref !== null) commitSpawnIdentity(reservation, ref);
       return result;
     } finally {
       reservation.release();
@@ -185,7 +222,7 @@ export function createStockT3Facade(
       }
       const result = await runtime.resumeCreateReconciliation(pending, nativeInput, operation);
       const ref = reconciledRef(result);
-      if (ref !== null) reservation.commit(ref, { source: "spawn" });
+      if (ref !== null) commitSpawnIdentity(reservation, ref);
       return result;
     } finally {
       reservation.release();

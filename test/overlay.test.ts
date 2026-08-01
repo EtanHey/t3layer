@@ -113,6 +113,30 @@ describe("process-local worker hierarchy overlay", () => {
     ]);
   });
 
+  test("orders public listings by deterministic scoped-key comparison", () => {
+    const overlay = createWorkerOverlay();
+    const parent = { environmentId: "env-a", threadId: "parent" };
+    overlay.attach(parent, { role: "lead", parentRef: null });
+    overlay.attach(
+      { environmentId: "env-a", threadId: "Z" },
+      { role: "worker", parentRef: parent },
+    );
+    overlay.attach(
+      { environmentId: "env-a", threadId: "a" },
+      { role: "worker", parentRef: parent },
+    );
+
+    expect(overlay.listChildren(parent).map((entry) => entry.ref.threadId)).toEqual([
+      "Z",
+      "a",
+    ]);
+    expect(overlay.listWorkers().map((entry) => entry.ref.threadId)).toEqual([
+      "Z",
+      "a",
+      "parent",
+    ]);
+  });
+
   test("returns defensive records and reports lost metadata as overlay_unknown", () => {
     const ref = { environmentId: "env-a", threadId: "worker" };
     const firstProcess = createWorkerOverlay({ now: () => "2026-08-01T20:00:00.000Z" });
@@ -158,5 +182,57 @@ describe("process-local worker hierarchy overlay", () => {
         ),
       ),
     ).toMatchObject({ code: "overlay_invalid_role" });
+  });
+
+  test("rejects invalid roles and policies and closes reservations", () => {
+    const overlay = createWorkerOverlay();
+    expect(
+      captureOverlayError(() =>
+        overlay.attach(
+          { environmentId: "env-a", threadId: "untrimmed" },
+          { role: "worker ", parentRef: null },
+        ),
+      ),
+    ).toMatchObject({ code: "overlay_invalid_role" });
+    expect(
+      captureOverlayError(() =>
+        overlay.attach(
+          { environmentId: "env-a", threadId: "oversized" },
+          { role: "x".repeat(257), parentRef: null },
+        ),
+      ),
+    ).toMatchObject({ code: "overlay_invalid_role" });
+    expect(
+      captureOverlayError(() => createWorkerOverlay({ maxDepth: -1 })),
+    ).toMatchObject({ code: "overlay_invalid_policy", details: { field: "maxDepth" } });
+    expect(
+      captureOverlayError(() => createWorkerOverlay({ maxDepth: 1.5 })),
+    ).toMatchObject({ code: "overlay_invalid_policy", details: { field: "maxDepth" } });
+
+    const committedRef = { environmentId: "env-a", threadId: "committed" };
+    const committed = overlay.reserve(committedRef, { role: "worker", parentRef: null });
+    committed.commit(committedRef, { source: "spawn" });
+    expect(
+      captureOverlayError(() => committed.commit(committedRef, { source: "spawn" })),
+    ).toMatchObject({ code: "overlay_reservation_closed" });
+
+    const releasedRef = { environmentId: "env-a", threadId: "released" };
+    const released = overlay.reserve(releasedRef, { role: "worker", parentRef: null });
+    released.release();
+    expect(
+      captureOverlayError(() => released.commit(releasedRef, { source: "spawn" })),
+    ).toMatchObject({ code: "overlay_reservation_closed" });
+
+    const plannedRef = { environmentId: "env-a", threadId: "planned" };
+    const planned = overlay.reserve(plannedRef, { role: "worker", parentRef: null });
+    expect(
+      captureOverlayError(() =>
+        planned.commit(
+          { environmentId: "env-a", threadId: "other" },
+          { source: "spawn" },
+        ),
+      ),
+    ).toMatchObject({ code: "overlay_invalid_ref" });
+    planned.release();
   });
 });

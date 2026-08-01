@@ -76,6 +76,12 @@ function scopedKey(ref: AgentRef): string {
   return JSON.stringify([ref.environmentId, ref.threadId]);
 }
 
+function compareScopedKeys(left: AgentRef, right: AgentRef): number {
+  const leftKey = scopedKey(left);
+  const rightKey = scopedKey(right);
+  return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+}
+
 function sameRef(left: AgentRef, right: AgentRef): boolean {
   return left.environmentId === right.environmentId && left.threadId === right.threadId;
 }
@@ -207,8 +213,11 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
     }
   }
 
-  function materialize(record: StoredRecord): WorkerOverlayRecord {
-    const recordDepth = depths().get(scopedKey(record.ref));
+  function materialize(
+    record: StoredRecord,
+    depthByKey: Map<GraphKey, number | null> = depths(),
+  ): WorkerOverlayRecord {
+    const recordDepth = depthByKey.get(scopedKey(record.ref));
     if (recordDepth === undefined) {
       throw new WorkerOverlayError("overlay_unknown", { ref: cloneRef(record.ref) });
     }
@@ -312,17 +321,19 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
         .filter(
           (record) => record.parentRef !== null && scopedKey(record.parentRef) === parentKey,
         )
-        .sort((left, right) => scopedKey(left.ref).localeCompare(scopedKey(right.ref)));
+        .sort((left, right) => compareScopedKeys(left.ref, right.ref));
       if (children.length === 0 && !records.has(parentKey)) {
         throw new WorkerOverlayError("overlay_unknown", { ref: cloneRef(parentRef) });
       }
-      return Object.freeze(children.map(materialize));
+      const depthByKey = depths();
+      return Object.freeze(children.map((record) => materialize(record, depthByKey)));
     },
     listWorkers(): readonly WorkerOverlayRecord[] {
+      const depthByKey = depths();
       return Object.freeze(
         [...records.values()]
-          .sort((left, right) => scopedKey(left.ref).localeCompare(scopedKey(right.ref)))
-          .map(materialize),
+          .sort((left, right) => compareScopedKeys(left.ref, right.ref))
+          .map((record) => materialize(record, depthByKey)),
       );
     },
   });
