@@ -15,6 +15,7 @@ import type {
 } from "../src/stockT3Contracts";
 import { StockT3HttpError } from "../src/stockT3HttpClient";
 import { createStockT3Facade } from "../src/facade";
+import { WorkerOverlayError } from "../src/overlay";
 
 const iso = "2026-07-31T18:00:00.000Z";
 const selection = { instanceId: "claudeAgent", model: "claude-opus-5" };
@@ -76,6 +77,14 @@ function detail(
       activities: [],
       checkpoints: [],
     },
+  };
+}
+
+function detailFor(threadId: string, sequence = 1): ThreadDetailSnapshot {
+  const snapshot = detail(sequence);
+  return {
+    ...snapshot,
+    thread: { ...snapshot.thread, id: threadId },
   };
 }
 
@@ -887,5 +896,208 @@ describe("stock HTTP runtime state machine", () => {
     await expect(runtime.send(ref, "second", { deadlineMs: 200 })).resolves.toMatchObject({
       messageId: "message-second",
     });
+  });
+});
+
+describe("facade worker hierarchy overlay", () => {
+  test("installs role and parent metadata only after a reconciled stock spawn", async () => {
+    const commands: Array<Record<string, unknown>> = [];
+    const childDetails = [
+      detailFor("thread-1", 2),
+      detailFor("thread-1", 2),
+      {
+        ...detailFor("thread-1", 4),
+        thread: {
+          ...detailFor("thread-1", 4).thread,
+          messages: [message("message-1", "initial")],
+        },
+      },
+    ];
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => shell(4, [threadIdentity()]),
+        getThread: async (threadId) =>
+          threadId === "parent" ? detailFor("parent", 1) : childDetails.shift(),
+        dispatch: async (command) => {
+          commands.push(command);
+          return { sequence: commands.length === 1 ? 2 : 4 };
+        },
+      }),
+      id: (() => {
+        const ids = ["thread-create-1", "thread-1", "turn-command-1", "message-1", "lease-1"];
+        return () => ids.shift()!;
+      })(),
+      now: () => iso,
+    });
+    const facade = createStockT3Facade(runtime, {
+      overlay: { now: () => "2026-08-01T20:00:00.000Z" },
+    });
+    const parentRef = { environmentId: "env-1", threadId: "parent" };
+
+    const result = await facade.spawn({
+      ...spawnInput,
+      role: "worker",
+      parentRef,
+    });
+
+    expect(result.kind).toBe("spawned");
+    expect(facade.getWorker({ environmentId: "env-1", threadId: "thread-1" })).toMatchObject({
+      role: "worker",
+      parentRef,
+      depth: null,
+      creation: { source: "spawn", createdAt: "2026-08-01T20:00:00.000Z" },
+    });
+    expect(facade.listChildren(parentRef).map((entry) => entry.ref.threadId)).toEqual([
+      "thread-1",
+    ]);
+    expect(commands).toHaveLength(2);
+    expect(commands.every((command) => !("role" in command) && !("parentRef" in command))).toBe(
+      true,
+    );
+  });
+
+  test("keeps provisional metadata unknown until read-only resume reconciles the create", async () => {
+    let phase: "pending" | "resume" = "pending";
+    let resumeDetailReads = 0;
+    const commands: Array<Record<string, unknown>> = [];
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () =>
+          phase === "pending" ? shell(1) : shell(10, [threadIdentity()]),
+        getThread: async () => {
+          if (phase === "pending") return undefined;
+          resumeDetailReads += 1;
+          return resumeDetailReads < 3
+            ? detailFor("thread-1", 9)
+            : {
+                ...detailFor("thread-1", 10),
+                thread: {
+                  ...detailFor("thread-1", 10).thread,
+                  messages: [message("message-1", "initial")],
+                },
+              };
+        },
+        dispatch: async (command) => {
+          commands.push(command);
+          return { sequence: commands.length === 1 ? 9 : 10 };
+        },
+      }),
+      id: (() => {
+        const ids = ["create-1", "thread-1", "turn-1", "message-1", "lease-1"];
+        return () => ids.shift()!;
+      })(),
+      now: () => iso,
+    });
+    const facade = createStockT3Facade(runtime);
+    const input = { ...spawnInput, role: "worker", parentRef: null };
+
+    const pending = await facade.spawn(input, { maxReconciliationReads: 1 });
+    expect(pending.kind).toBe("create_reconciliation_pending");
+    expect(() =>
+      facade.getWorker({ environmentId: "env-1", threadId: "thread-1" }),
+    ).toThrow(WorkerOverlayError);
+    if (pending.kind !== "create_reconciliation_pending") {
+      throw new Error("expected reconciliation pending");
+    }
+
+    phase = "resume";
+    const result = await facade.resumeCreateReconciliation(pending, input);
+
+    expect(result.kind).toBe("spawned");
+    expect(facade.getWorker(result.kind === "spawned" ? result.agentRef : pending.provisionalRef))
+      .toMatchObject({ role: "worker", parentRef: null, creation: { source: "spawn" } });
+    expect(commands.map((command) => command.type)).toEqual([
+      "thread.create",
+      "thread.turn.start",
+    ]);
+  });
+
+  test("reattaches canonical stock threads explicitly and surfaces overlay loss after restart", async () => {
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getThread: async (threadId) => detailFor(threadId, 3),
+      }),
+    });
+    const ref = { environmentId: "env-1", threadId: "thread-1" };
+    const firstProcess = createStockT3Facade(runtime);
+
+    await expect(
+      firstProcess.attach(ref, { role: "worker", parentRef: null }),
+    ).resolves.toMatchObject({ role: "worker", depth: 0 });
+    expect(firstProcess.getWorker(ref).parentRef).toBeNull();
+
+    const restartedProcess = createStockT3Facade(runtime);
+    await expect(restartedProcess.observe(ref)).resolves.toMatchObject({ snapshotSequence: 3 });
+    expect(() => restartedProcess.getWorker(ref)).toThrow(WorkerOverlayError);
+    try {
+      restartedProcess.getWorker(ref);
+    } catch (error) {
+      expect(error).toMatchObject({ code: "overlay_unknown" });
+    }
+    expect(restartedProcess.listWorkers()).toEqual([]);
+  });
+
+  test("fails missing canonical parents and hierarchy capacity before spawn dispatch", async () => {
+    let dispatches = 0;
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getThread: async (threadId) =>
+          threadId === "root" ? detailFor("root", 1) : undefined,
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 1 };
+        },
+      }),
+    });
+    const root = { environmentId: "env-1", threadId: "root" };
+    const missing = { environmentId: "env-1", threadId: "missing" };
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await expect(
+      facade.spawn({ ...spawnInput, role: "worker", parentRef: missing }),
+    ).rejects.toMatchObject({ code: "overlay_canonical_not_found" });
+    expect(dispatches).toBe(0);
+
+    await facade.attach(root, { role: "lead", parentRef: null });
+    await expect(
+      facade.spawn({ ...spawnInput, role: "worker", parentRef: root }),
+    ).rejects.toMatchObject({ code: "overlay_capacity_exceeded" });
+    expect(dispatches).toBe(0);
+  });
+
+  test("rejects cross-environment, cyclic, and over-depth attachments before dispatch", async () => {
+    let dispatches = 0;
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getThread: async (threadId) => detailFor(threadId, 1),
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 1 };
+        },
+      }),
+    });
+    const root = { environmentId: "env-1", threadId: "root" };
+    const child = { environmentId: "env-1", threadId: "child" };
+    const facade = createStockT3Facade(runtime, { overlay: { maxDepth: 1 } });
+
+    await expect(
+      facade.attach(
+        { environmentId: "env-2", threadId: "foreign" },
+        { role: "worker", parentRef: root },
+      ),
+    ).rejects.toMatchObject({ code: "overlay_environment_mismatch" });
+
+    await facade.attach(root, { role: "lead", parentRef: null });
+    await facade.attach(child, { role: "worker", parentRef: root });
+    await expect(
+      facade.spawn({ ...spawnInput, role: "worker", parentRef: child }),
+    ).rejects.toMatchObject({ code: "overlay_depth_exceeded" });
+
+    const cyclic = createStockT3Facade(runtime);
+    await cyclic.attach(root, { role: "lead", parentRef: child });
+    await expect(
+      cyclic.attach(child, { role: "worker", parentRef: root }),
+    ).rejects.toMatchObject({ code: "overlay_cycle" });
+    expect(dispatches).toBe(0);
   });
 });
