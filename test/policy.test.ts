@@ -284,6 +284,30 @@ describe("bounded orchestration policy", () => {
     policy.close();
   });
 
+  test("rejects a result that resolves after its deadline before the timer fires", async () => {
+    let now = 0;
+    const policy = createOrchestrationPolicy({
+      maxActive: 1,
+      maxActivePerScope: 1,
+      maxQueued: 0,
+      now: () => now,
+      setTimer: () => "deadline-timer",
+      clearTimer: () => {},
+    });
+
+    const late = policy.dispatch(
+      { scopeId: "lead", queue: "fail", deadlineMs: 100 },
+      async () => {
+        now = 100;
+        return "late success";
+      },
+    );
+
+    await expect(late).rejects.toMatchObject({ code: "timeout" });
+    expect(policy.metrics().active).toBe(0);
+    policy.close();
+  });
+
   test("returns partial fan-out outcomes without exceeding policy caps", async () => {
     const policy = createOrchestrationPolicy({
       maxActive: 2,

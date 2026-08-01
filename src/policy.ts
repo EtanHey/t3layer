@@ -142,6 +142,20 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
     pump();
   }
 
+  function runningStop(task: DispatchTask<unknown>): PolicyError | null {
+    if (task.controller.signal.aborted) {
+      return task.controller.signal.reason instanceof PolicyError
+        ? task.controller.signal.reason
+        : abortReason("cancelled");
+    }
+    if (task.deadlineMs !== undefined && now() >= task.deadlineMs) {
+      const error = abortReason("timeout");
+      task.controller.abort(error);
+      return error;
+    }
+    return null;
+  }
+
   function start(task: DispatchTask<unknown>): void {
     task.state = "running";
     active += 1;
@@ -157,14 +171,22 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
         });
       })
       .then(
-        (value) =>
-          task.controller.signal.aborted
-            ? finishRunning(task, {
-                ok: false,
-                error: task.controller.signal.reason,
-              })
-            : finishRunning(task, { ok: true, value }),
-        (error) => finishRunning(task, { ok: false, error }),
+        (value) => {
+          const stopped = runningStop(task);
+          finishRunning(
+            task,
+            stopped === null
+              ? { ok: true, value }
+              : { ok: false, error: stopped },
+          );
+        },
+        (error) => {
+          const stopped = runningStop(task);
+          finishRunning(task, {
+            ok: false,
+            error: stopped ?? error,
+          });
+        },
       );
   }
 
