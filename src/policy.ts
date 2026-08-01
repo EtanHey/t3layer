@@ -239,15 +239,24 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
     operation: (context: PolicyDispatchContext) => Promise<T> | T,
   ): Promise<T> {
     if (closed) return Promise.reject(abortReason("closed"));
-    if (dispatchOptions.scopeId.trim().length === 0) {
+    const scopeId = dispatchOptions.scopeId.trim();
+    if (scopeId.length === 0) {
       return Promise.reject(new TypeError("scopeId must be non-empty"));
     }
     if (dispatchOptions.signal?.aborted) {
       return Promise.reject(abortReason("cancelled"));
     }
+    let deadlineMs = dispatchOptions.deadlineMs;
+    if (deadlineMs !== undefined) {
+      try {
+        deadlineMs = boundedInteger(deadlineMs, "deadlineMs", true);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
     if (
-      dispatchOptions.deadlineMs !== undefined &&
-      now() >= dispatchOptions.deadlineMs
+      deadlineMs !== undefined &&
+      now() >= deadlineMs
     ) {
       return Promise.reject(abortReason("timeout"));
     }
@@ -255,11 +264,11 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
     return new Promise<T>((resolve, reject) => {
       const controller = new AbortController();
       const task: DispatchTask<T> = {
-        scopeId: dispatchOptions.scopeId,
+        scopeId,
         operation,
         controller,
         sourceSignal: dispatchOptions.signal,
-        deadlineMs: dispatchOptions.deadlineMs,
+        deadlineMs,
         resolve,
         reject,
         onAbort: () => {
@@ -325,18 +334,20 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
     ): Promise<PromiseSettledResult<R>[]> {
       return Promise.allSettled(
         items.map((item, index) =>
-          dispatch(
-            {
-              scopeId: fanOutOptions.scopeId(item, index),
-              queue: fanOutOptions.queue,
-              ...(fanOutOptions.signal === undefined
-                ? {}
-                : { signal: fanOutOptions.signal }),
-              ...(fanOutOptions.deadlineMs === undefined
-                ? {}
-                : { deadlineMs: fanOutOptions.deadlineMs }),
-            },
-            (context) => operation(item, context, index),
+          Promise.resolve().then(() =>
+            dispatch(
+              {
+                scopeId: fanOutOptions.scopeId(item, index),
+                queue: fanOutOptions.queue,
+                ...(fanOutOptions.signal === undefined
+                  ? {}
+                  : { signal: fanOutOptions.signal }),
+                ...(fanOutOptions.deadlineMs === undefined
+                  ? {}
+                  : { deadlineMs: fanOutOptions.deadlineMs }),
+              },
+              (context) => operation(item, context, index),
+            ),
           ),
         ),
       );

@@ -1,12 +1,16 @@
 import type {
   AgentRef,
+  ApprovalResponse,
+  ControlOperationResult,
   CreateReconciliationPending,
   RuntimeOperationOptions,
   SpawnResult,
   StockSpawnInput,
   T3NativeRuntime,
   TurnReceipt,
+  UserInputResponse,
 } from "./nativeRuntime";
+import { StockRuntimeError } from "./nativeRuntime";
 import {
   WorkerOverlayError,
   createWorkerOverlay,
@@ -15,16 +19,23 @@ import {
   type WorkerOverlayOptions,
   type WorkerOverlayRecord,
   type WorkerOverlayReservation,
+  recordWorkerTerminalState,
 } from "./overlay";
+import type { ThreadDetailSnapshot } from "./stockT3Contracts";
 
 export {
   allocateProjectCreateIdentity,
   canonicalizeWorkspaceRoot,
   parseProjectCreateIdentity,
-  StockRuntimeError,
 } from "./nativeRuntime";
+export { StockRuntimeError };
 export type {
   AgentRef,
+  ApprovalDecision,
+  ApprovalResponse,
+  ControlOperationName,
+  ControlOperationResult,
+  ControlReceipt,
   CreateAttemptReceipt,
   CreateReconciliationPending,
   CreateReconciliationState,
@@ -42,6 +53,7 @@ export type {
   T3NativeRuntime,
   ThreadCreateReceipt,
   TurnReceipt,
+  UserInputResponse,
   WorkspaceCanonicalizationOptions,
 } from "./nativeRuntime";
 export {
@@ -86,20 +98,8 @@ function isWorkerOverlay(value: WorkerOverlay | WorkerOverlayOptions): value is 
 }
 
 function stockSpawnInput(input: StockFacadeSpawnInput): StockSpawnInput {
-  return {
-    workspaceRoot: input.workspaceRoot,
-    ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
-    ...(input.projectCreateIdentity === undefined
-      ? {}
-      : { projectCreateIdentity: input.projectCreateIdentity }),
-    title: input.title,
-    message: input.message,
-    modelSelection: input.modelSelection,
-    runtimeMode: input.runtimeMode,
-    interactionMode: input.interactionMode,
-    branch: input.branch,
-    worktreePath: input.worktreePath,
-  };
+  const { role: _role, parentRef: _parentRef, ...native } = input;
+  return native;
 }
 
 function requestedOverlayIdentity(input: StockFacadeSpawnInput): WorkerOverlayIdentity | null {
@@ -142,6 +142,7 @@ function stableIdentity(identity: WorkerOverlayIdentity): WorkerOverlayIdentity 
 function commitSpawnIdentity(
   reservation: WorkerOverlayReservation,
   agentRef: AgentRef,
+  result: SpawnResult,
 ): void {
   try {
     reservation.commit(agentRef, { source: "spawn" });
@@ -150,6 +151,7 @@ function commitSpawnIdentity(
       throw new WorkerOverlayError(error.code, {
         ...error.details,
         agentRef: stableRef(agentRef),
+        result,
       });
     }
     throw error;
@@ -158,6 +160,15 @@ function commitSpawnIdentity(
 
 function reconciledRef(result: SpawnResult): AgentRef | null {
   return result.kind === "spawned" || result.kind === "partial" ? result.agentRef : null;
+}
+
+function isTerminalSnapshot(snapshot: ThreadDetailSnapshot): boolean {
+  return (
+    snapshot.thread.latestTurn?.state === "completed" ||
+    snapshot.thread.latestTurn?.state === "error" ||
+    snapshot.thread.session?.status === "stopped" ||
+    snapshot.thread.session?.status === "error"
+  );
 }
 
 /** Public receipt-targeted facade over the stock T3 HTTP runtime. */
@@ -197,7 +208,7 @@ export function createStockT3Facade(
       }
       const result = await runtime.spawn(nativeInput, operation);
       const ref = reconciledRef(result);
-      if (ref !== null) commitSpawnIdentity(reservation, ref);
+      if (ref !== null) commitSpawnIdentity(reservation, ref, result);
       return result;
     } finally {
       reservation.release();
@@ -222,7 +233,7 @@ export function createStockT3Facade(
       }
       const result = await runtime.resumeCreateReconciliation(pending, nativeInput, operation);
       const ref = reconciledRef(result);
-      if (ref !== null) commitSpawnIdentity(reservation, ref);
+      if (ref !== null) commitSpawnIdentity(reservation, ref, result);
       return result;
     } finally {
       reservation.release();
@@ -253,12 +264,56 @@ export function createStockT3Facade(
     getWorker: (ref: AgentRef) => overlay.getWorker(ref),
     listChildren: (parentRef: AgentRef) => overlay.listChildren(parentRef),
     listWorkers: () => overlay.listWorkers(),
-    send: (ref: AgentRef, message: string, options?: RuntimeOperationOptions) =>
-      runtime.send(ref, message, options),
-    wait: (receipt: TurnReceipt, options?: RuntimeOperationOptions) =>
-      runtime.wait(receipt, options),
-    observe: (ref: AgentRef, options?: RuntimeOperationOptions) =>
-      runtime.observe(ref, options),
+    async send(ref: AgentRef, message: string, options?: RuntimeOperationOptions) {
+      const receipt = await runtime.send(ref, message, options);
+      recordWorkerTerminalState(overlay, ref, false);
+      return receipt;
+    },
+    async wait(receipt: TurnReceipt, options?: RuntimeOperationOptions) {
+      try {
+        const result = await runtime.wait(receipt, options);
+        recordWorkerTerminalState(overlay, receipt.agentRef, true);
+        return result;
+      } catch (error) {
+        if (error instanceof StockRuntimeError && error.code === "turn_error") {
+          recordWorkerTerminalState(overlay, receipt.agentRef, true);
+        }
+        throw error;
+      }
+    },
+    async interrupt(
+      ref: AgentRef,
+      options?: RuntimeOperationOptions,
+    ): Promise<ControlOperationResult> {
+      const result = await runtime.interrupt(ref, options);
+      recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
+      return result;
+    },
+    async stop(
+      ref: AgentRef,
+      options?: RuntimeOperationOptions,
+    ): Promise<ControlOperationResult> {
+      const result = await runtime.stop(ref, options);
+      recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
+      return result;
+    },
+    respondToApproval: (
+      ref: AgentRef,
+      response: ApprovalResponse,
+      options?: RuntimeOperationOptions,
+    ) => runtime.respondToApproval(ref, response, options),
+    respondToUserInput: (
+      ref: AgentRef,
+      response: UserInputResponse,
+      options?: RuntimeOperationOptions,
+    ) => runtime.respondToUserInput(ref, response, options),
+    async observe(ref: AgentRef, options?: RuntimeOperationOptions) {
+      const snapshot = await runtime.observe(ref, options);
+      if (snapshot !== undefined) {
+        recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(snapshot));
+      }
+      return snapshot;
+    },
     releaseReceipt: (receipt: TurnReceipt) => runtime.releaseReceipt(receipt),
     pollMetrics: () => runtime.pollMetrics(),
     httpObservations: () => runtime.httpObservations(),

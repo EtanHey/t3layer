@@ -388,6 +388,55 @@ describe("bounded orchestration policy", () => {
     policy.close();
   });
 
+  test.each([Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY])(
+    "rejects malformed deadlineMs %p before dispatch",
+    async (deadlineMs) => {
+      const policy = createOrchestrationPolicy({
+        maxActive: 1,
+        maxActivePerScope: 1,
+        maxQueued: 0,
+        now: () => 0,
+      });
+      let dispatches = 0;
+
+      await expect(
+        policy.dispatch(
+          { scopeId: "lead", queue: "fail", deadlineMs },
+          async () => {
+            dispatches += 1;
+          },
+        ),
+      ).rejects.toBeInstanceOf(RangeError);
+      expect(dispatches).toBe(0);
+      expect(policy.metrics()).toMatchObject({ active: 0, queued: 0 });
+      policy.close();
+    },
+  );
+
+  test("keys per-scope capacity by the validated normalized scope", async () => {
+    const policy = createOrchestrationPolicy({
+      maxActive: 2,
+      maxActivePerScope: 1,
+      maxQueued: 0,
+    });
+    const gate = deferred();
+    let bypassDispatches = 0;
+    const active = policy.dispatch({ scopeId: "A", queue: "fifo" }, async () => {
+      await gate.promise;
+    });
+
+    await expect(
+      policy.dispatch({ scopeId: " A ", queue: "fail" }, async () => {
+        bypassDispatches += 1;
+      }),
+    ).rejects.toMatchObject({ code: "capacity", reason: "active_limit" });
+    expect(bypassDispatches).toBe(0);
+
+    gate.resolve();
+    await active;
+    policy.close();
+  });
+
   test("returns partial fan-out outcomes without exceeding policy caps", async () => {
     const policy = createOrchestrationPolicy({
       maxActive: 2,
@@ -412,6 +461,44 @@ describe("bounded orchestration policy", () => {
     expect(results[0]).toEqual({ status: "fulfilled", value: 10 });
     expect(results[2]).toEqual({ status: "fulfilled", value: 30 });
     expect(policy.metrics().peakActive).toBe(2);
+    policy.close();
+  });
+
+  test("settles a throwing fan-out scope selector without orphaning sibling work", async () => {
+    const policy = createOrchestrationPolicy({
+      maxActive: 2,
+      maxActivePerScope: 2,
+      maxQueued: 2,
+    });
+    const completed: number[] = [];
+
+    const results = await policy.fanOut(
+      [0, 1, 2],
+      {
+        scopeId: (_item, index) => {
+          if (index === 1) throw new Error("selector boom");
+          return "lead";
+        },
+        queue: "fifo",
+      },
+      async (value) => {
+        await Bun.sleep(1);
+        completed.push(value);
+        return value * 10;
+      },
+    );
+
+    expect(results.map((entry) => entry.status)).toEqual([
+      "fulfilled",
+      "rejected",
+      "fulfilled",
+    ]);
+    expect(results[1]).toMatchObject({
+      status: "rejected",
+      reason: new Error("selector boom"),
+    });
+    expect(completed.sort()).toEqual([0, 2]);
+    expect(policy.metrics()).toMatchObject({ active: 0, queued: 0 });
     policy.close();
   });
 });

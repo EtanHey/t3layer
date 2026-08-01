@@ -71,6 +71,7 @@ interface PendingRecord {
 }
 
 type GraphKey = string | symbol;
+const setTerminalState = Symbol("worker-overlay-terminal-state");
 
 function scopedKey(ref: AgentRef): string {
   return JSON.stringify([ref.environmentId, ref.threadId]);
@@ -139,6 +140,15 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
   const now = options.now ?? (() => new Date().toISOString());
   const records = new Map<string, StoredRecord>();
   const pending = new Map<symbol, PendingRecord>();
+  const terminalRecords = new Set<string>();
+
+  function activeRecordCount(): number {
+    let count = 0;
+    for (const key of records.keys()) {
+      if (!terminalRecords.has(key)) count += 1;
+    }
+    return count;
+  }
 
   function graph(): Map<GraphKey, string | null> {
     const result = new Map<GraphKey, string | null>();
@@ -234,7 +244,7 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
     ref: AgentRef | null,
     requestedIdentity: WorkerOverlayIdentity,
   ): WorkerOverlayReservation {
-    if (records.size + pending.size >= maxWorkers) {
+    if (activeRecordCount() + pending.size >= maxWorkers) {
       throw new WorkerOverlayError("overlay_capacity_exceeded", { maxWorkers });
     }
     if (ref !== null) validateRef(ref);
@@ -278,11 +288,14 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
           parentRef: identity.parentRef,
           creation: Object.freeze({ source: creation.source, createdAt: now() }),
         });
-        records.set(scopedKey(stored.ref), stored);
+        const storedKey = scopedKey(stored.ref);
+        records.set(storedKey, stored);
+        terminalRecords.delete(storedKey);
         try {
           depths();
         } catch (error) {
-          records.delete(scopedKey(stored.ref));
+          records.delete(storedKey);
+          terminalRecords.delete(storedKey);
           throw error;
         }
         return materialize(stored);
@@ -296,6 +309,12 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
   }
 
   return Object.freeze({
+    [setTerminalState](ref: AgentRef, terminal: boolean): void {
+      const key = scopedKey(ref);
+      if (!records.has(key)) return;
+      if (terminal) terminalRecords.add(key);
+      else terminalRecords.delete(key);
+    },
     reserve,
     attach(ref: AgentRef, identity: WorkerOverlayIdentity): WorkerOverlayRecord {
       const reservation = reserve(ref, identity);
@@ -340,3 +359,11 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
 }
 
 export type WorkerOverlay = ReturnType<typeof createWorkerOverlay>;
+
+export function recordWorkerTerminalState(
+  overlay: WorkerOverlay,
+  ref: AgentRef,
+  terminal: boolean,
+): void {
+  overlay[setTerminalState](ref, terminal);
+}

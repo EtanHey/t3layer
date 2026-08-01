@@ -143,6 +143,53 @@ export interface TurnReceipt {
   readonly reconciliationEvidence?: readonly Readonly<Record<string, unknown>>[];
 }
 
+export type ControlOperationName =
+  | "interrupt"
+  | "stop"
+  | "respond_to_approval"
+  | "respond_to_user_input";
+
+export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+
+export interface ApprovalResponse {
+  readonly requestId: string;
+  readonly decision: ApprovalDecision;
+}
+
+export interface UserInputResponse {
+  readonly requestId: string;
+  readonly answers: Readonly<Record<string, unknown>>;
+}
+
+export interface ControlReceipt {
+  readonly operation: ControlOperationName;
+  readonly commandId: string;
+  readonly acceptedSequence: number | null;
+  readonly observedSequence: number;
+  readonly retryState:
+    | "not_needed"
+    | "reconciled_before_retry"
+    | "identical_retry_accepted"
+    | "identical_retry_outcome_unknown";
+}
+
+export type ControlOperationResult =
+  | {
+      readonly kind: "applied";
+      readonly operation: ControlOperationName;
+      readonly agentRef: AgentRef;
+      readonly receipt: ControlReceipt;
+      readonly snapshot: ThreadDetailSnapshot;
+    }
+  | {
+      readonly kind: "no_op";
+      readonly operation: "interrupt" | "stop";
+      readonly reason: "turn_terminal" | "session_terminal";
+      readonly agentRef: AgentRef;
+      readonly observedSequence: number;
+      readonly snapshot: ThreadDetailSnapshot;
+    };
+
 export type SpawnResult =
   | {
       readonly kind: "spawned";
@@ -215,6 +262,8 @@ export type StockRuntimeErrorCode =
   | "causality_unverifiable"
   | "pending_approval"
   | "pending_input"
+  | "approval_not_pending"
+  | "user_input_not_pending"
   | "turn_interrupted"
   | "turn_error";
 
@@ -2201,6 +2250,550 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     );
   }
 
+  interface ControlPreflight {
+    readonly shell: ShellSnapshot;
+    readonly shellThread: StockThreadShell;
+    readonly detail: ThreadDetailSnapshot;
+  }
+
+  function boundedControlOperation(
+    operation: RuntimeOperationOptions,
+  ): RuntimeOperationOptions & { readonly deadlineMs: number } {
+    if (
+      operation.deadlineMs !== undefined &&
+      (!Number.isSafeInteger(operation.deadlineMs) || operation.deadlineMs < 0)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "deadlineMs" });
+    }
+    if (
+      operation.timeoutMs !== undefined &&
+      (!Number.isSafeInteger(operation.timeoutMs) || operation.timeoutMs < 1)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "timeoutMs" });
+    }
+    return boundedOperation(operation);
+  }
+
+  function validateControlRef(ref: AgentRef): void {
+    if (
+      typeof ref.environmentId !== "string" ||
+      ref.environmentId.trim().length === 0 ||
+      ref.environmentId !== ref.environmentId.trim() ||
+      typeof ref.threadId !== "string" ||
+      ref.threadId.trim().length === 0 ||
+      ref.threadId !== ref.threadId.trim()
+    ) {
+      throw new StockRuntimeError("identity_conflict", { reason: "invalid_agent_ref" });
+    }
+  }
+
+  function controlIdentifier(value: unknown, field: string): string {
+    if (
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value !== value.trim()
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", { field });
+    }
+    return value;
+  }
+
+  function validateControlIdentity(
+    ref: AgentRef,
+    shellSnapshot: ShellSnapshot,
+    detailSnapshot: ThreadDetailSnapshot | undefined,
+  ): { readonly shellThread: StockThreadShell; readonly detail: ThreadDetailSnapshot } {
+    const shellThread = shellSnapshot.threads.find((entry) => entry.id === ref.threadId);
+    if (shellThread === undefined || detailSnapshot === undefined) {
+      throw new StockRuntimeError("identity_conflict", {
+        reason: "thread_not_found",
+        threadId: ref.threadId,
+      });
+    }
+    if (
+      detailSnapshot.thread.id !== ref.threadId ||
+      detailSnapshot.thread.projectId !== shellThread.projectId ||
+      (shellThread.session !== null && shellThread.session.threadId !== ref.threadId) ||
+      (detailSnapshot.thread.session !== null &&
+        detailSnapshot.thread.session.threadId !== ref.threadId)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "control_thread_identity_conflict",
+      });
+    }
+    return { shellThread, detail: detailSnapshot };
+  }
+
+  async function preflightControl(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+  ): Promise<ControlPreflight> {
+    validateControlRef(ref);
+    const stopped = stopCode(operation);
+    if (stopped !== null) throw new StockRuntimeError(stopped);
+    const [environment, shellSnapshot, detailSnapshot] = await Promise.all([
+      descriptor({ deadlineMs: operation.deadlineMs, signal: operation.signal }),
+      client
+        .getShell({ deadlineMs: operation.deadlineMs, signal: operation.signal })
+        .catch((error) => {
+          throw mapReceivedError(error);
+        }),
+      client
+        .getThread(ref.threadId, {
+          deadlineMs: operation.deadlineMs,
+          signal: operation.signal,
+        })
+        .catch((error) => {
+          throw mapReceivedError(error);
+        }),
+    ] as const);
+    if (environment.environmentId !== ref.environmentId) {
+      throw new StockRuntimeError("environment_changed", {
+        expectedEnvironmentId: ref.environmentId,
+        actualEnvironmentId: environment.environmentId,
+      });
+    }
+    const stoppedAfterRead = stopCode(operation);
+    if (stoppedAfterRead !== null) throw new StockRuntimeError(stoppedAfterRead);
+    const identity = validateControlIdentity(ref, shellSnapshot, detailSnapshot);
+    if (shellSnapshot.snapshotSequence !== identity.detail.snapshotSequence) {
+      const minimumSequence = Math.max(
+        shellSnapshot.snapshotSequence,
+        identity.detail.snapshotSequence,
+      );
+      try {
+        return await poller.waitFor({
+          environmentId: ref.environmentId,
+          threadId: ref.threadId,
+          deadlineMs: operation.deadlineMs,
+          signal: operation.signal,
+          evaluate: ({ shell: observedShell, detail: observedDetail }) => {
+            if (observedDetail === undefined) {
+              return { done: false, detail: true };
+            }
+            const observed = validateControlIdentity(ref, observedShell, observedDetail);
+            if (
+              observedShell.snapshotSequence < minimumSequence ||
+              observed.detail.snapshotSequence < observedShell.snapshotSequence
+            ) {
+              return { done: false, detail: true };
+            }
+            return {
+              done: true,
+              value: {
+                shell: observedShell,
+                shellThread: observed.shellThread,
+                detail: observed.detail,
+              },
+            };
+          },
+        });
+      } catch (error) {
+        if (error instanceof StockRuntimeError) throw error;
+        if (error instanceof PollerError) {
+          throw new StockRuntimeError(
+            error.code === "timeout" ? "timeout" : "cancelled",
+            { reason: error.code },
+          );
+        }
+        throw mapReceivedError(error);
+      }
+    }
+    return {
+      shell: shellSnapshot,
+      shellThread: identity.shellThread,
+      detail: identity.detail,
+    };
+  }
+
+  async function reconcileControlAfterAmbiguous(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+  ): Promise<ControlPreflight | null> {
+    try {
+      return await preflightControl(ref, operation);
+    } catch (error) {
+      if (
+        error instanceof StockRuntimeError &&
+        (error.code === "cancelled" ||
+          error.code === "timeout" ||
+          error.code === "environment_changed")
+      ) {
+        throw error;
+      }
+      return null;
+    }
+  }
+
+  type ControlPredicate = (
+    shellThread: StockThreadShell,
+    detail: ThreadDetailSnapshot,
+  ) => boolean;
+
+  function observedControlSequence(preflight: ControlPreflight): number {
+    return Math.max(preflight.shell.snapshotSequence, preflight.detail.snapshotSequence);
+  }
+
+  function appliedControlResult(
+    operation: ControlOperationName,
+    ref: AgentRef,
+    commandId: string,
+    acceptedSequence: number | null,
+    retryState: ControlReceipt["retryState"],
+    snapshot: ThreadDetailSnapshot,
+  ): ControlOperationResult {
+    return {
+      kind: "applied",
+      operation,
+      agentRef: ref,
+      receipt: {
+        operation,
+        commandId,
+        acceptedSequence,
+        observedSequence: snapshot.snapshotSequence,
+        retryState,
+      },
+      snapshot,
+    };
+  }
+
+  async function waitForControlConfirmation(
+    operationName: ControlOperationName,
+    ref: AgentRef,
+    commandId: string,
+    acceptedSequence: number | null,
+    retryState: ControlReceipt["retryState"],
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+    predicate: ControlPredicate,
+  ): Promise<ControlOperationResult> {
+    const receipt: ControlReceipt = {
+      operation: operationName,
+      commandId,
+      acceptedSequence,
+      observedSequence: 0,
+      retryState,
+    };
+    try {
+      const snapshot = await poller.waitFor({
+        environmentId: ref.environmentId,
+        threadId: ref.threadId,
+        deadlineMs: operation.deadlineMs,
+        signal: operation.signal,
+        evaluate: ({ shell: shellSnapshot, detail: detailSnapshot }) => {
+          if (detailSnapshot === undefined) {
+            if (!shellSnapshot.threads.some((entry) => entry.id === ref.threadId)) {
+              throw new StockRuntimeError("identity_conflict", {
+                reason: "thread_not_found",
+                threadId: ref.threadId,
+              });
+            }
+            return { done: false, detail: true };
+          }
+          const identity = validateControlIdentity(ref, shellSnapshot, detailSnapshot);
+          if (
+            identity.detail.snapshotSequence < shellSnapshot.snapshotSequence ||
+            (acceptedSequence !== null &&
+              (shellSnapshot.snapshotSequence < acceptedSequence ||
+                identity.detail.snapshotSequence < acceptedSequence))
+          ) {
+            return { done: false, detail: true };
+          }
+          return predicate(identity.shellThread, identity.detail)
+            ? { done: true, value: identity.detail }
+            : { done: false, detail: true };
+        },
+      });
+      return appliedControlResult(
+        operationName,
+        ref,
+        commandId,
+        acceptedSequence,
+        retryState,
+        snapshot,
+      );
+    } catch (error) {
+      if (error instanceof StockRuntimeError) {
+        throw new StockRuntimeError(error.code, { ...error.evidence, receipt });
+      }
+      if (error instanceof PollerError) {
+        throw new StockRuntimeError(
+          error.code === "timeout" ? "timeout" : "cancelled",
+          { reason: error.code, receipt },
+        );
+      }
+      const mapped = mapReceivedError(error);
+      throw new StockRuntimeError(mapped.code, { ...mapped.evidence, receipt });
+    }
+  }
+
+  async function dispatchControl(
+    operationName: ControlOperationName,
+    ref: AgentRef,
+    command: Readonly<Record<string, unknown>>,
+    commandId: string,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+    predicate: ControlPredicate,
+  ): Promise<ControlOperationResult> {
+    let acceptedSequence: number | null = null;
+    let retryState: ControlReceipt["retryState"] = "not_needed";
+    try {
+      const accepted = await client.dispatch(command, {
+        deadlineMs: operation.deadlineMs,
+        signal: operation.signal,
+      });
+      acceptedSequence = accepted.sequence;
+      poller.dispatchObserved(ref.environmentId);
+    } catch (error) {
+      const failure = classifyDispatchFailure(error, operation);
+      if (failure.kind !== "ambiguous") {
+        if (failure.kind === "cancelled" || failure.kind === "timeout") {
+          throw new StockRuntimeError(failure.kind, { operation: operationName, commandId });
+        }
+        throw failure.error;
+      }
+
+      const reconciled = await reconcileControlAfterAmbiguous(ref, operation);
+      if (reconciled !== null && predicate(reconciled.shellThread, reconciled.detail)) {
+        return appliedControlResult(
+          operationName,
+          ref,
+          commandId,
+          null,
+          "reconciled_before_retry",
+          reconciled.detail,
+        );
+      }
+      const beforeRetryStop = stopCode(operation);
+      if (beforeRetryStop !== null) {
+        throw new StockRuntimeError(beforeRetryStop, { operation: operationName, commandId });
+      }
+      try {
+        const accepted = await client.dispatch(command, {
+          deadlineMs: operation.deadlineMs,
+          signal: operation.signal,
+        });
+        acceptedSequence = accepted.sequence;
+        retryState = "identical_retry_accepted";
+        poller.dispatchObserved(ref.environmentId);
+      } catch (retryError) {
+        const retryFailure = classifyDispatchFailure(retryError, operation);
+        if (retryFailure.kind === "cancelled" || retryFailure.kind === "timeout") {
+          throw new StockRuntimeError(retryFailure.kind, {
+            operation: operationName,
+            commandId,
+          });
+        }
+        if (
+          retryFailure.kind === "received" &&
+          ![400, 401, 403, 500].includes(
+            typeof retryFailure.error.evidence.status === "number"
+              ? retryFailure.error.evidence.status
+              : 0,
+          )
+        ) {
+          throw retryFailure.error;
+        }
+        retryState = "identical_retry_outcome_unknown";
+      }
+    }
+    return waitForControlConfirmation(
+      operationName,
+      ref,
+      commandId,
+      acceptedSequence,
+      retryState,
+      operation,
+      predicate,
+    );
+  }
+
+  async function interrupt(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightControl(ref, bounded);
+    const shellTurn = preflight.shellThread.latestTurn;
+    const detailTurn = preflight.detail.thread.latestTurn;
+    if (
+      shellTurn !== null &&
+      detailTurn !== null &&
+      shellTurn.turnId !== detailTurn.turnId
+    ) {
+      throw new StockRuntimeError("concurrent_writer", { reason: "turn_changed" });
+    }
+    const turn =
+      shellTurn?.state === "running"
+        ? shellTurn
+        : detailTurn?.state === "running"
+          ? detailTurn
+          : detailTurn ?? shellTurn;
+    if (turn === null) {
+      throw new StockRuntimeError("identity_conflict", { reason: "turn_not_found" });
+    }
+    if (
+      shellTurn !== null &&
+      shellTurn.state !== "running" &&
+      detailTurn !== null &&
+      detailTurn.state !== "running"
+    ) {
+      return {
+        kind: "no_op",
+        operation: "interrupt",
+        reason: "turn_terminal",
+        agentRef: ref,
+        observedSequence: observedControlSequence(preflight),
+        snapshot: preflight.detail,
+      };
+    }
+    const commandId = id();
+    const command = Object.freeze({
+      type: "thread.turn.interrupt",
+      commandId,
+      threadId: ref.threadId,
+      turnId: turn.turnId,
+      createdAt: now(),
+    });
+    return dispatchControl(
+      "interrupt",
+      ref,
+      command,
+      commandId,
+      bounded,
+      (shellThread, detailSnapshot) => {
+        const shellLatest = shellThread.latestTurn;
+        const latest = detailSnapshot.thread.latestTurn;
+        if (
+          (shellLatest !== null && shellLatest.turnId !== turn.turnId) ||
+          (latest !== null && latest.turnId !== turn.turnId)
+        ) {
+          throw new StockRuntimeError("concurrent_writer", { reason: "turn_changed" });
+        }
+        return (
+          shellLatest !== null &&
+          shellLatest.state !== "running" &&
+          latest !== null &&
+          latest.state !== "running"
+        );
+      },
+    );
+  }
+
+  async function stop(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightControl(ref, bounded);
+    const shellStatus = preflight.shellThread.session?.status;
+    const detailStatus = preflight.detail.thread.session?.status;
+    if (
+      (shellStatus === "stopped" || shellStatus === "error") &&
+      (detailStatus === "stopped" || detailStatus === "error")
+    ) {
+      return {
+        kind: "no_op",
+        operation: "stop",
+        reason: "session_terminal",
+        agentRef: ref,
+        observedSequence: observedControlSequence(preflight),
+        snapshot: preflight.detail,
+      };
+    }
+    const commandId = id();
+    const command = Object.freeze({
+      type: "thread.session.stop",
+      commandId,
+      threadId: ref.threadId,
+      createdAt: now(),
+    });
+    return dispatchControl(
+      "stop",
+      ref,
+      command,
+      commandId,
+      bounded,
+      (shellThread, detailSnapshot) => {
+        const shellStatus = shellThread.session?.status;
+        const detailStatus = detailSnapshot.thread.session?.status;
+        return (
+          (shellStatus === "stopped" || shellStatus === "error") &&
+          (detailStatus === "stopped" || detailStatus === "error")
+        );
+      },
+    );
+  }
+
+  async function respondToApproval(
+    ref: AgentRef,
+    response: ApprovalResponse,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const requestId = controlIdentifier(response.requestId, "requestId");
+    if (!["accept", "acceptForSession", "decline", "cancel"].includes(response.decision)) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "decision" });
+    }
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightControl(ref, bounded);
+    if (!preflight.shellThread.hasPendingApprovals) {
+      throw new StockRuntimeError("approval_not_pending", { requestId });
+    }
+    const commandId = id();
+    const command = Object.freeze({
+      type: "thread.approval.respond",
+      commandId,
+      threadId: ref.threadId,
+      requestId,
+      decision: response.decision,
+      createdAt: now(),
+    });
+    return dispatchControl(
+      "respond_to_approval",
+      ref,
+      command,
+      commandId,
+      bounded,
+      (shellThread) => !shellThread.hasPendingApprovals,
+    );
+  }
+
+  async function respondToUserInput(
+    ref: AgentRef,
+    response: UserInputResponse,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const requestId = controlIdentifier(response.requestId, "requestId");
+    if (
+      typeof response.answers !== "object" ||
+      response.answers === null ||
+      Array.isArray(response.answers)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "answers" });
+    }
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightControl(ref, bounded);
+    if (!preflight.shellThread.hasPendingUserInput) {
+      throw new StockRuntimeError("user_input_not_pending", { requestId });
+    }
+    const commandId = id();
+    const command = Object.freeze({
+      type: "thread.user-input.respond",
+      commandId,
+      threadId: ref.threadId,
+      requestId,
+      answers: response.answers,
+      createdAt: now(),
+    });
+    return dispatchControl(
+      "respond_to_user_input",
+      ref,
+      command,
+      commandId,
+      bounded,
+      (shellThread) => !shellThread.hasPendingUserInput,
+    );
+  }
+
   async function send(
     ref: AgentRef,
     text: string,
@@ -2520,6 +3113,10 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     client,
     spawn,
     resumeCreateReconciliation,
+    interrupt,
+    stop,
+    respondToApproval,
+    respondToUserInput,
     send,
     wait,
     async observe(ref: AgentRef, operation: RuntimeOperationOptions = {}) {
