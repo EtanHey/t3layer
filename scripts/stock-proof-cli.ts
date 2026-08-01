@@ -17,8 +17,9 @@ if (command === "validate-provisional") {
   const candidateSha = third;
   if (!candidateSha) throw new TypeError("candidate SHA is required");
   const checksum = await proofChecksum(value);
-  await Bun.write(first, canonicalProofEnvelopeJson(value, checksum));
-  await validateProofEnvelope(await Bun.file(first).json(), { runId: second, candidateSha });
+  const envelope = canonicalProofEnvelopeJson(value, checksum);
+  await validateProofEnvelope(JSON.parse(envelope), { runId: second, candidateSha });
+  await Bun.write(first, envelope);
 } else if (command === "validate-envelope") {
   if (!first || !second) throw new TypeError("expected identity is required");
   await validateProofEnvelope(value, { runId: first, candidateSha: second });

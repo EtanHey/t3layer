@@ -209,13 +209,21 @@ describe("environment-coalesced adaptive poller", () => {
 
   test("removes each resolved default-sleep abort listener", async () => {
     let sequence = 0;
-    let maximumAbortListeners = 0;
+    const observedSignals = new Set<AbortSignal>();
+    const shellSignals = new Set<AbortSignal>();
+    const originalAddEventListener = AbortSignal.prototype.addEventListener;
+    AbortSignal.prototype.addEventListener = function (
+      this: AbortSignal,
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) {
+      if (type === "abort") observedSignals.add(this);
+      return originalAddEventListener.call(this, type, listener, options);
+    } as typeof originalAddEventListener;
     const poller = createAdaptivePoller({
       getShell: async ({ signal }) => {
-        maximumAbortListeners = Math.max(
-          maximumAbortListeners,
-          signal === undefined ? 0 : getEventListeners(signal, "abort").length,
-        );
+        if (signal !== undefined) shellSignals.add(signal);
         sequence += 1;
         return {
           snapshotSequence: sequence,
@@ -227,17 +235,25 @@ describe("environment-coalesced adaptive poller", () => {
       getThread: async () => undefined,
     });
 
-    await expect(
-      poller.waitFor({
-        environmentId: "env-listeners",
-        threadId: "thread-listeners",
-        deadlineMs: Date.now() + 2_000,
-        evaluate: ({ shell }) =>
-          shell.snapshotSequence >= 2 ? { done: true, value: "done" } : { done: false },
-      }),
-    ).resolves.toBe("done");
-    expect(maximumAbortListeners).toBeLessThanOrEqual(1);
-    poller.close();
+    try {
+      await expect(
+        poller.waitFor({
+          environmentId: "env-listeners",
+          threadId: "thread-listeners",
+          deadlineMs: Date.now() + 2_000,
+          evaluate: ({ shell }) =>
+            shell.snapshotSequence >= 2 ? { done: true, value: "done" } : { done: false },
+        }),
+      ).resolves.toBe("done");
+      const cycleSignals = [...observedSignals].filter((signal) => !shellSignals.has(signal));
+      expect(cycleSignals.length).toBeGreaterThan(0);
+      expect(cycleSignals.every((signal) => getEventListeners(signal, "abort").length === 0)).toBe(
+        true,
+      );
+    } finally {
+      AbortSignal.prototype.addEventListener = originalAddEventListener;
+      poller.close();
+    }
   }, 3_000);
 
   test("dispatch observation interrupts stale failure backoff and resumes fast cadence", async () => {

@@ -229,7 +229,8 @@ describe("stock T3 HTTP client", () => {
       },
     });
     const occupying = Array.from({ length: 8 }, () => client.getDescriptor());
-    while (starts < 8) await Promise.resolve();
+    for (let spin = 0; spin < 100 && starts < 8; spin += 1) await Promise.resolve();
+    expect(starts).toBe(8);
     const queued = client.getDescriptor({ deadlineMs: Date.now() + 5 }).catch((error) => error);
     try {
       const outcome = await Promise.race([
@@ -269,7 +270,8 @@ describe("stock T3 HTTP client", () => {
     const occupying = Array.from({ length: 8 }, (_, index) =>
       client.dispatch({ id: `held-${index}` }),
     );
-    while (starts.length < 8) await Promise.resolve();
+    for (let spin = 0; spin < 100 && starts.length < 8; spin += 1) await Promise.resolve();
+    expect(starts).toHaveLength(8);
     const expired = client.dispatch({ id: "expired" }, { deadlineMs: 5 }).catch((error) => error);
     const first = client.dispatch({ id: "first" }, { deadlineMs: 100 });
     const second = client.dispatch({ id: "second" }, { deadlineMs: 100 });

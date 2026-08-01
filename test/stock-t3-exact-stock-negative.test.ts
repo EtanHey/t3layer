@@ -19,6 +19,12 @@ describe("exact-stock characterization driver", () => {
     expect(source).toContain('rm -f -- "$generated_path"');
     expect(source).toContain('if [[ -e "$generated_path" ]]');
     expect(source).toContain("generated characterization path already exists");
+    const shaCheck = source.indexOf('if [[ "$actual_sha" != "$expected_sha" ]]');
+    const cleanCheck = source.indexOf("status --porcelain");
+    const generatedCollisionCheck = source.indexOf('if [[ -e "$generated_path" ]]');
+    expect(cleanCheck).toBeGreaterThan(shaCheck);
+    expect(cleanCheck).toBeLessThan(generatedCollisionCheck);
+    expect(source).toContain("exact stock worktree is not clean");
   });
 
   test.skipIf(exactTree === undefined || exactToolchain === undefined)(

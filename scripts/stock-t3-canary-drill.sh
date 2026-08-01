@@ -43,6 +43,16 @@ sha256_file() {
   fi
 }
 
+file_mode() {
+  local path=$1
+  local mode
+  if mode=$(/usr/bin/stat -c '%a' "$path" 2>/dev/null); then
+    printf '%s\n' "$mode"
+  else
+    /usr/bin/stat -f '%Lp' "$path"
+  fi
+}
+
 commands=(
   "$T3_STOCK_ROUTE_OFF_COMMAND"
   "$T3_STOCK_ROUTE_CANARY_COMMAND"
@@ -92,6 +102,10 @@ verify_artifact() {
 }
 
 record_status() {
+  if [[ ${T3_STOCK_FAIL_STATUS_AT:-} == "$1" ]]; then
+    echo "ERROR: injected status-record failure: $1" >&2
+    return 92
+  fi
   command_statuses=$(/usr/bin/jq -c --arg name "$1" --argjson status "$2" '. + [{name:$name,status:$status}]' <<<"$command_statuses")
 }
 
@@ -113,6 +127,7 @@ recover() {
   local exit_status=$?
   if [[ $# -eq 1 ]]; then exit_status=$1; fi
   trap - EXIT INT TERM
+  set +e
   if [[ "$drill_complete" != true && "$recovery_armed" == true ]]; then
     local prior_status=0
     "$T3_STOCK_ROUTE_PRIOR_CONFIG_COMMAND" || prior_status=$?
@@ -224,7 +239,7 @@ checksum=$(sha256_file "$body_staging")
 mv -f -- "$staging" "$T3_STOCK_DRILL_RECEIPT_PATH"
 chmod 600 "$T3_STOCK_DRILL_RECEIPT_PATH"
 rm -f -- "$body_staging"
-if [[ $(/usr/bin/stat -f '%Lp' "$T3_STOCK_DRILL_RECEIPT_PATH") != 600 ]]; then
+if [[ $(file_mode "$T3_STOCK_DRILL_RECEIPT_PATH") != 600 ]]; then
   echo "ERROR: canary receipt mode mismatch" >&2
   exit 2
 fi

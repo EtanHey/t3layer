@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   ProofReceiptError,
   canonicalProofBody,
+  canonicalProofEnvelopeJson,
   canonicalProofJson,
   proofChecksum,
   validateProofEnvelope,
@@ -424,6 +425,28 @@ describe("stock live harness lifecycle", () => {
     expect((await Bun.file(receipt).text()).endsWith("\n")).toBe(true);
   });
 
+  test("proof CLI validates expected identity before replacing an existing receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-proof-cli-preserve."));
+    temporaryRoots.push(root);
+    const priorBody = { ...completeBody(), runId: "prior-run" };
+    const currentBody = completeBody();
+    const draft = join(root, "draft.json");
+    const receipt = join(root, "receipt.json");
+    const priorChecksum = await proofChecksum(priorBody);
+    const priorEnvelope = canonicalProofEnvelopeJson(priorBody, priorChecksum);
+    await Bun.write(draft, JSON.stringify(currentBody));
+    await Bun.write(receipt, priorEnvelope);
+    await chmod(receipt, 0o600);
+
+    const published = await run([
+      "bun", "scripts/stock-proof-cli.ts", "publish", draft, receipt,
+      "wrong-current-run", currentBody.candidateSha,
+    ]);
+
+    expect(published.exitCode).not.toBe(0);
+    expect(await Bun.file(receipt).text()).toBe(priorEnvelope);
+  });
+
   test("deploy drill dry-run records the required immutable-artifact transitions", async () => {
     const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--dry-run"]);
     expect(result.exitCode).toBe(0);
@@ -460,6 +483,17 @@ describe("stock live harness lifecycle", () => {
     await expect(Bun.file(fixture.receipt).json()).resolves.toMatchObject({ success: true });
   });
 
+  test("execute mode uses a portable receipt-mode probe", async () => {
+    const source = await Bun.file(
+      join(import.meta.dir, "../scripts/stock-t3-canary-drill.sh"),
+    ).text();
+
+    expect(source).toContain("file_mode() {");
+    expect(source).toContain("/usr/bin/stat -c '%a'");
+    expect(source).toContain("/usr/bin/stat -f '%Lp'");
+    expect(source).not.toContain("if [[ $(/usr/bin/stat -f '%Lp'");
+  });
+
   test("execute mode rejects unapproved artifact or config bytes before routing", async () => {
     const fixture = await canaryFixture();
     const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], {
@@ -485,7 +519,11 @@ describe("stock live harness lifecycle", () => {
       stdout: "pipe",
       stderr: "pipe",
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (await Bun.file(fixture.log).exists()) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(await Bun.file(fixture.log).exists()).toBe(true);
     child.kill("SIGINT");
     const [exitCode, stderr] = await Promise.all([
       child.exited,
@@ -548,4 +586,20 @@ describe("stock live harness lifecycle", () => {
       expect(commands.at(-1), seam).toBe("cancel");
     }
   }, 60_000);
+
+  test("recovery completes safety commands when status bookkeeping fails", async () => {
+    const fixture = await canaryFixture();
+    const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], {
+      ...fixture.env,
+      T3_STOCK_FAIL_AT: "route-canary",
+      T3_STOCK_FAIL_STATUS_AT: "recovery-prior-config",
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain(
+      "injected status-record failure: recovery-prior-config",
+    );
+    const commands = (await Bun.file(fixture.log).text()).trim().split("\n");
+    expect(commands.slice(-3)).toEqual(["prior", "off", "cancel"]);
+  });
 });

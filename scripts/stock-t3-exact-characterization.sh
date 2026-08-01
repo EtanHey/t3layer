@@ -12,9 +12,14 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
   exit 2
 fi
 
+if [[ -n $(/usr/bin/git -C "$stock_tree" status --porcelain --untracked-files=all) ]]; then
+  echo "ERROR: exact stock worktree is not clean" >&2
+  exit 3
+fi
+
 if [[ -e "$generated_path" ]]; then
   echo "ERROR: generated characterization path already exists" >&2
-  exit 3
+  exit 4
 fi
 
 cleanup() {
