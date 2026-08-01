@@ -275,10 +275,10 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
         timer: undefined,
       };
       dispatchOptions.signal?.addEventListener("abort", task.onAbort, { once: true });
-      scheduleDeadline(task as DispatchTask<unknown>);
 
       if (queue.length === 0 && canStart(task as DispatchTask<unknown>)) {
         start(task as DispatchTask<unknown>);
+        scheduleDeadline(task as DispatchTask<unknown>);
         return;
       }
       if (dispatchOptions.queue === "fail") {
@@ -302,6 +302,7 @@ export function createOrchestrationPolicy(options: OrchestrationPolicyOptions) {
       }
       queue.push(task as DispatchTask<unknown>);
       peakQueued = Math.max(peakQueued, queue.length);
+      scheduleDeadline(task as DispatchTask<unknown>);
       pump();
     });
   }

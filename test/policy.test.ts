@@ -308,6 +308,33 @@ describe("bounded orchestration policy", () => {
     policy.close();
   });
 
+  test("does not dispatch when the deadline expires during admission", async () => {
+    let clockReads = 0;
+    let dispatches = 0;
+    const policy = createOrchestrationPolicy({
+      maxActive: 1,
+      maxActivePerScope: 1,
+      maxQueued: 0,
+      now: () => (clockReads++ === 0 ? 99 : 100),
+      setTimer: () => {
+        throw new Error("an expired deadline must not arm a timer");
+      },
+      clearTimer: () => {},
+    });
+
+    const expired = policy.dispatch(
+      { scopeId: "lead", queue: "fail", deadlineMs: 100 },
+      async () => {
+        dispatches += 1;
+      },
+    );
+
+    await expect(expired).rejects.toMatchObject({ code: "timeout" });
+    expect(dispatches).toBe(0);
+    expect(policy.metrics()).toMatchObject({ active: 0, queued: 0 });
+    policy.close();
+  });
+
   test("chunks far-future deadlines without timing out on timer overflow", async () => {
     const maxTimerDelayMs = 2_147_483_647;
     let now = 0;
