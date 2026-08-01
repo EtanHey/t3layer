@@ -292,6 +292,26 @@ describe("phase 3 boundary convergence", () => {
     expect(Object.isFrozen(identity.defaultModelSelection)).toBe(true);
   });
 
+  test("project identity parsing preserves an own __proto__ JSON key", () => {
+    const replay = JSON.parse(JSON.stringify(allocateProjectCreateIdentity(
+      {
+        workspaceRoot: "/tmp/boundary-project",
+        title: "project",
+        defaultModelSelection: selection,
+      },
+      { id: ids("project-public", "command-public"), now: () => iso },
+    )));
+    replay.defaultModelSelection.options = [
+      JSON.parse('{"__proto__":{"polluted":true},"safe":1}'),
+    ];
+
+    const parsed = parseProjectCreateIdentity(replay);
+    const option = parsed.defaultModelSelection.options?.[0] as Record<string, unknown>;
+    expect(Object.hasOwn(option, "__proto__")).toBe(true);
+    expect(option.__proto__).toEqual({ polluted: true });
+    expect(Object.getPrototypeOf(option)).toBe(Object.prototype);
+  });
+
   test("project.create receives only the canonical root stored in caller identity", async () => {
     const stock = new BoundaryStock("/tmp/new-boundary");
     stock.projects.clear();

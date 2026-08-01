@@ -258,7 +258,12 @@ function jsonValue(value: unknown, field: string): unknown {
     const result: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
       if (entry === undefined) identityConflict(`${field}.${key}_must_be_json`);
-      result[key] = jsonValue(entry, `${field}.${key}`);
+      Object.defineProperty(result, key, {
+        value: jsonValue(entry, `${field}.${key}`),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
     return result;
   }
@@ -599,7 +604,8 @@ function sameThreadIdentity(
     thread.branch === input.branch &&
     thread.worktreePath === input.worktreePath &&
     thread.modelSelection.instanceId === input.modelSelection.instanceId &&
-    thread.modelSelection.model === input.modelSelection.model
+    thread.modelSelection.model === input.modelSelection.model &&
+    canonical(thread.modelSelection.options) === canonical(input.modelSelection.options)
   );
 }
 

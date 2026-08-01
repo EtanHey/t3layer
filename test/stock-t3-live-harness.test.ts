@@ -32,8 +32,8 @@ afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function canaryFixture() {
-  const root = await mkdtemp(join(tmpdir(), "t3layer-canary."));
+async function canaryFixture(prefix = "t3layer-canary.") {
+  const root = await mkdtemp(join(tmpdir(), prefix));
   temporaryRoots.push(root);
   const log = join(root, "commands.log");
   const paths: Record<string, string> = {};
@@ -149,6 +149,9 @@ describe("stock live harness lifecycle", () => {
     expect(source).toContain('validate-envelope');
     expect(source).toContain("stat -f '%Lp'");
     expect(source).toContain('staging_bytes=$(shasum -a 256');
+    expect(source).toContain('if [[ ! -e "$proof_root" ]]');
+    expect(source).not.toContain('--header "Authorization: Bearer $http_token"');
+    expect(source).toContain('--header @-');
   });
 
   test("declares fault seams across setup, live execution, and atomic finalization", async () => {
@@ -217,6 +220,26 @@ describe("stock live harness lifecycle", () => {
       expect(await Bun.file(target).exists(), seam).toBe(false);
       expect(result.stderr, seam).not.toContain("op://fixture/provider/key");
     }
+  });
+
+  test("test-mode teardown publishes only after deleting its isolated proof root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-success."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    });
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stderr).toContain("cleanup root_removed=true");
+    expect(result.stderr).not.toContain("op://fixture/provider/key");
+    expect(await Bun.file(target).exists()).toBe(true);
+    await expect(Bun.file(target).json()).resolves.toMatchObject({
+      success: true,
+      teardown: { pidStopped: true, worktreeRemoved: true, rootRemoved: true },
+    });
   });
 
   test("requires caller-held runId and candidateSha instead of trusting a stale path", async () => {
@@ -389,6 +412,13 @@ describe("stock live harness lifecycle", () => {
     expect(receipt.cancellation).toEqual({ cancelled: 2, replayed: 0 });
     expect(receipt.checksum).toMatch(/^[0-9a-f]{64}$/);
     expect((await Bun.file(fixture.receipt).stat()).mode & 0o777).toBe(0o600);
+  });
+
+  test("execute mode supports command paths containing spaces", async () => {
+    const fixture = await canaryFixture("t3layer canary. ");
+    const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], fixture.env);
+    expect(result.exitCode, result.stderr).toBe(0);
+    await expect(Bun.file(fixture.receipt).json()).resolves.toMatchObject({ success: true });
   });
 
   test("execute mode rejects artifact drift and environment identity drift", async () => {

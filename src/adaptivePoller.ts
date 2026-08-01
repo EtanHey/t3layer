@@ -7,8 +7,6 @@ const POLICY = Object.freeze({
   detailStartsPerWaitMinute: 4,
   maxActiveWaits: 8,
   maxHttpInFlight: 8,
-  firstMinuteAggregateCeiling: 64,
-  laterMinuteAggregateCeiling: 62,
   intervalMs(attempt: number): number {
     return [250, 500, 1_000, 2_000][Math.min(Math.max(0, attempt), 3)] ?? 2_000;
   },
@@ -162,6 +160,8 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
   let shellStarts = 0;
   let detailStarts = 0;
   let throttledCycles = 0;
+  let aggregateShellStartTimes: number[] = [];
+  let aggregateFirstStartAt: number | null = null;
   const slotWaiters: SlotWaiter[] = [];
 
   function pumpSlots(): void {
@@ -237,14 +237,53 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
     state.shellStartTimes = state.shellStartTimes.filter(
       (start) => instant - start < 60_000,
     );
-    const firstMinute =
+    aggregateShellStartTimes = aggregateShellStartTimes.filter(
+      (start) => instant - start < 60_000,
+    );
+    const stateFirstMinute =
       state.firstStartAt === null || instant - state.firstStartAt < 60_000;
-    const cap = firstMinute
+    const aggregateFirstMinute =
+      aggregateFirstStartAt === null || instant - aggregateFirstStartAt < 60_000;
+    const stateCap = stateFirstMinute
       ? POLICY.firstMinuteShellStarts
       : POLICY.laterMinuteShellStarts;
-    if (state.shellStartTimes.length < cap) return 0;
+    const aggregateCap = aggregateFirstMinute
+      ? POLICY.firstMinuteShellStarts
+      : POLICY.laterMinuteShellStarts;
+    const stateDelay = state.shellStartTimes.length < stateCap
+      ? 0
+      : Math.max(0, 60_000 - (instant - state.shellStartTimes[0]!));
+    const aggregateDelay = aggregateShellStartTimes.length < aggregateCap
+      ? 0
+      : Math.max(0, 60_000 - (instant - aggregateShellStartTimes[0]!));
+    const delay = Math.max(stateDelay, aggregateDelay);
+    if (delay === 0) return 0;
     throttledCycles += 1;
-    return Math.max(0, 60_000 - (instant - state.shellStartTimes[0]!));
+    return delay;
+  }
+
+  async function reserveShellStart(
+    state: EnvironmentState,
+    deadlineMs: number,
+  ): Promise<number | null> {
+    while (!closed && state.subscribers.size > 0) {
+      const instant = now();
+      if (instant >= deadlineMs) return null;
+      const delay = rateDelay(state, instant);
+      if (delay === 0) {
+        if (state.firstStartAt === null) state.firstStartAt = instant;
+        if (aggregateFirstStartAt === null) aggregateFirstStartAt = instant;
+        state.shellStartTimes.push(instant);
+        aggregateShellStartTimes.push(instant);
+        return instant;
+      }
+      await sleep(
+        Math.min(delay, Math.max(0, deadlineMs - instant)),
+        state.controller.signal,
+      );
+      expireSubscribers(state);
+    }
+    return null;
   }
 
   async function tracked<T>(
@@ -401,7 +440,7 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
         const earliestDeadline = Math.min(
           ...[...state.subscribers.values()].map((entry) => entry.deadlineMs),
         );
-        const desiredDelay = Math.max(nextDelay(state), rateDelay(state, now()));
+        const desiredDelay = nextDelay(state);
         const delay = Math.min(desiredDelay, Math.max(0, earliestDeadline - now()));
         try {
           await sleep(delay, state.controller.signal);
@@ -415,10 +454,15 @@ export function createAdaptivePoller(options: AdaptivePollerOptions) {
           ...[...state.subscribers.values()].map((entry) => entry.deadlineMs),
         );
         if (now() >= requestDeadline) continue;
-        const startedAt = now();
-        if (state.firstStartAt === null) state.firstStartAt = startedAt;
+        let startedAt: number | null = null;
+        try {
+          startedAt = await reserveShellStart(state, requestDeadline);
+        } catch {
+          if (state.subscribers.size === 0 || closed) break;
+          continue;
+        }
+        if (startedAt === null || state.subscribers.size === 0 || closed) continue;
         state.lastScheduledStart = startedAt;
-        state.shellStartTimes.push(startedAt);
         shellStarts += 1;
         try {
           const shell = await tracked(

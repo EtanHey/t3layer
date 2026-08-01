@@ -189,6 +189,44 @@ describe("stock T3 HTTP client", () => {
     expect(client.observations()).toMatchObject({ peakInFlight: 8, inFlight: 0 });
   });
 
+  test("an attempt deadline aborts while the request is still queued for capacity", async () => {
+    let releaseHeld!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHeld = resolve;
+    });
+    let starts = 0;
+    const client = createStockT3HttpClient({
+      baseUrl: "http://127.0.0.1:3774",
+      setTimer: (callback, milliseconds) => setTimeout(callback, milliseconds),
+      clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+      fetch: async (_input, init) => {
+        starts += 1;
+        if (init?.signal?.aborted) throw init.signal.reason;
+        await held;
+        return Response.json(descriptor);
+      },
+    });
+    const occupying = Array.from({ length: 8 }, () => client.getDescriptor());
+    while (starts < 8) await Promise.resolve();
+    const queued = client.getDescriptor({ deadlineMs: Date.now() + 5 }).catch((error) => error);
+    try {
+      const outcome = await Promise.race([
+        queued,
+        new Promise((resolve) => setTimeout(() => resolve("still-queued"), 50)),
+      ]);
+      expect(outcome).not.toBe("still-queued");
+      expect(outcome).toMatchObject({
+        code: "transport_unavailable",
+        detail: { reason: "deadline" },
+      });
+      expect(starts).toBe(8);
+    } finally {
+      releaseHeld();
+      await Promise.allSettled([...occupying, queued]);
+    }
+    expect(client.observations()).toMatchObject({ inFlight: 0 });
+  });
+
   test.each([
     ["local", 251, true],
     ["local", 4_999, true],

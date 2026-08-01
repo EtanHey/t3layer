@@ -114,16 +114,26 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
   let peakInFlight = 0;
   const capacityWaiters: Array<() => void> = [];
 
+  function capacityFailure(signal: AbortSignal | undefined): StockT3HttpError {
+    const reason = signal?.reason;
+    return new StockT3HttpError("transport_unavailable", null, {
+      reason:
+        reason instanceof DOMException && reason.name === "TimeoutError"
+          ? "deadline"
+          : "cancelled",
+    });
+  }
+
   async function acquireCapacity(boundary: RequestBoundaryOptions): Promise<() => void> {
     if (boundary.signal?.aborted) {
-      throw new StockT3HttpError("transport_unavailable", null, { reason: "cancelled" });
+      throw capacityFailure(boundary.signal);
     }
     if (inFlight >= MAX_HTTP_IN_FLIGHT) {
       await new Promise<void>((resolve, reject) => {
         const onAbort = () => {
           const index = capacityWaiters.indexOf(resume);
           if (index >= 0) capacityWaiters.splice(index, 1);
-          reject(new StockT3HttpError("transport_unavailable", null, { reason: "cancelled" }));
+          reject(capacityFailure(boundary.signal));
         };
         const resume = () => {
           boundary.signal?.removeEventListener("abort", onAbort);
@@ -169,14 +179,15 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
     const attempt = linkedAttemptSignal(boundary.signal, timeoutMs, setTimer, clearTimer);
     const method = init.method ?? "GET";
     requestCount += 1;
-    const releaseCapacity = await acquireCapacity(boundary);
-    const headers = new Headers(init.headers);
-    headers.set("accept", "application/json");
-    if (init.body !== undefined && init.body !== null) headers.set("content-type", "application/json");
-    if (authenticated && options.bearerToken !== undefined) {
-      headers.set("authorization", `Bearer ${options.bearerToken}`);
-    }
+    let releaseCapacity: (() => void) | undefined;
     try {
+      releaseCapacity = await acquireCapacity({ ...boundary, signal: attempt.signal });
+      const headers = new Headers(init.headers);
+      headers.set("accept", "application/json");
+      if (init.body !== undefined && init.body !== null) headers.set("content-type", "application/json");
+      if (authenticated && options.bearerToken !== undefined) {
+        headers.set("authorization", `Bearer ${options.bearerToken}`);
+      }
       const response = await fetchImpl(new URL(path, baseUrl), { ...init, headers, signal: attempt.signal });
       endpointStatusTrace.push({ method, path, status: response.status });
       let body: unknown;
@@ -202,7 +213,7 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
         reason: boundary.signal?.aborted ? "cancelled" : "request_failed",
       });
     } finally {
-      releaseCapacity();
+      releaseCapacity?.();
       attempt.cleanup();
     }
   }

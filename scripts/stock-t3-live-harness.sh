@@ -19,7 +19,16 @@ candidate_sha=''
 artifact_digest=''
 actual_stock_sha=''
 run_id=''
+finalizer_source=''
 test_mode=${T3_STOCK_HARNESS_TEST_MODE:-0}
+
+run_finalizer() {
+  printf '%s' "$finalizer_source" | bun run - "$@"
+}
+
+authenticated_curl() {
+  printf 'Authorization: Bearer %s\n' "$http_token" | /usr/bin/curl --header @- "$@"
+}
 
 run_stage_seam() {
   stage=$1
@@ -72,7 +81,7 @@ cleanup() {
   fi
   if [[ "$cleanup_root_valid" == true && -n "$proof_root" && "$proof_root" != / && "$proof_root" != "$HOME" && ! -L "$proof_root" ]]; then
     rm -rf -- "$proof_root"
-    root_removed=true
+    if [[ ! -e "$proof_root" ]]; then root_removed=true; fi
   fi
   if [[ "$cleanup_status" -eq 0 && "$proof_ready" == true && "$pid_stopped" == true && "$worktree_removed" == true && "$root_removed" == true ]]; then
     proof_dir=$(dirname "$proof_target")
@@ -95,7 +104,7 @@ cleanup() {
       echo "ERROR: injected failure: before-final-body-validation" >&2
       exit 91
     fi
-    if ! bun "$t3layer_clean/scripts/stock-proof-cli.ts" publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha"; then
+    if ! run_finalizer publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha"; then
       rm -f -- "$final_body_staging" "$final_staging"
       exit 2
     fi
@@ -118,7 +127,7 @@ cleanup() {
     fi
     chmod 600 "$proof_target"
     final_bytes=$(shasum -a 256 "$proof_target" | /usr/bin/awk '{print $1}')
-    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! bun "$t3layer_clean/scripts/stock-proof-cli.ts" validate-envelope "$proof_target" "$run_id" "$candidate_sha"; then
+    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha"; then
       rm -f -- "$proof_target"
       echo "ERROR: final proof bytes, mode, checksum, identity, or teardown mismatch" >&2
       exit 2
@@ -191,6 +200,13 @@ if [[ "$test_mode" != 1 ]]; then
   (cd "$t3layer_clean" && bun install --frozen-lockfile)
 fi
 run_stage_seam after-candidate-install
+finalizer_bundle="$proof_root/stock-proof-finalizer.mjs"
+(cd "$t3layer_clean" && bun build scripts/stock-proof-cli.ts --target=bun --format=esm --outfile "$finalizer_bundle" >/dev/null)
+finalizer_source=$(<"$finalizer_bundle")
+if [[ -z "$finalizer_source" ]]; then
+  echo "ERROR: empty stock proof finalizer bundle" >&2
+  exit 2
+fi
 
 legacy_scope='@t3tools'
 legacy_name='runtime''-client'
@@ -270,10 +286,9 @@ else
   --arg createdAt "$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')" \
   --arg workspace "$workspace" \
   '{type:"thread.turn.start",commandId:$commandId,threadId:$threadId,message:{messageId:$messageId,role:"user",text:"negative",attachments:[]},runtimeMode:"full-access",interactionMode:"default",bootstrap:{createThread:{projectId:"00000000-0000-4000-8000-000000000000",title:"negative",modelSelection:{instanceId:"claudeAgent",model:"claude-sonnet-4-5"},runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,createdAt:$createdAt}},createdAt:$createdAt}')
-negative_status=$(/usr/bin/curl --silent --show-error --output "$negative_body" --write-out '%{http_code}' \
+negative_status=$(authenticated_curl --silent --show-error --output "$negative_body" --write-out '%{http_code}' \
   --max-time 5 \
   --request POST \
-  --header "Authorization: Bearer $http_token" \
   --header 'Content-Type: application/json' \
   --data "$negative_payload" \
   http://127.0.0.1:3774/api/orchestration/dispatch)
@@ -282,14 +297,12 @@ negative_status=$(/usr/bin/curl --silent --show-error --output "$negative_body" 
   exit 2
 fi
 negative_shell_body="$proof_root/negative-shell.json"
-negative_shell_status=$(/usr/bin/curl --silent --show-error --output "$negative_shell_body" --write-out '%{http_code}' \
+negative_shell_status=$(authenticated_curl --silent --show-error --output "$negative_shell_body" --write-out '%{http_code}' \
   --max-time 5 \
-  --header "Authorization: Bearer $http_token" \
   http://127.0.0.1:3774/api/orchestration/shell)
 negative_detail_body="$proof_root/negative-detail.json"
-negative_detail_status=$(/usr/bin/curl --silent --show-error --output "$negative_detail_body" --write-out '%{http_code}' \
+negative_detail_status=$(authenticated_curl --silent --show-error --output "$negative_detail_body" --write-out '%{http_code}' \
   --max-time 5 \
-  --header "Authorization: Bearer $http_token" \
   "http://127.0.0.1:3774/api/orchestration/threads/$negative_thread_id")
   if [[ "$negative_shell_status" != 200 || "$negative_detail_status" != 404 ]] || /usr/bin/jq -e --arg id "$negative_thread_id" '.threads[]? | select(.id == $id)' "$negative_shell_body" >/dev/null; then
   echo "ERROR: direct HTTP bootstrap unexpectedly created a thread" >&2

@@ -15,6 +15,8 @@ describe("exact-stock characterization driver", () => {
     );
     expect(source).toContain("trap cleanup EXIT INT TERM");
     expect(source).toContain('rm -f -- "$generated_path"');
+    expect(source).toContain('if [[ -e "$generated_path" ]]');
+    expect(source).toContain("generated characterization path already exists");
   });
 
   test.skipIf(exactTree === undefined || exactToolchain === undefined)(

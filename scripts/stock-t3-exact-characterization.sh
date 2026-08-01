@@ -12,6 +12,11 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
   exit 2
 fi
 
+if [[ -e "$generated_path" ]]; then
+  echo "ERROR: generated characterization path already exists" >&2
+  exit 3
+fi
+
 cleanup() {
   rm -f -- "$generated_path"
 }

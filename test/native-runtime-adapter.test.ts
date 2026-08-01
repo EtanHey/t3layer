@@ -407,6 +407,34 @@ describe("stock native runtime read-only resume", () => {
     });
     expect(dispatches).toBe(0);
   });
+
+  test("treats different model options as a true thread identity conflict", async () => {
+    let dispatches = 0;
+    const runtime = createStockT3NativeRuntime({
+      client: baseClient({
+        getShell: async () => shell(9),
+        getThread: async () => detail(9, [], {
+          modelSelection: { ...modelSelection, options: [{ temperature: 1 }] },
+        }),
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 10 };
+        },
+      }),
+      id: ids(),
+      now: () => iso,
+    });
+    const pending = await pendingReceipt(runtime);
+    const result = await runtime.resumeCreateReconciliation(pending, spawnInput, {
+      maxReconciliationReads: 1,
+    });
+    expect(result).toMatchObject({
+      kind: "create_protocol_failure",
+      provisionalRef: pending.provisionalRef,
+      conflict: { source: "detail" },
+    });
+    expect(dispatches).toBe(0);
+  });
 });
 
 describe("stock native runtime inclusive create deadline", () => {

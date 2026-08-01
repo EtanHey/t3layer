@@ -79,8 +79,8 @@ describe("environment-coalesced adaptive poller", () => {
     expect(policy.detailStartsPerWaitMinute).toBe(4);
     expect(policy.maxActiveWaits).toBe(8);
     expect(policy.maxHttpInFlight).toBe(8);
-    expect(policy.firstMinuteAggregateCeiling).toBe(64);
-    expect(policy.laterMinuteAggregateCeiling).toBe(62);
+    expect("firstMinuteAggregateCeiling" in policy).toBe(false);
+    expect("laterMinuteAggregateCeiling" in policy).toBe(false);
   });
 
   test("enforces the global eight-request in-flight cap across environments", async () => {
@@ -398,7 +398,7 @@ describe("environment-coalesced adaptive poller", () => {
     const waits = Array.from({ length: 8 }, (_, index) =>
       poller
         .waitFor({
-          environmentId: "env-1",
+          environmentId: `env-${index}`,
           threadId: `thread-${index}`,
           deadlineMs: 120_000,
           evaluate: () => ({ done: false, detail: true }),

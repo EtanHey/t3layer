@@ -117,7 +117,7 @@ trap recover EXIT INT TERM
 verify_health() {
   stage=$1
   run_step "$stage-readiness" "$T3_STOCK_READINESS_COMMAND"
-  descriptor=$($T3_STOCK_DESCRIPTOR_COMMAND)
+  descriptor=$("$T3_STOCK_DESCRIPTOR_COMMAND")
   if ! /usr/bin/jq -e 'type == "object" and (.environmentId|type == "string" and length > 0) and (.serverVersion|type == "string" and length > 0)' <<<"$descriptor" >/dev/null; then
     echo "ERROR: invalid descriptor evidence" >&2
     return 2
@@ -132,7 +132,7 @@ verify_health() {
   fi
   record_status "$stage-descriptor" 0
   if [[ ${T3_STOCK_FAIL_AT:-} == "$stage-descriptor" ]]; then return 91; fi
-  thread=$($T3_STOCK_THREAD_READ_COMMAND)
+  thread=$("$T3_STOCK_THREAD_READ_COMMAND")
   if ! /usr/bin/jq -e 'type == "object" and (.threadId|type == "string" and length > 0) and .readable == true' <<<"$thread" >/dev/null; then
     echo "ERROR: existing thread is not readable" >&2
     return 2
@@ -165,7 +165,7 @@ run_step route-prior-canary "$T3_STOCK_ROUTE_CANARY_COMMAND"
 verify_health prior-canary
 run_step final-route-off "$T3_STOCK_ROUTE_OFF_COMMAND"
 cancellation_status=0
-cancellation_evidence=$($T3_STOCK_CANCEL_WAITS_COMMAND) || cancellation_status=$?
+cancellation_evidence=$("$T3_STOCK_CANCEL_WAITS_COMMAND") || cancellation_status=$?
 record_status cancel-waits "$cancellation_status"
 if [[ "$cancellation_status" -ne 0 ]] || ! /usr/bin/jq -e 'type == "object" and (.cancelled|type == "number" and . >= 0) and .replayed == 0' <<<"$cancellation_evidence" >/dev/null; then
   echo "ERROR: invalid cancellation/no-replay evidence" >&2
