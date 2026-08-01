@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+T3_STOCK_SHA=d3037064e61a9f059eafbd4f9869679779bd2a7c
+stock_repo=/Users/etanheyman/Gits/t3code
+candidate_repo=/Users/etanheyman/Gits/t3layer-stock-http-runtime
+proof_target=${T3_STOCK_PROOF_TARGET:-/Users/etanheyman/Gits/t3layer/docs.local/audits/t3layer-stock-t3-realignment/phase-3-stock-live-proof.json}
+proof_root=''
+stock_tree=''
+server_pid=''
+server_birth=''
+cleanup_root_valid=false
+pid_stopped=false
+worktree_removed=false
+root_removed=false
+proof_ready=false
+provisional_json=''
+candidate_sha=''
+artifact_digest=''
+actual_stock_sha=''
+run_id=''
+test_mode=${T3_STOCK_HARNESS_TEST_MODE:-0}
+
+run_stage_seam() {
+  stage=$1
+  if [[ "$test_mode" == 1 ]]; then
+    : "${T3_STOCK_HARNESS_COMMAND_RUNNER:?required in test mode}"
+    "$T3_STOCK_HARNESS_COMMAND_RUNNER" "$stage" "$proof_root"
+  fi
+  fail_at "$stage"
+}
+
+fail_at() {
+  if [[ ${T3_STOCK_FAIL_AT:-} == "$1" ]]; then
+    echo "ERROR: injected failure: $1" >&2
+    exit 91
+  fi
+}
+
+cleanup() {
+  cleanup_status=$?
+  set +e
+  if [[ -n "$server_pid" && -n "$server_birth" && "$server_pid" =~ ^[0-9]+$ ]]; then
+    current_birth=$(/bin/ps -o lstart= -p "$server_pid" 2>/dev/null | /usr/bin/xargs)
+    current_cwd=$(/usr/sbin/lsof -a -p "$server_pid" -d cwd -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p')
+    if [[ -n "$current_birth" && "$current_birth" == "$server_birth" && "$current_cwd" == "$workspace" ]]; then
+      /bin/kill -TERM "$server_pid" 2>/dev/null
+      for _stop_attempt in {1..20}; do
+        if ! /bin/kill -0 "$server_pid" 2>/dev/null; then break; fi
+        sleep 0.1
+      done
+      if /bin/kill -0 "$server_pid" 2>/dev/null; then
+        /bin/kill -KILL "$server_pid" 2>/dev/null
+      fi
+      wait "$server_pid" 2>/dev/null
+      if ! /bin/kill -0 "$server_pid" 2>/dev/null; then pid_stopped=true; fi
+    fi
+  else
+    pid_stopped=true
+  fi
+  if [[ -n "$stock_tree" ]]; then
+    registered_paths=$(/usr/bin/git -C "$stock_repo" worktree list --porcelain 2>/dev/null)
+    if /usr/bin/grep -F -x -q -- "worktree $stock_tree" <<<"$registered_paths"; then
+      /usr/bin/git -C "$stock_repo" worktree remove --force "$stock_tree" >/dev/null 2>&1
+    fi
+    registered_after=$(/usr/bin/git -C "$stock_repo" worktree list --porcelain 2>/dev/null)
+    if ! /usr/bin/grep -F -x -q -- "worktree $stock_tree" <<<"$registered_after"; then
+      worktree_removed=true
+    fi
+  elif [[ -z "$stock_tree" || ! -e "$stock_tree" ]]; then
+    worktree_removed=true
+  fi
+  if [[ "$cleanup_root_valid" == true && -n "$proof_root" && "$proof_root" != / && "$proof_root" != "$HOME" && ! -L "$proof_root" ]]; then
+    rm -rf -- "$proof_root"
+    root_removed=true
+  fi
+  if [[ "$cleanup_status" -eq 0 && "$proof_ready" == true && "$pid_stopped" == true && "$worktree_removed" == true && "$root_removed" == true ]]; then
+    proof_dir=$(dirname "$proof_target")
+    mkdir -p -- "$proof_dir"
+    final_body_staging=$(mktemp "$proof_dir/.phase-3-stock-live-proof-body.XXXXXX")
+    final_staging=$(mktemp "$proof_dir/.phase-3-stock-live-proof.XXXXXX")
+    chmod 600 "$final_body_staging" "$final_staging"
+    final_body=$(/usr/bin/jq -cS -n \
+      --arg runId "$run_id" \
+      --arg candidateSha "$candidate_sha" \
+      --arg stockSha "$actual_stock_sha" \
+      --arg artifactDigest "$artifact_digest" \
+      --argjson live "$provisional_json" \
+      --argjson negativeShellStatus "$negative_shell_status" \
+      --argjson negativeDetailStatus "$negative_detail_status" \
+      '{runId:$runId,candidateSha:$candidateSha,stockSha:$stockSha,success:true,cleanBeforeBuild:true,artifactDigest:$artifactDigest,privateResolution:false,provenance:{stockInstall:{command:"corepack pnpm install --frozen-lockfile",status:0},stockBuild:{command:"corepack pnpm --filter t3 build:bundle",status:0},candidateInstall:{command:"bun install --frozen-lockfile",status:0},exactCharacterization:{command:"corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts",status:0},isolatedBasenames:["stock-tree","t3layer-clean","server-home","workspace"]},exactHttpNegative:{status:500,shellStatus:$negativeShellStatus,detailStatus:$negativeDetailStatus,code:"internal_error",reason:"orchestration_dispatch_failed",threadAbsent:true},live:($live|del(.provisional,.success,.runId)),teardown:{pidStopped:true,worktreeRemoved:true,rootRemoved:true}}')
+    printf '%s\n' "$final_body" >"$final_body_staging"
+    if [[ ${T3_STOCK_FAIL_AT:-} == before-final-body-validation ]]; then
+      rm -f -- "$final_body_staging" "$final_staging"
+      echo "ERROR: injected failure: before-final-body-validation" >&2
+      exit 91
+    fi
+    if ! bun "$t3layer_clean/scripts/stock-proof-cli.ts" publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha"; then
+      rm -f -- "$final_body_staging" "$final_staging"
+      exit 2
+    fi
+    if [[ ${T3_STOCK_FAIL_AT:-} == after-final-body-validation ]]; then
+      rm -f -- "$final_body_staging" "$final_staging"
+      echo "ERROR: injected failure: after-final-body-validation" >&2
+      exit 91
+    fi
+    [[ $(/usr/bin/stat -f '%Lp' "$final_staging") == 600 ]]
+    staging_bytes=$(shasum -a 256 "$final_staging" | /usr/bin/awk '{print $1}')
+    if ! node -e 'const fs=require("node:fs");const [source,target]=process.argv.slice(1);const fd=fs.openSync(source,"r+");fs.fsyncSync(fd);fs.closeSync(fd);fs.renameSync(source,target);const check=fs.openSync(target,"r");fs.fsyncSync(check);fs.closeSync(check)' "$final_staging" "$proof_target"; then
+      rm -f -- "$final_body_staging" "$final_staging"
+      exit 2
+    fi
+    rm -f -- "$final_body_staging"
+    if [[ ${T3_STOCK_FAIL_AT:-} == after-final-rename ]]; then
+      rm -f -- "$proof_target"
+      echo "ERROR: injected failure: after-final-rename" >&2
+      exit 91
+    fi
+    chmod 600 "$proof_target"
+    final_bytes=$(shasum -a 256 "$proof_target" | /usr/bin/awk '{print $1}')
+    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! bun "$t3layer_clean/scripts/stock-proof-cli.ts" validate-envelope "$proof_target" "$run_id" "$candidate_sha"; then
+      rm -f -- "$proof_target"
+      echo "ERROR: final proof bytes, mode, checksum, identity, or teardown mismatch" >&2
+      exit 2
+    fi
+  fi
+  echo "cleanup root_removed=$root_removed worktree_removed=$worktree_removed pid_stopped=$pid_stopped" >&2
+  exit "$cleanup_status"
+}
+
+: "${T3_STOCK_PROVIDER_SECRET_REF:?T3_STOCK_PROVIDER_SECRET_REF is required}"
+proof_root=$(mktemp -d "${TMPDIR:-/tmp}/t3layer-stock-proof.XXXXXX")
+trap cleanup EXIT INT TERM
+
+canonical_root=$(cd "$proof_root" && pwd -P)
+canonical_temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+expected_prefix="$canonical_temp_base/t3layer-stock-proof."
+case "$canonical_root" in
+  "$expected_prefix"*) ;;
+  *) echo "ERROR: invalid proof root" >&2; exit 2 ;;
+esac
+if [[ -L "$proof_root" || "$canonical_root" == / || "$canonical_root" == "$HOME" ]]; then
+  echo "ERROR: unsafe proof root" >&2
+  exit 2
+fi
+cleanup_root_valid=true
+run_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
+stock_tree="$proof_root/stock-tree"
+t3layer_clean="$proof_root/t3layer-clean"
+server_home="$proof_root/server-home"
+workspace="$proof_root/workspace"
+server_log="$proof_root/server.log"
+provisional="$proof_root/provisional.json"
+mkdir -p -- "$t3layer_clean" "$server_home" "$workspace"
+: >"$server_log"
+: >"$provisional"
+chmod 600 "$server_log" "$provisional"
+
+run_stage_seam after-proof-root
+if [[ "$test_mode" == 1 ]]; then
+  stock_tree=''
+  actual_stock_sha=$T3_STOCK_SHA
+else
+  /usr/bin/git -C "$stock_repo" worktree add --detach "$stock_tree" "$T3_STOCK_SHA"
+fi
+run_stage_seam after-worktree-add
+if [[ "$test_mode" != 1 ]]; then
+  actual_stock_sha=$(/usr/bin/git -C "$stock_tree" rev-parse HEAD)
+  [[ "$actual_stock_sha" == "$T3_STOCK_SHA" ]]
+  [[ -z $(/usr/bin/git -C "$stock_tree" status --short) ]]
+  (cd "$stock_tree" && corepack pnpm install --frozen-lockfile)
+fi
+run_stage_seam after-stock-install
+if [[ "$test_mode" != 1 ]]; then
+  (cd "$stock_tree" && corepack pnpm --filter t3 build:bundle)
+fi
+run_stage_seam after-stock-build
+if [[ "$test_mode" == 1 ]]; then
+  candidate_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  artifact_digest=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  mkdir -p -- "$t3layer_clean/scripts" "$t3layer_clean/src"
+  /bin/cp "$candidate_repo/scripts/stock-proof-cli.ts" "$t3layer_clean/scripts/stock-proof-cli.ts"
+  /bin/cp "$candidate_repo/src/stockProof.ts" "$t3layer_clean/src/stockProof.ts"
+else
+  candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)
+  /usr/bin/git -C "$candidate_repo" archive HEAD | /usr/bin/tar -x -C "$t3layer_clean"
+  artifact_digest=$(/usr/bin/git -C "$candidate_repo" archive HEAD | shasum -a 256 | /usr/bin/awk '{print $1}')
+fi
+run_stage_seam after-archive-extract
+if [[ "$test_mode" != 1 ]]; then
+  (cd "$t3layer_clean" && bun install --frozen-lockfile)
+fi
+run_stage_seam after-candidate-install
+
+legacy_scope='@t3tools'
+legacy_name='runtime''-client'
+if [[ "$test_mode" != 1 ]] && (cd "$t3layer_clean" && bun -e "await import('${legacy_scope}/${legacy_name}')" >/dev/null 2>&1); then
+  echo "ERROR: archived candidate resolves retired package" >&2
+  exit 2
+fi
+
+exact_failure=''
+if [[ ${T3_STOCK_FAIL_AT:-} == after-generated-fixture ]]; then
+  exact_failure=after-generated-fixture
+fi
+if [[ "$test_mode" != 1 ]]; then
+  T3_STOCK_EXACT_FAIL_AT="$exact_failure" bash "$t3layer_clean/scripts/stock-t3-exact-characterization.sh" "$stock_tree"
+fi
+run_stage_seam after-exact-characterization
+if [[ "$test_mode" == 1 ]]; then
+  http_token=test-mode-redacted
+else
+  http_token=$(node "$stock_tree/apps/server/dist/bin.mjs" auth session issue --base-dir "$server_home" --ttl 30m --label t3layer-stock-proof --subject t3layer-stock-proof --token-only)
+fi
+run_stage_seam after-bearer-issue
+if [[ "$test_mode" != 1 ]] && /usr/sbin/lsof -nP -iTCP:3774 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "ERROR: port 3774 already bound" >&2
+  exit 2
+fi
+set +x
+if [[ "$test_mode" == 1 ]]; then
+  provider_key=test-mode-redacted
+else
+  provider_key=$(op read "$T3_STOCK_PROVIDER_SECRET_REF")
+fi
+run_stage_seam after-secret-read
+if [[ "$test_mode" != 1 ]]; then
+  (cd "$workspace" && ANTHROPIC_API_KEY="$provider_key" exec node "$stock_tree/apps/server/dist/bin.mjs" serve --host 127.0.0.1 --port 3774 --base-dir "$server_home") >"$server_log" 2>&1 &
+  server_pid=$!
+  server_birth=$(/bin/ps -o lstart= -p "$server_pid" | /usr/bin/xargs)
+  unset provider_key
+  server_cwd=$(/usr/sbin/lsof -a -p "$server_pid" -d cwd -Fn | /usr/bin/sed -n 's/^n//p')
+  [[ "$server_cwd" == "$workspace" ]]
+else
+  unset provider_key
+fi
+run_stage_seam after-server-launch
+
+ready=false
+if [[ "$test_mode" == 1 ]]; then
+  ready=true
+else
+  for _attempt in {1..30}; do
+    /bin/kill -0 "$server_pid" 2>/dev/null || break
+    descriptor_body=$(/usr/bin/curl --silent --fail --max-time 0.5 http://127.0.0.1:3774/.well-known/t3/environment 2>/dev/null || true)
+    if /usr/bin/jq -e 'type == "object" and (.environmentId|type == "string" and length > 0) and (.serverVersion|type == "string" and length > 0)' <<<"$descriptor_body" >/dev/null 2>&1; then
+      ready=true
+      break
+    fi
+    sleep 0.5
+  done
+fi
+[[ "$ready" == true ]]
+run_stage_seam after-readiness
+
+if [[ "$test_mode" == 1 ]]; then
+  negative_shell_status=200
+  negative_detail_status=404
+else
+  negative_thread_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
+  negative_command_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
+  negative_message_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
+  negative_body="$proof_root/exact-http-negative.json"
+  : >"$negative_body"
+  chmod 600 "$negative_body"
+  negative_payload=$(/usr/bin/jq -n \
+  --arg commandId "$negative_command_id" \
+  --arg threadId "$negative_thread_id" \
+  --arg messageId "$negative_message_id" \
+  --arg createdAt "$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')" \
+  --arg workspace "$workspace" \
+  '{type:"thread.turn.start",commandId:$commandId,threadId:$threadId,message:{messageId:$messageId,role:"user",text:"negative",attachments:[]},runtimeMode:"full-access",interactionMode:"default",bootstrap:{createThread:{projectId:"00000000-0000-4000-8000-000000000000",title:"negative",modelSelection:{instanceId:"claudeAgent",model:"claude-sonnet-4-5"},runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,createdAt:$createdAt}},createdAt:$createdAt}')
+negative_status=$(/usr/bin/curl --silent --show-error --output "$negative_body" --write-out '%{http_code}' \
+  --max-time 5 \
+  --request POST \
+  --header "Authorization: Bearer $http_token" \
+  --header 'Content-Type: application/json' \
+  --data "$negative_payload" \
+  http://127.0.0.1:3774/api/orchestration/dispatch)
+  if [[ "$negative_status" != 500 ]] || ! /usr/bin/jq -e '.code == "internal_error" and .reason == "orchestration_dispatch_failed"' "$negative_body" >/dev/null; then
+  echo "ERROR: exact HTTP bootstrap negative did not match stock" >&2
+  exit 2
+fi
+negative_shell_body="$proof_root/negative-shell.json"
+negative_shell_status=$(/usr/bin/curl --silent --show-error --output "$negative_shell_body" --write-out '%{http_code}' \
+  --max-time 5 \
+  --header "Authorization: Bearer $http_token" \
+  http://127.0.0.1:3774/api/orchestration/shell)
+negative_detail_body="$proof_root/negative-detail.json"
+negative_detail_status=$(/usr/bin/curl --silent --show-error --output "$negative_detail_body" --write-out '%{http_code}' \
+  --max-time 5 \
+  --header "Authorization: Bearer $http_token" \
+  "http://127.0.0.1:3774/api/orchestration/threads/$negative_thread_id")
+  if [[ "$negative_shell_status" != 200 || "$negative_detail_status" != 404 ]] || /usr/bin/jq -e --arg id "$negative_thread_id" '.threads[]? | select(.id == $id)' "$negative_shell_body" >/dev/null; then
+  echo "ERROR: direct HTTP bootstrap unexpectedly created a thread" >&2
+  exit 2
+  fi
+fi
+run_stage_seam after-http-negative
+
+export T3_STOCK_BASE_URL=http://127.0.0.1:3774
+export T3_STOCK_HTTP_TOKEN="$http_token"
+export T3_STOCK_WORKSPACE_ROOT="$workspace"
+export T3_STOCK_RECEIPT_PATH="$provisional"
+export T3_STOCK_RUN_ID="$run_id"
+if [[ "$test_mode" == 1 ]]; then
+  provisional_json=$(/usr/bin/jq -cS -n --arg runId "$run_id" '{provisional:true,success:false,runId:$runId,environmentId:"environment-fixture",serverVersion:"stock",endpointStatusTrace:[{method:"GET",path:"/.well-known/t3/environment",status:200},{method:"GET",path:"/api/orchestration/shell",status:200},{method:"GET",path:"/api/orchestration/shell",status:200},{method:"GET",path:"/api/orchestration/shell",status:200},{method:"GET",path:"/api/orchestration/threads/thread-id",status:200},{method:"GET",path:"/api/orchestration/threads/thread-id",status:200},{method:"POST",path:"/api/orchestration/dispatch",status:200},{method:"POST",path:"/api/orchestration/dispatch",status:200},{method:"POST",path:"/api/orchestration/dispatch",status:200}],ids:{projectId:"project-id",threadId:"thread-id",createCommandId:"create-id",initialCommandId:"initial-id",initialMessageId:"initial-message",followupCommandId:"followup-id",followupMessageId:"followup-message"},sequences:{create:1,initial:2,followup:3},counters:{requests:9,shellPolls:3,detailPolls:2,peakInFlight:1},terminalKinds:["completed","completed"],timestamps:{startedAt:"2026-07-31T00:00:00.000Z",completedAt:"2026-07-31T00:01:00.000Z"}}')
+  printf '%s\n' "$provisional_json" >"$provisional"
+else
+  (cd "$t3layer_clean" && T3_STOCK_LIVE=1 bun test test/stock-t3-live.test.ts --timeout 120000)
+fi
+run_stage_seam after-live-test
+
+if [[ "$test_mode" != 1 ]]; then
+  bun "$t3layer_clean/scripts/stock-proof-cli.ts" validate-provisional "$provisional" "$run_id"
+fi
+run_stage_seam after-provisional-validation
+
+if [[ "$test_mode" != 1 ]]; then
+  provisional_json=$(/usr/bin/jq -cS \
+    --arg runId "$run_id" \
+    'select(.provisional == true and .success == false and .runId == $runId)' \
+    "$provisional")
+fi
+if [[ -z "$provisional_json" ]]; then
+  echo "ERROR: invalid live provisional evidence" >&2
+  exit 2
+fi
+proof_ready=true
+run_stage_seam before-normal-exit
+echo "LIVE PROVISIONAL WRITTEN runId=$run_id candidateSha=$candidate_sha artifactDigest=$artifact_digest target=$proof_target"

@@ -1,18 +1,15 @@
 {
   "name": "t3layer",
-  "private": true,
-  "type": "module",
-  "packageManager": "bun@1.3.11",
-  "scripts": {
-    "test": "bun test",
-    "typecheck": "tsc --noEmit"
-  },
   "devDependencies": {
     "@types/bun": "1.3.11",
     "typescript": "~6.0.3"
   },
-  "dependencies": {
-    "@t3tools/runtime-client": "https://github.com/EtanHey/t3code/releases/download/runtime-client-v0.0.31-rpc.2/t3tools-runtime-client-0.0.31-rpc.2.tgz",
-    "effect": "4.0.0-beta.102"
-  }
+  "packageManager": "bun@1.3.11",
+  "private": true,
+  "scripts": {
+    "check:stock-only": "bash scripts/check-stock-only.sh",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module"
 }

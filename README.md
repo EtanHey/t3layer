@@ -1,64 +1,216 @@
 # T3Layer
 
-T3Layer is an experimental TypeScript control-plane facade for native
-[T3 Code](https://t3.codes/) projects, threads, turns, and lifecycle events.
-It is designed to coordinate coding agents through T3 Code's structured APIs
-without parsing terminal output or maintaining a second agent registry.
+T3Layer is an experimental TypeScript orchestration facade for an unmodified
+stock [T3 Code](https://t3.codes/) server. Stock T3 remains the only durable
+owner of projects, threads, messages, turns, sessions, approvals, checkpoints,
+and provider state. T3Layer keeps only bounded process-local receipts, causal
+wait leases, polling cursors, evidence, and orchestration policy.
 
 > [!WARNING]
-> T3Layer is in early development. It has no stable public API or release yet.
-> The narrow protocol code currently in this repository is prototype evidence,
-> not a supported T3 Code client.
+> T3Layer is pre-release software. Use disposable workspaces and a scoped,
+> short-lived T3 bearer while testing it.
 
-T3Layer is an independent project and is not an official T3 Code product.
+T3Layer is independent and is not an official T3 Code product.
 
-## Design principles
+## Stock HTTP boundary
 
-- T3 Code remains the source of truth for agent identity and lifecycle.
-- A native T3 thread ID is the durable agent ID.
-- Transport adaptation, compatibility checks, timeouts, and bounded resource
-  policy belong in T3Layer.
-- Agent transcripts, approvals, provider sessions, and UI state do not.
-- Lifecycle decisions come from structured state and events, never terminal
-  panes, titles, or model prose.
+The baseline transport uses only the public stock endpoints below:
 
-## Intended API
+- `GET /.well-known/t3/environment`
+- `POST /oauth/token` when a bootstrap credential must be exchanged
+- `GET /api/orchestration/shell`
+- `GET /api/orchestration/threads/:threadId`
+- `POST /api/orchestration/dispatch`
 
-The planned facade is deliberately small:
+Dispatch always uses authenticated HTTP. Observation uses one coalesced shell
+poller per environment plus conditional thread-detail reads. Socket framing,
+server source imports, direct database access, copied runtime internals, and a
+second transcript/lifecycle store are outside the baseline.
+
+Configure a runtime directly:
 
 ```ts
-spawn(input): Promise<AgentSnapshot>
-send(agentId, message): Promise<TurnReceipt>
-wait(agentId, condition): AsyncIterable<AgentEvent>
-getState(agentId): Promise<AgentSnapshot>
-interrupt(agentId): Promise<void>
-stop(agentId): Promise<void>
+import { createStockT3Facade } from "./src/facade";
+import { createStockT3NativeRuntime } from "./src/nativeRuntime";
+
+const runtime = createStockT3NativeRuntime({
+  baseUrl: "http://127.0.0.1:3774",
+  bearerToken: process.env.T3_STOCK_HTTP_TOKEN,
+  connectionProfile: "local",
+});
+const t3 = createStockT3Facade(runtime);
 ```
 
-These signatures describe project direction, not a released implementation.
+Never log the bearer, authorization headers, bootstrap credentials, provider
+keys, prompts, or raw responses. The live harness accepts a 1Password reference
+through `T3_STOCK_PROVIDER_SECRET_REF`; the resolved value is scoped only to the
+owned isolated server child.
 
-## Development
+## Causal API
 
-Declared toolchain target:
+Project lookup remains stock-authoritative. If a unique project for
+`workspaceRoot` is already visible, `spawn` may resolve it without a creation
+identity. If no project exists, the caller must preallocate and retain the full
+immutable `projectCreateIdentity`: cryptographically random project and command
+IDs plus `createdAt`, workspace root, project title, and default model selection.
+The same object must be reused after a timeout, runtime recreation, or by
+simultaneous runtime objects participating in the same logical attempt.
+Identity-free creation fails before dispatch as
+`identity_conflict/project_create_identity_required`; T3Layer never derives a
+deterministic ID from a workspace root or relies on a process-local map for
+duplicate prevention.
 
-- [Bun](https://bun.sh/) 1.3.11
-- TypeScript 6.0.x
+```ts
+import {
+  allocateProjectCreateIdentity,
+  parseProjectCreateIdentity,
+} from "./src/facade";
+
+const projectCreateIdentity = allocateProjectCreateIdentity({
+  workspaceRoot,
+  title: "My stock project",
+  defaultModelSelection: modelSelection,
+});
+const restoredIdentity = parseProjectCreateIdentity(
+  JSON.parse(JSON.stringify(projectCreateIdentity)),
+  { workspaceRoot },
+);
+
+await t3.spawn({
+  workspaceRoot,
+  projectCreateIdentity: restoredIdentity,
+  title: "worker",
+  message: "Start",
+  modelSelection,
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+});
+```
+
+HTTP spawn is a two-stage operation:
+
+```text
+thread.create -> shell/detail identity reconciliation
+              -> fresh empty-thread preflight
+              -> bootstrap-free thread.turn.start
+```
+
+`spawn` returns either a fully reconciled `spawned` result, a truthful partial
+result for a durable thread whose initial turn is not proven, a
+`create_reconciliation_pending` result with its provisional scoped reference,
+or a ref-preserving protocol failure. Pending create reconciliation is read-only
+until identity is established; it never hides or deletes the stock thread.
+
+`send` returns a `TurnReceipt`. Only `wait(receipt, ...)` may claim causal turn
+completion. One expiring send lease is allowed per scoped thread. A bare thread
+reference can be observed but cannot be upgraded into a causal completion claim
+after process restart or lease loss. Receipts use `leaseState: "active"` while
+executable. External-writer terminal partials retain the complete accepted or
+ambiguous receipt as `leaseState: "released"`; that evidence is not executable
+and `wait` rejects it as `receipt_expired`.
+
+Workspace roots cross one stock-compatible ingress seam before lookup, identity
+validation, payload construction, or comparison: whitespace is trimmed, `~` is
+expanded, relative paths become absolute, trailing separators are normalized,
+and Windows drive/UNC comparison is case-insensitive. The canonical root is
+stored in project-create identities and evidence. `createdAt` remains
+allocator-owned because an ambiguous stock command retry must replay the entire
+original command byte-for-byte.
+
+The distinct-ID correlation contract fails closed on observable overlap:
+`superseded`, `concurrent_writer`, or `causality_unverifiable`. Deliberate reuse
+of the exact target message ID with indistinguishable time and payload is outside
+the deterministic guarantee because stock exposes no public command-to-turn
+causation field.
+
+## Polling and request budgets
+
+- Healthy shell cadence after dispatch: 250 ms, 500 ms, 1 s, then 2 s.
+- Shell starts: at most 32 in minute one, then 30 per rolling minute.
+- Detail amplification: at most four reads per active wait/minute and no
+  overlapping detail read for one thread.
+- Capacity: eight active waits and eight total HTTP requests per client.
+- Aggregate ceiling for eight fast waits: 64 starts in minute one and 62 in a
+  later full minute; slow requests reduce starts because attempts do not overlap.
+- Attempt deadline: 5 s for `local`; 15 s independently for `relay` and
+  `tunnel`, always capped by the operation deadline.
+- Default operation/lease deadline: 15 minutes; no unbounded wait.
+- Snapshot failure backoff: 500 ms, 1 s, 2 s, 4 s, then 8 s; `Retry-After` is
+  capped at 8 s.
+- Evidence cap: 256 KiB per wait, with terminal identity retained.
+
+Capacity, transport, protocol-decode, and shell/detail observation failures do
+not prove a causal turn outcome. They leave the receipt active so the caller can
+retry `wait` with the same receipt; a duplicate `send` remains blocked. Only
+explicit cancellation/release, environment invalidation, inclusive lease
+expiry, a proven causal terminal outcome, or successful completion releases the
+lease. Every terminal result/error embeds a structurally released receipt.
+
+Exact received dispatch errors are surfaced as `command_rejected` (400),
+`authentication_failed` (401), `permission_denied` (403), or `server_internal`
+(500). A received first-attempt error is not retried. Only a request with no
+trustworthy response can be retried once with identical IDs and payload; a retry
+error cannot erase ambiguity about the original attempt.
+
+An environment-ID change invalidates only the old environment's receipts and
+slot claims, then re-pins the runtime to the newly discovered stable
+environment. The operation that observes the roll returns `environment_changed`;
+new-environment work cannot be blocked or cleared by a colliding old ref. Scoped
+old project-create evidence fails closed, while stable work may reuse the same
+unscoped caller-held project command identity without minting a second ID.
+
+## Development and proof
+
+Declared toolchain target: Bun 1.3.11 and TypeScript 6.0.x.
 
 ```bash
-bun install
+bun install --frozen-lockfile
 bun test
 bun run typecheck
+bash scripts/check-stock-only.sh
+bash scripts/stock-t3-canary-drill.sh --dry-run
 ```
 
-Do not point experimental code at an important T3 Code environment. Some future
-operations may run agents with broad filesystem access; use disposable projects
-and worktrees while developing integrations.
+The opt-in exact-stock live proof is isolated from normal user state:
 
-## Contributing
+```bash
+set -a
+. ./.env.stock-proof
+set +a
+bash scripts/stock-t3-live-harness.sh
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately
-as described in [SECURITY.md](SECURITY.md).
+`.env.stock-proof` is ignored and must contain only a secret reference, never a
+secret value. The harness pins the adopted stock SHA, builds in detached clean
+worktrees, uses a dedicated base directory/workspace/bearer, validates exact PID
+birth and working-directory identity during teardown, and accepts proof freshness
+only for the caller-held current `{runId, candidateSha}` pair. Its TypeScript
+validator requires clean-install/build provenance, executable exact-stock
+characterization, the HTTP negative, redacted endpoint/status observations,
+actual request/poll counters, scoped IDs and sequences, terminal outcomes,
+isolation, and complete teardown before atomic mode-0600 publication. Literal
+stock SHA/provenance commands and isolation basenames are pinned, and final
+validation runs from the archived candidate rather than the mutable worktree.
 
-## License
+Because the harness exports `git archive HEAD`, it proves only a reviewed
+checkpoint commit. An uncommitted working tree cannot produce a current proof
+for those edits.
 
-Licensed under the [Apache License 2.0](LICENSE).
+## First stock-only release
+
+The first stock-only release has no compatible earlier binary rollback target.
+Canary and promotion therefore use the same immutable artifact and
+`stock-http-v1` configuration. A configuration rollback restores the
+canary-validated config on that same artifact. A code failure turns T3Layer
+routing off, cancels in-flight receipt waits without replay, and leaves stock T3
+untouched while a forward fix is built. After a second stock-only artifact passes
+the same gate, rollback may target a previously accepted stock-only artifact.
+
+See [docs/operations/stock-t3-first-release.md](docs/operations/stock-t3-first-release.md).
+
+## Contributing and license
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed
+under the [Apache License 2.0](LICENSE).
