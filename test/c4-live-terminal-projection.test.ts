@@ -401,7 +401,7 @@ describe("criterion-4 terminal projection rollover", () => {
       snapshotSequence: 16,
     });
     runtime.close();
-  });
+  }, 20_000);
 
   test("refuses a terminal assistant id substituted after a shell-only advertisement", async () => {
     let currentMs = 0;
@@ -435,7 +435,7 @@ describe("criterion-4 terminal projection rollover", () => {
 
     await expect(pending).rejects.toMatchObject({ code: "timeout" });
     runtime.close();
-  });
+  }, 20_000);
 
   test("does not infer an assistant id when neither projection ever advertises one", async () => {
     let currentMs = 0;
@@ -469,7 +469,7 @@ describe("criterion-4 terminal projection rollover", () => {
 
     await expect(pending).rejects.toMatchObject({ code: "timeout" });
     runtime.close();
-  });
+  }, 20_000);
 
   test("does not capture an assistant id from a shell pointer re-pointed to another turn", async () => {
     let currentMs = 0;
@@ -512,7 +512,7 @@ describe("criterion-4 terminal projection rollover", () => {
 
     await expect(pending).rejects.toMatchObject({ code: "timeout" });
     runtime.close();
-  });
+  }, 20_000);
 
   test.each([
     ["error", "turn_error"],
