@@ -64,6 +64,16 @@ file_mode() {
   fi
 }
 
+file_owner() {
+  local path=$1
+  local owner
+  if owner=$(/usr/bin/stat -c '%u' "$path" 2>/dev/null); then
+    printf '%s\n' "$owner"
+  else
+    /usr/bin/stat -f '%u' "$path"
+  fi
+}
+
 run_finalizer() {
   printf '%s' "$finalizer_source" | bun run - "$@"
 }
@@ -94,6 +104,13 @@ prepare_projection_trace() {
   local trace_parent
   local trace_name
   local canonical_trace_parent
+  local proof_parent
+  local proof_name
+  local canonical_proof_parent
+  local canonical_proof_target
+  local trace_parent_mode
+  local trace_parent_owner
+  local current_uid
   trace_parent=$(dirname -- "$trace_target")
   trace_name=$(basename -- "$trace_target")
   if [[ -z "$trace_name" || "$trace_name" == . || "$trace_name" == .. ]] ||
@@ -101,11 +118,31 @@ prepare_projection_trace() {
     preflight_error projection_trace_invalid parent_unavailable
   fi
   trace_target="$canonical_trace_parent/$trace_name"
+  proof_parent=$(dirname -- "$proof_target")
+  proof_name=$(basename -- "$proof_target")
+  canonical_proof_target=$proof_target
+  if canonical_proof_parent=$(cd "$proof_parent" 2>/dev/null && pwd -P); then
+    canonical_proof_target="$canonical_proof_parent/$proof_name"
+  fi
+  if [[ "$trace_target" == "$canonical_proof_target" ]]; then
+    preflight_error projection_trace_invalid path_conflicts_with_proof_target
+  fi
   case "$trace_target" in
     "$proof_root"|"$proof_root"/*)
       preflight_error projection_trace_invalid path_inside_proof_root
       ;;
   esac
+  if ! trace_parent_mode=$(file_mode "$canonical_trace_parent") ||
+     ! trace_parent_owner=$(file_owner "$canonical_trace_parent") ||
+     ! current_uid=$(/usr/bin/id -u) ||
+     [[ ! "$trace_parent_mode" =~ ^[0-7]{3,4}$ ||
+        ! "$trace_parent_owner" =~ ^[0-9]+$ ||
+        "$trace_parent_owner" != "$current_uid" ]]; then
+    preflight_error projection_trace_invalid insecure_parent
+  fi
+  if (( (8#$trace_parent_mode & 0022) != 0 )); then
+    preflight_error projection_trace_invalid insecure_parent
+  fi
   if [[ -e "$trace_target" || -L "$trace_target" ]]; then
     preflight_error projection_trace_invalid path_already_exists
   fi

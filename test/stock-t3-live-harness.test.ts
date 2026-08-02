@@ -719,8 +719,52 @@ fi
     expect(source).toContain("/usr/bin/stat -c '%a'");
     expect(source).toContain("/usr/bin/stat -f '%Lp'");
     expect(source).not.toContain("$(/usr/bin/stat -f '%Lp'");
-    expect(source.match(/\$\(file_mode /g)).toHaveLength(3);
+    expect(source.match(/\$\(file_mode /g)).toHaveLength(4);
   });
+
+  test("rejects a projection trace that canonically aliases the proof receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-trace-alias."));
+    temporaryRoots.push(root);
+    const receiptRoot = join(root, "receipts");
+    const linkedRoot = join(root, "linked-receipts");
+    await mkdir(receiptRoot, { mode: 0o700 });
+    await symlink(receiptRoot, linkedRoot);
+    const proofTarget = join(receiptRoot, "proof.json");
+    const traceTarget = join(linkedRoot, "proof.json");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: proofTarget,
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=path_conflicts_with_proof_target");
+    expect(await Bun.file(proofTarget).exists()).toBe(false);
+  }, 20_000);
+
+  test("rejects a projection trace beneath a group-or-world-writable parent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-trace-parent."));
+    temporaryRoots.push(root);
+    const traceRoot = join(root, "shared");
+    await mkdir(traceRoot, { mode: 0o700 });
+    await chmod(traceRoot, 0o777);
+    const traceTarget = join(traceRoot, "projection-trace.jsonl");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: join(root, "proof.json"),
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=insecure_parent");
+    expect(await Bun.file(traceTarget).exists()).toBe(false);
+  }, 20_000);
 
   test("requires a fresh external projection trace before a real proof can allocate work", async () => {
     const result = await run(
