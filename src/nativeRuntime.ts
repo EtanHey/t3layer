@@ -513,6 +513,7 @@ interface LeaseState {
   readonly preflightLatestTurnId: string | null;
   readonly expectedInputDigest: string;
   boundTurnId: string | null;
+  boundAssistantMessageId: string | null;
 }
 
 interface TurnSlotClaim {
@@ -1133,6 +1134,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       preflightLatestTurnId: preflight.thread.latestTurn?.turnId ?? null,
       expectedInputDigest: digestSync({ text: inputText, attachments: [] }),
       boundTurnId: null,
+      boundAssistantMessageId: null,
     });
     const delay = Math.max(0, Math.min(2_147_483_647, deadlineMs - clock()));
     const timer = setTimeout(() => releaseLease(ref, leaseId), delay);
@@ -3035,13 +3037,21 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           ) {
             throw new StockRuntimeError("superseded");
           }
-          if (state.boundTurnId !== null && latest?.turnId !== state.boundTurnId) {
+          if (
+            state.boundTurnId !== null &&
+            latest !== null &&
+            latest.turnId !== state.boundTurnId
+          ) {
             throw new StockRuntimeError("concurrent_writer", { reason: "turn_changed" });
           }
           if (state.boundTurnId === null) return { done: false, detail: true };
           const shellLatest = shellThread.latestTurn;
+          if ((latest === null) !== (shellLatest === null)) {
+            throw new StockRuntimeError("concurrent_writer", {
+              reason: "shell_detail_turn_conflict",
+            });
+          }
           if (
-            state.boundTurnId !== null &&
             shellLatest !== null &&
             (shellLatest.turnId !== state.boundTurnId ||
               shellLatest.requestedAt !== target.createdAt)
@@ -3050,8 +3060,72 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
               reason: "shell_detail_turn_conflict",
             });
           }
+          if (latest !== null && latest.assistantMessageId !== null) {
+            if (
+              state.boundAssistantMessageId !== null &&
+              state.boundAssistantMessageId !== latest.assistantMessageId
+            ) {
+              throw new StockRuntimeError("concurrent_writer", {
+                reason: "assistant_message_changed",
+              });
+            }
+            state.boundAssistantMessageId = latest.assistantMessageId;
+          }
           if (shellThread.hasPendingApprovals) throw new StockRuntimeError("pending_approval");
           if (shellThread.hasPendingUserInput) throw new StockRuntimeError("pending_input");
+          const completeFromBoundAssistant = () => {
+            if (state.boundAssistantMessageId === null) {
+              return { done: false as const, detail: true as const };
+            }
+            const assistant = detailSnapshot.thread.messages.find(
+              (entry) =>
+                entry.id === state.boundAssistantMessageId &&
+                entry.role === "assistant" &&
+                entry.turnId === state.boundTurnId &&
+                !entry.streaming,
+            );
+            if (assistant === undefined) return { done: false as const, detail: true as const };
+            const retained = boundedUtf8(assistant.text);
+            const terminalReceipt = releaseLeaseAndSnapshot(receipt);
+            return {
+              done: true as const,
+              value: {
+                kind: "completed" as const,
+                receipt: terminalReceipt,
+                assistantContent: retained.text,
+                snapshotSequence: detailSnapshot.snapshotSequence,
+                evidence: {
+                  truncated: retained.truncated,
+                  originalBytes: retained.originalBytes,
+                  retainedBytes: retained.retainedBytes,
+                },
+              },
+            };
+          };
+          if (latest === null) {
+            const shellSession = shellThread.session;
+            const detailSession = detailSnapshot.thread.session;
+            if (
+              shellSession === null ||
+              detailSession === null ||
+              shellSession.status !== detailSession.status ||
+              shellSession.activeTurnId !== detailSession.activeTurnId
+            ) {
+              return { done: false, detail: true };
+            }
+            if (shellSession.status === "error") throw new StockRuntimeError("turn_error");
+            if (shellSession.status === "interrupted" || shellSession.status === "stopped") {
+              throw new StockRuntimeError("turn_interrupted");
+            }
+            if (
+              shellSession.status === "starting" ||
+              shellSession.status === "running" ||
+              shellSession.activeTurnId !== null
+            ) {
+              return { done: false, detail: true };
+            }
+            return completeFromBoundAssistant();
+          }
           if (latest?.state === "interrupted") throw new StockRuntimeError("turn_interrupted");
           if (latest?.state === "error") throw new StockRuntimeError("turn_error");
           if (
@@ -3063,30 +3137,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           ) {
             return { done: false, detail: true };
           }
-          const assistant = detailSnapshot.thread.messages.find(
-            (entry) =>
-              entry.id === latest.assistantMessageId &&
-              entry.role === "assistant" &&
-              entry.turnId === state.boundTurnId &&
-              !entry.streaming,
-          );
-          if (assistant === undefined) return { done: false, detail: true };
-          const retained = boundedUtf8(assistant.text);
-          const terminalReceipt = releaseLeaseAndSnapshot(receipt);
-          return {
-            done: true,
-            value: {
-              kind: "completed" as const,
-              receipt: terminalReceipt,
-              assistantContent: retained.text,
-              snapshotSequence: detailSnapshot.snapshotSequence,
-              evidence: {
-                truncated: retained.truncated,
-                originalBytes: retained.originalBytes,
-                retainedBytes: retained.retainedBytes,
-              },
-            },
-          };
+          return completeFromBoundAssistant();
         },
       });
     } catch (error) {
