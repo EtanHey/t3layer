@@ -315,6 +315,7 @@ if [[ -L "$proof_root" || "$canonical_root" == / || "$canonical_root" == "$HOME"
   echo "ERROR: unsafe proof root" >&2
   exit 2
 fi
+proof_root=$canonical_root
 cleanup_root_valid=true
 run_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
 stock_tree="$proof_root/stock-tree"
