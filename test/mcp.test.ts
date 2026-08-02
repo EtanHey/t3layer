@@ -122,9 +122,16 @@ describe("stock T3 MCP facade", () => {
     }
     const spawn = tools.find((entry) => entry.name === "spawn");
     const nestedInput = spawn?.inputSchema.properties.input as
-      | { readonly additionalProperties?: boolean }
+      | {
+          readonly additionalProperties?: boolean;
+          readonly dependentRequired?: Readonly<Record<string, readonly string[]>>;
+        }
       | undefined;
     expect(nestedInput?.additionalProperties).toBeFalse();
+    expect(nestedInput?.dependentRequired).toEqual({
+      role: ["parentRef"],
+      parentRef: ["role"],
+    });
   });
 
   test("routes every tool through the same injected facade instance", async () => {
@@ -236,6 +243,16 @@ describe("stock T3 MCP facade", () => {
     });
     expect(calls).toHaveLength(0);
 
+    const incompleteOverlay = await mcp.callTool("spawn", {
+      input: { ...spawnInput, role: "worker" },
+    });
+    expect(error(incompleteOverlay)).toEqual({
+      type: "stock_runtime",
+      code: "protocol_mismatch",
+      evidence: { field: "input.parentRef" },
+    });
+    expect(calls).toHaveLength(0);
+
     const malformedArguments = await mcp.callTool("send", null);
     expect(error(malformedArguments)).toEqual({
       type: "stock_runtime",
@@ -298,6 +315,15 @@ describe("stock T3 MCP facade", () => {
       expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
       expect(JSON.parse(JSON.stringify(result))).toEqual(result);
     }
+  });
+
+  test("encodes an absent observed thread consistently as JSON null", async () => {
+    const { facade } = fakeFacade();
+    (facade as unknown as { observe: () => Promise<undefined> }).observe = async () => undefined;
+    const result = await createStockT3McpFacade(facade).callTool("observe", { ref });
+
+    expect(result.structuredContent).toEqual({ ok: true, value: null });
+    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
   });
 
   test("turns an aborted MCP context into the runtime's typed cancellation before HTTP", async () => {

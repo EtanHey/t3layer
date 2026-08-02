@@ -1625,6 +1625,81 @@ describe("facade worker hierarchy overlay", () => {
     ).rejects.toMatchObject({ code: "overlay_capacity_exceeded" });
   });
 
+  test("does not release a newer send from an older wait that completes after explicit release", async () => {
+    const activeRef = { environmentId: "env-1", threadId: "active" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const oldReceipt = {
+      agentRef: activeRef,
+      leaseId: "lease-old",
+      commandId: "command-old",
+      messageId: "message-old",
+      acceptedSequence: 2,
+      observedSequence: 2,
+      leaseExpiresAt: Date.now() + 1_000,
+      leaseState: "active" as const,
+    };
+    let releaseOldWait!: () => void;
+    const oldWaitGate = new Promise<void>((resolve) => {
+      releaseOldWait = resolve;
+    });
+    let observeReads = 0;
+    const staleTerminal = {
+      ...detailFor(activeRef.threadId, 3),
+      thread: {
+        ...detailFor(activeRef.threadId, 3).thread,
+        latestTurn: {
+          turnId: "turn-old",
+          state: "completed" as const,
+          requestedAt: iso,
+          startedAt: iso,
+          completedAt: iso,
+          assistantMessageId: "assistant-old",
+        },
+      },
+    };
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => {
+        if (ref.threadId !== activeRef.threadId) return detailFor(ref.threadId, 11);
+        observeReads += 1;
+        return observeReads === 1 ? detailFor(activeRef.threadId, 1) : staleTerminal;
+      },
+      wait: async () => {
+        await oldWaitGate;
+        return {
+          kind: "completed" as const,
+          receipt: { ...oldReceipt, leaseState: "released" as const },
+          assistantContent: "old completion",
+          snapshotSequence: 3,
+          evidence: { truncated: false, originalBytes: 14, retainedBytes: 14 },
+        };
+      },
+      releaseReceipt: () => {},
+      send: async () => ({
+        agentRef: activeRef,
+        leaseId: "lease-new",
+        commandId: "command-new",
+        messageId: "message-new",
+        acceptedSequence: 10,
+        observedSequence: 10,
+        leaseExpiresAt: Date.now() + 1_000,
+        leaseState: "active" as const,
+      }),
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(activeRef, { role: "worker", parentRef: null });
+    const olderWait = facade.wait(oldReceipt);
+    facade.releaseReceipt(oldReceipt);
+    await facade.send(activeRef, "new turn");
+    releaseOldWait();
+    await olderWait;
+    await facade.observe(activeRef);
+
+    await expect(
+      facade.attach(replacementRef, { role: "worker", parentRef: null }),
+    ).rejects.toMatchObject({ code: "overlay_capacity_exceeded" });
+  });
+
   test("restores terminal capacity when an admitted control operation fails", async () => {
     const terminalRef = { environmentId: "env-1", threadId: "terminal" };
     const replacementRef = { environmentId: "env-1", threadId: "replacement" };

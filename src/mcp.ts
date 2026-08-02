@@ -143,6 +143,10 @@ const spawnInputSchema = Object.freeze({
     "branch",
     "worktreePath",
   ]),
+  dependentRequired: Object.freeze({
+    role: Object.freeze(["parentRef"]),
+    parentRef: Object.freeze(["role"]),
+  }),
   additionalProperties: false,
 });
 const receiptSchema = Object.freeze({
@@ -261,7 +265,7 @@ function resultContent(payload: unknown) {
 }
 
 function success(value: unknown): StockT3McpToolResult {
-  const payload = Object.freeze({ ok: true as const, value });
+  const payload = Object.freeze({ ok: true as const, value: value === undefined ? null : value });
   return Object.freeze({
     isError: false as const,
     structuredContent: payload,
@@ -306,6 +310,7 @@ interface SchemaShape {
   readonly type?: string | readonly string[];
   readonly properties?: Readonly<Record<string, unknown>>;
   readonly required?: readonly string[];
+  readonly dependentRequired?: Readonly<Record<string, readonly string[]>>;
   readonly additionalProperties?: boolean;
   readonly enum?: readonly unknown[];
   readonly anyOf?: readonly unknown[];
@@ -366,6 +371,14 @@ function validateSchema(value: unknown, schemaValue: unknown, field: string): vo
     for (const required of schema.required ?? []) {
       if (!Object.hasOwn(input, required)) {
         protocolMismatch(schemaErrorField(fieldPath(field, required)));
+      }
+    }
+    for (const [property, dependencies] of Object.entries(schema.dependentRequired ?? {})) {
+      if (!Object.hasOwn(input, property)) continue;
+      for (const dependency of dependencies) {
+        if (!Object.hasOwn(input, dependency)) {
+          protocolMismatch(schemaErrorField(fieldPath(field, dependency)));
+        }
       }
     }
     const properties = schema.properties ?? {};

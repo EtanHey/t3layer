@@ -27,7 +27,6 @@ Use the repository's pinned toolchain:
 bun install
 bun test
 bun run typecheck
-bash scripts/check-stock-only.sh
 ```
 
 For MCP or facade work, also run the authenticated in-process parity fixture in
@@ -41,6 +40,12 @@ Exercise malformed refs and every numeric operation field at the tool boundary
 and through the direct facade. Assertions must cover the typed code and evidence
 as well as zero HTTP before refusal. When a test crosses the MCP boundary,
 verify that its receipt, snapshot, and error envelope survive JSON round-trip.
+
+Repository maintainers also run `scripts/check-stock-only.sh` with the retained
+historical evidence path and SHA configured through
+`STOCK_ONLY_HISTORICAL_PATH` and `STOCK_ONLY_HISTORICAL_SHA256`. That historical
+artifact is not part of a clean contributor checkout, so this is a release gate
+rather than a general local prerequisite.
 
 If your change requires a live T3 Code environment, describe the sanitized setup
 and observed version in the pull request. Never attach authorization headers,

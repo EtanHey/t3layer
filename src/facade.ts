@@ -210,6 +210,18 @@ export function createStockT3Facade(
     }
   }
 
+  function recordTerminalRelease(ref: AgentRef, observedSequence: number): boolean {
+    const minimumSequence = lifecycleSequenceByRef.get(lifecycleKey(ref));
+    if (minimumSequence !== undefined && observedSequence < minimumSequence) return false;
+    recordWorkerTerminalState(overlay, ref, true);
+    pruneLifecycleTracking(ref);
+    return true;
+  }
+
+  function receiptLifecycleSequence(receipt: TurnReceipt): number {
+    return Math.max(receipt.observedSequence, receipt.acceptedSequence ?? 0);
+  }
+
   async function runControlLifecycleMutation(
     ref: AgentRef,
     action: () => Promise<ControlOperationResult>,
@@ -347,16 +359,20 @@ export function createStockT3Facade(
     async wait(receipt: TurnReceipt, options?: RuntimeOperationOptions) {
       try {
         const result = await runtime.wait(receipt, options);
-        recordWorkerTerminalState(overlay, receipt.agentRef, true);
-        pruneLifecycleTracking(receipt.agentRef);
+        recordTerminalRelease(receipt.agentRef, result.snapshotSequence);
         return result;
       } catch (error) {
         if (
           error instanceof StockRuntimeError &&
           (error.code === "turn_interrupted" || error.code === "turn_error")
         ) {
-          recordWorkerTerminalState(overlay, receipt.agentRef, true);
-          pruneLifecycleTracking(receipt.agentRef);
+          const terminalReceipt = error.evidence.receipt as TurnReceipt | undefined;
+          recordTerminalRelease(
+            receipt.agentRef,
+            terminalReceipt === undefined
+              ? receiptLifecycleSequence(receipt)
+              : receiptLifecycleSequence(terminalReceipt),
+          );
         }
         throw error;
       }

@@ -196,7 +196,8 @@ fractions, unsafe integers, and values below those minima fail before HTTP as
 ## MCP outcomes and supported errors
 
 Successful MCP calls return `{ ok: true, value }` in `structuredContent` and as
-JSON text. Failures set `isError: true` and retain the direct error family:
+JSON text. An absent `observe` result is encoded as JSON `null` in both forms.
+Failures set `isError: true` and retain the direct error family:
 
 - `stock_runtime` carries a `StockRuntimeError` code and `evidence`.
 - `worker_overlay` carries a `WorkerOverlayError` code and `details`.
