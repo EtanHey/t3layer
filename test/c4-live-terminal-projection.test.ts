@@ -26,12 +26,16 @@ const project = {
 };
 const ref = { environmentId: "env-1", threadId: "thread-1" };
 
-const boundTurn: StockLatestTurn = {
+const pendingBoundTurn: StockLatestTurn = {
   turnId: "turn-a",
   state: "running",
   requestedAt,
   startedAt: requestedAt,
   completedAt: null,
+  assistantMessageId: null,
+};
+const boundTurn: StockLatestTurn = {
+  ...pendingBoundTurn,
   assistantMessageId: "assistant-a",
 };
 const newerTurn: StockLatestTurn = {
@@ -56,7 +60,7 @@ const readySession: StockSession = {
   activeTurnId: null,
   updatedAt: laterAt,
 };
-const messages: readonly StockMessage[] = [
+const userMessages: readonly StockMessage[] = [
   {
     id: "message-1",
     role: "user",
@@ -67,6 +71,9 @@ const messages: readonly StockMessage[] = [
     createdAt: requestedAt,
     updatedAt: requestedAt,
   },
+];
+const completedMessages: readonly StockMessage[] = [
+  ...userMessages,
   {
     id: "assistant-a",
     role: "assistant",
@@ -78,6 +85,9 @@ const messages: readonly StockMessage[] = [
     updatedAt: laterAt,
   },
 ];
+const mismatchedAssistantMessages: readonly StockMessage[] = completedMessages.map((entry) =>
+  entry.role === "assistant" ? { ...entry, id: "assistant-b" } : entry,
+);
 
 function shellThread(
   latestTurn: StockLatestTurn | null,
@@ -144,12 +154,20 @@ function detail(
   };
 }
 
-function clientForTerminalProjection(
-  terminalLatest: StockLatestTurn | null,
-  terminalSession: StockSession,
+interface Projection {
+  readonly sequence: number;
+  readonly latestTurn: StockLatestTurn | null;
+  readonly session: StockSession;
+  readonly messages: readonly StockMessage[];
+}
+
+function clientForProjections(
+  projections: readonly Projection[],
+  onDetailProjection?: (sequence: number) => void,
 ): StockT3RuntimeClient {
   let shellReads = 0;
   let detailReads = 0;
+  const projection = (index: number) => projections[Math.min(index, projections.length - 1)]!;
   return {
     getDescriptor: async () => ({
       environmentId: ref.environmentId,
@@ -160,28 +178,32 @@ function clientForTerminalProjection(
     }),
     getShell: async () => {
       shellReads += 1;
-      return shellReads === 1
-        ? shell(9, boundTurn, runningSession)
-        : shell(16, terminalLatest, terminalSession);
+      const current = projection(shellReads - 1);
+      return shell(current.sequence, current.latestTurn, current.session);
     },
     getThread: async () => {
       detailReads += 1;
       if (detailReads === 1) return detail(1, null, null, []);
-      return detailReads === 2
-        ? detail(9, boundTurn, runningSession)
-        : detail(16, terminalLatest, terminalSession);
+      const current = projection(detailReads - 2);
+      onDetailProjection?.(current.sequence);
+      return detail(
+        current.sequence,
+        current.latestTurn,
+        current.session,
+        current.messages,
+      );
     },
     dispatch: async () => ({ sequence: 4 }),
   };
 }
 
 function runtimeFor(
-  terminalLatest: StockLatestTurn | null,
-  terminalSession: StockSession,
+  projections: readonly Projection[],
+  onDetailProjection?: (sequence: number) => void,
 ) {
   const ids = ["command-1", "message-1", "lease-1"];
   return createStockT3NativeRuntime({
-    client: clientForTerminalProjection(terminalLatest, terminalSession),
+    client: clientForProjections(projections, onDetailProjection),
     id: () => ids.shift()!,
     now: () => requestedAt,
   });
@@ -189,28 +211,128 @@ function runtimeFor(
 
 describe("criterion-4 terminal projection rollover", () => {
   test("completes from the bound finalized assistant after stock clears latestTurn", async () => {
-    const runtime = runtimeFor(null, readySession);
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      { sequence: 14, latestTurn: boundTurn, session: runningSession, messages: completedMessages },
+      { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+    ]);
     const receipt = await runtime.send(ref, "target");
 
-    await expect(runtime.wait(receipt, { timeoutMs: 1_000 })).resolves.toMatchObject({
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).resolves.toMatchObject({
       kind: "completed",
       assistantContent: "done",
+      snapshotSequence: 16,
     });
     runtime.close();
   });
 
   test("still rejects a genuinely newer non-null turn after binding", async () => {
-    const runtime = runtimeFor(newerTurn, {
-      ...runningSession,
-      activeTurnId: newerTurn.turnId,
-      updatedAt: laterAt,
-    });
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      {
+        sequence: 16,
+        latestTurn: newerTurn,
+        session: {
+          ...runningSession,
+          activeTurnId: newerTurn.turnId,
+          updatedAt: laterAt,
+        },
+        messages: userMessages,
+      },
+    ]);
     const receipt = await runtime.send(ref, "target");
 
     await expect(runtime.wait(receipt, { timeoutMs: 1_000 })).rejects.toMatchObject({
       code: "concurrent_writer",
       evidence: { reason: "turn_changed" },
     });
+    runtime.close();
+  });
+
+  test.each([
+    ["error", "turn_error"],
+    ["stopped", "turn_interrupted"],
+    ["interrupted", "turn_interrupted"],
+  ] as const)("maps a cleared latestTurn with session %s to %s", async (status, code) => {
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      { sequence: 14, latestTurn: boundTurn, session: runningSession, messages: completedMessages },
+      {
+        sequence: 16,
+        latestTurn: null,
+        session: { ...readySession, status },
+        messages: completedMessages,
+      },
+    ]);
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({ code });
+    runtime.close();
+  });
+
+  test("does not complete a cleared ready session without a captured finalized assistant", async () => {
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      { sequence: 16, latestTurn: null, session: readySession, messages: userMessages },
+    ]);
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+      code: "timeout",
+    });
+    runtime.close();
+  });
+
+  test("does not substitute a same-turn assistant whose id was never advertised", async () => {
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      {
+        sequence: 14,
+        latestTurn: boundTurn,
+        session: runningSession,
+        messages: mismatchedAssistantMessages,
+      },
+      {
+        sequence: 16,
+        latestTurn: null,
+        session: readySession,
+        messages: mismatchedAssistantMessages,
+      },
+    ]);
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+      code: "timeout",
+    });
+    runtime.close();
+  });
+
+  test("still rejects a newer turn after the session pointer first clears", async () => {
+    const observedSequences: number[] = [];
+    const runtime = runtimeFor(
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: userMessages },
+        {
+          sequence: 17,
+          latestTurn: newerTurn,
+          session: {
+            ...runningSession,
+            activeTurnId: newerTurn.turnId,
+            updatedAt: laterAt,
+          },
+          messages: userMessages,
+        },
+      ],
+      (sequence) => observedSequences.push(sequence),
+    );
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+      code: "concurrent_writer",
+      evidence: { reason: "turn_changed" },
+    });
+    expect(observedSequences).toContain(17);
     runtime.close();
   });
 });
