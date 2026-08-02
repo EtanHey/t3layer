@@ -9,6 +9,10 @@ candidate_repo=${T3_STOCK_CANDIDATE_REPO:-}
 expected_candidate_sha=${T3_STOCK_CANDIDATE_SHA:-}
 proof_target=${T3_STOCK_PROOF_TARGET:-/Users/etanheyman/Gits/t3layer/docs.local/audits/t3layer-stock-t3-realignment/phase-3-stock-live-proof.json}
 trace_target=${T3_STOCK_TRACE_PATH:-}
+trace_parent_canonical=''
+trace_name=''
+trace_enabled=false
+trace_fd_open=false
 proof_root=''
 stock_tree=''
 server_pid=''
@@ -91,7 +95,7 @@ run_stage_seam() {
   fail_at "$stage"
 }
 
-prepare_projection_trace() {
+validate_projection_trace_input() {
   if [[ -z "$trace_target" ]]; then
     if [[ "$test_mode" != 1 ]]; then
       preflight_error projection_trace_invalid missing_path
@@ -102,22 +106,17 @@ prepare_projection_trace() {
     preflight_error projection_trace_invalid path_not_absolute
   fi
   local trace_parent
-  local trace_name
-  local canonical_trace_parent
   local proof_parent
   local proof_name
   local canonical_proof_parent
   local canonical_proof_target
-  local trace_parent_mode
-  local trace_parent_owner
-  local current_uid
   trace_parent=$(dirname -- "$trace_target")
   trace_name=$(basename -- "$trace_target")
   if [[ -z "$trace_name" || "$trace_name" == . || "$trace_name" == .. ]] ||
-     ! canonical_trace_parent=$(cd "$trace_parent" 2>/dev/null && pwd -P); then
+     ! trace_parent_canonical=$(cd "$trace_parent" 2>/dev/null && pwd -P); then
     preflight_error projection_trace_invalid parent_unavailable
   fi
-  trace_target="$canonical_trace_parent/$trace_name"
+  trace_target="$trace_parent_canonical/$trace_name"
   proof_parent=$(dirname -- "$proof_target")
   proof_name=$(basename -- "$proof_target")
   canonical_proof_target=$proof_target
@@ -132,28 +131,73 @@ prepare_projection_trace() {
       preflight_error projection_trace_invalid path_inside_proof_root
       ;;
   esac
-  if ! trace_parent_mode=$(file_mode "$canonical_trace_parent") ||
-     ! trace_parent_owner=$(file_owner "$canonical_trace_parent") ||
+  trace_enabled=true
+}
+
+prepare_projection_trace() {
+  if [[ "$trace_enabled" != true ]]; then
+    return
+  fi
+  local previous_directory
+  local opened_trace_parent
+  local trace_parent_mode
+  local trace_parent_owner
+  local current_uid
+  local relative_trace_target="./$trace_name"
+  local trace_error=''
+  previous_directory=$(pwd -P)
+  if ! cd "$trace_parent_canonical"; then
+    preflight_error projection_trace_invalid parent_unavailable
+  fi
+  opened_trace_parent=$(pwd -P 2>/dev/null || true)
+  if [[ "$opened_trace_parent" != "$trace_parent_canonical" ]] ||
+     ! trace_parent_mode=$(file_mode .) ||
+     ! trace_parent_owner=$(file_owner .) ||
      ! current_uid=$(/usr/bin/id -u) ||
      [[ ! "$trace_parent_mode" =~ ^[0-7]{3,4}$ ||
         ! "$trace_parent_owner" =~ ^[0-9]+$ ||
         "$trace_parent_owner" != "$current_uid" ]]; then
-    preflight_error projection_trace_invalid insecure_parent
+    trace_error=insecure_parent
+  elif (( (8#$trace_parent_mode & 0022) != 0 )); then
+    trace_error=insecure_parent
   fi
-  if (( (8#$trace_parent_mode & 0022) != 0 )); then
-    preflight_error projection_trace_invalid insecure_parent
+  if [[ -n "$trace_error" ]]; then
+    cd "$previous_directory" 2>/dev/null || true
+    preflight_error projection_trace_invalid "$trace_error"
   fi
-  if [[ -e "$trace_target" || -L "$trace_target" ]]; then
-    preflight_error projection_trace_invalid path_already_exists
+
+  run_stage_seam after-trace-parent-validation
+  opened_trace_parent=$(pwd -P 2>/dev/null || true)
+  if [[ "$opened_trace_parent" != "$trace_parent_canonical" ]]; then
+    trace_error=parent_identity_changed
+  elif [[ -e "$relative_trace_target" || -L "$relative_trace_target" ]]; then
+    trace_error=path_already_exists
+  elif ! (umask 077; set -o noclobber; : > "$relative_trace_target") 2>/dev/null; then
+    trace_error=create_failed
+  elif ! chmod 600 "$relative_trace_target" ||
+       [[ ! -f "$relative_trace_target" || -L "$relative_trace_target" ]] ||
+       [[ $(file_mode "$relative_trace_target") != 600 ]]; then
+    trace_error=mode_or_type_mismatch
+  elif ! exec 9>>"$relative_trace_target"; then
+    trace_error=descriptor_open_failed
+  else
+    trace_fd_open=true
   fi
-  if ! (umask 077; set -o noclobber; : > "$trace_target") 2>/dev/null; then
-    preflight_error projection_trace_invalid create_failed
+  if ! cd "$previous_directory"; then
+    if [[ "$trace_fd_open" == true ]]; then exec 9>&-; trace_fd_open=false; fi
+    preflight_error projection_trace_invalid restore_directory_failed
   fi
-  chmod 600 "$trace_target"
-  if [[ ! -f "$trace_target" || -L "$trace_target" || $(file_mode "$trace_target") != 600 ]]; then
-    preflight_error projection_trace_invalid mode_or_type_mismatch
+  if [[ -n "$trace_error" ]]; then
+    if [[ "$trace_fd_open" == true ]]; then exec 9>&-; trace_fd_open=false; fi
+    preflight_error projection_trace_invalid "$trace_error"
   fi
-  export T3_STOCK_TRACE_PATH="$trace_target"
+  if [[ ! -e /dev/fd/9 ]]; then
+    exec 9>&-
+    trace_fd_open=false
+    preflight_error projection_trace_invalid descriptor_unavailable
+  fi
+  export T3_STOCK_TRACE_PATH=/dev/fd/9
+  run_stage_seam after-trace-open
 }
 
 preflight_error() {
@@ -283,6 +327,10 @@ fail_at() {
 cleanup() {
   cleanup_status=$?
   set +e
+  if [[ "$trace_fd_open" == true ]]; then
+    exec 9>&-
+    trace_fd_open=false
+  fi
   if [[ -n "$server_pid" && -n "$server_birth" && "$server_pid" =~ ^[0-9]+$ ]]; then
     current_birth=$(/bin/ps -o lstart= -p "$server_pid" 2>/dev/null | /usr/bin/xargs)
     current_cwd=$(/usr/sbin/lsof -a -p "$server_pid" -d cwd -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p')
@@ -403,7 +451,7 @@ if [[ -L "$proof_root" || "$canonical_root" == / || "$canonical_root" == "$HOME"
 fi
 proof_root=$canonical_root
 cleanup_root_valid=true
-prepare_projection_trace
+validate_projection_trace_input
 run_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
 stock_tree="$proof_root/stock-tree"
 t3layer_clean="$proof_root/t3layer-clean"
@@ -579,6 +627,7 @@ negative_detail_status=$(authenticated_curl --silent --show-error --output "$neg
 fi
 run_stage_seam after-http-negative
 
+prepare_projection_trace
 export T3_STOCK_BASE_URL=http://127.0.0.1:3774
 export T3_STOCK_HTTP_TOKEN="$http_token"
 export T3_STOCK_WORKSPACE_ROOT="$workspace"
