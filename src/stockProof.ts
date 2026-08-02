@@ -3,6 +3,18 @@ export interface ExpectedProofIdentity {
   readonly candidateSha: string;
 }
 
+export type ProviderAuthProvenance =
+  | {
+      readonly mode: "subscription";
+      readonly claudeExecutable: string;
+      readonly claudeVersion: string;
+    }
+  | { readonly mode: "secret_ref" };
+
+export interface ExpectedProofContext extends ExpectedProofIdentity {
+  readonly providerAuth: ProviderAuthProvenance;
+}
+
 export interface LiveProofEvidence {
   readonly environmentId: string;
   readonly serverVersion: string;
@@ -46,6 +58,7 @@ export interface StockProofBody extends ExpectedProofIdentity {
     readonly stockBuild: CommandResult;
     readonly candidateInstall: CommandResult;
     readonly exactCharacterization: CommandResult;
+    readonly providerAuth: ProviderAuthProvenance;
     readonly isolatedBasenames: readonly string[];
   };
   readonly exactHttpNegative: {
@@ -86,6 +99,7 @@ export class ProofReceiptError extends TypeError {
 
 const SHA40 = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const ATTESTED_EXECUTABLE_PATH = "receipt.provenance.providerAuth.claudeExecutable";
 const HTTP_METHOD = /^(GET|POST)$/;
 const ALLOWED_PATH = /^(?:\/\.well-known\/t3\/environment|\/api\/orchestration\/(?:shell|dispatch|threads\/[^/?#]+))$/;
 const EXPECTED_STOCK_SHA = "d3037064e61a9f059eafbd4f9869679779bd2a7c";
@@ -137,6 +151,7 @@ function integerField(input: Record<string, unknown>, key: string): number {
 
 function assertNoSecretMaterial(value: unknown, path = "receipt"): void {
   if (typeof value === "string") {
+    if (path === ATTESTED_EXECUTABLE_PATH) return;
     if (/op:\/\/|bearer\s|api[_-]?key|token/i.test(value)) {
       throw new ProofReceiptError(`secret_material:${path}`);
     }
@@ -251,6 +266,31 @@ function commandResult(
   if (result.status !== 0) throw new ProofReceiptError(`${key}_status`);
 }
 
+function providerAuth(value: unknown): ProviderAuthProvenance {
+  const auth = record(value, "provider_auth");
+  if (auth.mode === "secret_ref") {
+    if (Object.keys(auth).length !== 1) throw new ProofReceiptError("provider_auth_secret_ref_shape");
+    return { mode: "secret_ref" };
+  }
+  if (auth.mode !== "subscription") throw new ProofReceiptError("provider_auth_mode");
+  if (
+    Object.keys(auth).length !== 3 ||
+    typeof auth.claudeExecutable !== "string" ||
+    !auth.claudeExecutable.startsWith("/") ||
+    auth.claudeExecutable.includes("\n") ||
+    typeof auth.claudeVersion !== "string" ||
+    !/^[0-9]+\.[0-9]+\.[0-9]+/.test(auth.claudeVersion) ||
+    auth.claudeVersion.includes("\n")
+  ) {
+    throw new ProofReceiptError("provider_auth_subscription_shape");
+  }
+  return {
+    mode: "subscription",
+    claudeExecutable: auth.claudeExecutable,
+    claudeVersion: auth.claudeVersion,
+  };
+}
+
 export function canonicalProofBody(value: unknown): StockProofBody {
   const input = record(value);
   if (Object.keys(input).some((key) => !PROOF_BODY_KEYS.has(key))) {
@@ -268,6 +308,7 @@ export function canonicalProofBody(value: unknown): StockProofBody {
   commandResult(provenance.stockBuild, "stock_build");
   commandResult(provenance.candidateInstall, "candidate_install");
   commandResult(provenance.exactCharacterization, "exact_characterization");
+  providerAuth(provenance.providerAuth);
   if (
     !Array.isArray(provenance.isolatedBasenames) ||
     provenance.isolatedBasenames.length !== EXPECTED_ISOLATED_BASENAMES.length ||
@@ -290,10 +331,21 @@ export function canonicalProofBody(value: unknown): StockProofBody {
   return structuredClone(input) as unknown as StockProofBody;
 }
 
-export function validateProofReceipt(value: unknown, expected: ExpectedProofIdentity): StockProofBody {
+export function validateProofReceipt(value: unknown, expected: ExpectedProofContext): StockProofBody {
   const receipt = canonicalProofBody(value);
   if (receipt.runId !== expected.runId || receipt.candidateSha !== expected.candidateSha) {
     throw new ProofReceiptError("expected_identity_mismatch");
+  }
+  const expectedAuth = providerAuth(expected.providerAuth);
+  const actualAuth = receipt.provenance.providerAuth;
+  if (
+    actualAuth.mode !== expectedAuth.mode ||
+    (actualAuth.mode === "subscription" && expectedAuth.mode === "subscription" && (
+      actualAuth.claudeExecutable !== expectedAuth.claudeExecutable ||
+      actualAuth.claudeVersion !== expectedAuth.claudeVersion
+    ))
+  ) {
+    throw new ProofReceiptError("expected_provider_auth_mismatch");
   }
   return receipt;
 }
@@ -326,7 +378,7 @@ export async function proofChecksum(value: unknown): Promise<string> {
   return [...new Uint8Array(hashed)].map((entry) => entry.toString(16).padStart(2, "0")).join("");
 }
 
-export async function validateProofEnvelope(value: unknown, expected: ExpectedProofIdentity): Promise<StockProofBody> {
+export async function validateProofEnvelope(value: unknown, expected: ExpectedProofContext): Promise<StockProofBody> {
   const envelope = record(value);
   if (typeof envelope.checksum !== "string" || !SHA256.test(envelope.checksum)) throw new ProofReceiptError("checksum");
   const { checksum, ...bodyValue } = envelope;

@@ -46,12 +46,18 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
     expect(spawned.kind).toBe("spawned");
     if (spawned.kind !== "spawned") throw new Error("live spawn was partial");
     const first = await facade.wait(spawned.turnReceipt, { timeoutMs: 120_000 });
+    expect(first.kind).toBe("completed");
+    if (first.kind !== "completed") throw new Error("initial live turn did not complete");
+    expect(first.assistantContent.trim()).toBe("T3LAYER_STOCK_PROOF_OK");
     const sent = await facade.send(
       spawned.agentRef,
       "Reply with exactly T3LAYER_STOCK_PROOF_FOLLOWUP_OK.",
       { timeoutMs: 120_000 },
     );
     const second = await facade.wait(sent, { timeoutMs: 120_000 });
+    expect(second.kind).toBe("completed");
+    if (second.kind !== "completed") throw new Error("follow-up live turn did not complete");
+    expect(second.assistantContent.trim()).toBe("T3LAYER_STOCK_PROOF_FOLLOWUP_OK");
     const descriptor = await runtime.client.getDescriptor();
     const detail = await runtime.observe(spawned.agentRef, { timeoutMs: 30_000 });
     if (detail === undefined) throw new Error("live thread disappeared before receipt capture");
@@ -93,7 +99,5 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
         timestamps: { startedAt, completedAt: new Date().toISOString() },
       }, runId);
     await Bun.write(receiptPath, `${JSON.stringify(provisional)}\n`);
-    expect(first.kind).toBe("completed");
-    expect(second.kind).toBe("completed");
   }, 120_000);
 });

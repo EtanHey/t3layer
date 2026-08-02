@@ -3,7 +3,10 @@ set -euo pipefail
 
 T3_STOCK_SHA=d3037064e61a9f059eafbd4f9869679779bd2a7c
 stock_repo=/Users/etanheyman/Gits/t3code
-candidate_repo=/Users/etanheyman/Gits/t3layer-stock-http-runtime
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+implementation_repo=$(cd "$script_dir/.." && pwd -P)
+candidate_repo=${T3_STOCK_CANDIDATE_REPO:-}
+expected_candidate_sha=${T3_STOCK_CANDIDATE_SHA:-}
 proof_target=${T3_STOCK_PROOF_TARGET:-/Users/etanheyman/Gits/t3layer/docs.local/audits/t3layer-stock-t3-realignment/phase-3-stock-live-proof.json}
 proof_root=''
 stock_tree=''
@@ -21,6 +24,17 @@ actual_stock_sha=''
 run_id=''
 finalizer_source=''
 test_mode=${T3_STOCK_HARNESS_TEST_MODE:-0}
+provider_secret_ref=${T3_STOCK_PROVIDER_SECRET_REF:-}
+provider_auth_mode=''
+claude_executable=''
+claude_version=''
+provider_auth_expectation=''
+clean_server_env=(/usr/bin/env -i "HOME=$HOME" "PATH=$PATH")
+for preserved_name in USER LOGNAME LANG LC_ALL SHELL TMPDIR; do
+  if [[ -n ${!preserved_name:-} ]]; then
+    clean_server_env+=("$preserved_name=${!preserved_name}")
+  fi
+done
 
 sha256_file() {
   local path=$1
@@ -54,6 +68,123 @@ run_stage_seam() {
     "$T3_STOCK_HARNESS_COMMAND_RUNNER" "$stage" "$proof_root"
   fi
   fail_at "$stage"
+}
+
+preflight_error() {
+  local code=$1
+  local reason=$2
+  printf 'ERROR: %s reason=%s\n' "$code" "$reason" >&2
+  exit 2
+}
+
+validate_candidate_identity() {
+  if [[ -z "$candidate_repo" || -z "$expected_candidate_sha" || ! "$expected_candidate_sha" =~ ^[0-9a-f]{40}$ || ! -d "$candidate_repo" ]]; then
+    preflight_error candidate_identity_invalid missing_or_malformed_input
+  fi
+  if ! candidate_repo=$(cd "$candidate_repo" 2>/dev/null && pwd -P); then
+    preflight_error candidate_identity_invalid unreadable_repository
+  fi
+  local head_sha
+  local main_sha
+  local origin_main_sha
+  if ! head_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse --verify HEAD 2>/dev/null); then
+    preflight_error candidate_identity_invalid unreadable_head
+  fi
+  if [[ "$head_sha" != "$expected_candidate_sha" ]]; then
+    preflight_error candidate_identity_mismatch expected_sha_does_not_match_head
+  fi
+  if ! main_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse --verify refs/heads/main 2>/dev/null) ||
+     ! origin_main_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse --verify refs/remotes/origin/main 2>/dev/null); then
+    preflight_error candidate_identity_unmerged head_not_main_and_origin_main
+  fi
+  if ! [[ "$head_sha" == "$main_sha" && "$head_sha" == "$origin_main_sha" ]]; then
+    preflight_error candidate_identity_unmerged head_not_main_and_origin_main
+  fi
+  candidate_sha=$expected_candidate_sha
+}
+
+run_claude_probe() {
+  "${clean_server_env[@]}" node -e '
+const { spawnSync } = require("node:child_process");
+const [executable, ...args] = process.argv.slice(1);
+const result = spawnSync(executable, args, {
+  encoding: "utf8",
+  stdio: ["ignore", "pipe", "pipe"],
+  timeout: 5_000,
+  maxBuffer: 1_048_576,
+  killSignal: "SIGKILL",
+});
+if (result.error) process.exit(result.error.code === "ETIMEDOUT" ? 124 : 125);
+if (result.status !== 0) process.exit(125);
+process.stdout.write(result.stdout);
+' "$@"
+}
+
+preflight_provider_auth() {
+  if [[ -n "$provider_secret_ref" ]]; then
+    provider_auth_mode=secret_ref
+    provider_auth_expectation='{"mode":"secret_ref"}'
+    return
+  fi
+  provider_auth_mode=subscription
+  local resolved_claude
+  resolved_claude=$(command -v claude 2>/dev/null || true)
+  if [[ -z "$resolved_claude" || ! -x "$resolved_claude" ]]; then
+    preflight_error provider_auth_unavailable claude_executable_not_found
+  fi
+  claude_executable=$resolved_claude
+  if [[ -n ${T3_STOCK_CLAUDE_EXECUTABLE:-} ]]; then
+    if [[ "$T3_STOCK_CLAUDE_EXECUTABLE" != "$claude_executable" ]]; then
+      preflight_error provider_auth_unavailable claude_executable_mismatch
+    fi
+  fi
+
+  local auth_status
+  local probe_status
+  set +e
+  auth_status=$(run_claude_probe "$claude_executable" auth status)
+  probe_status=$?
+  set -e
+  if [[ "$probe_status" -eq 124 ]]; then
+    preflight_error provider_auth_unavailable auth_probe_timeout
+  fi
+  if [[ "$probe_status" -ne 0 ]]; then
+    preflight_error provider_auth_unavailable auth_probe_failed
+  fi
+  if ! /usr/bin/jq -e 'type == "object" and (.loggedIn | type == "boolean") and (.authMethod | type == "string")' <<<"$auth_status" >/dev/null 2>&1; then
+    preflight_error provider_auth_unavailable auth_probe_invalid
+  fi
+  if [[ $(/usr/bin/jq -r '.loggedIn' <<<"$auth_status") != true ]]; then
+    preflight_error provider_auth_unavailable subscription_not_authenticated
+  fi
+  local normalized_auth_method
+  normalized_auth_method=$(/usr/bin/jq -r '.authMethod | ascii_downcase | gsub("[^a-z]"; "")' <<<"$auth_status")
+  case "$normalized_auth_method" in
+    claudeai|subscription)
+      ;;
+    apikey|anthropicapikey|anthropicauthtoken)
+      preflight_error provider_auth_unavailable subscription_auth_method_api_key
+      ;;
+    *)
+      preflight_error provider_auth_unavailable subscription_auth_method_unrecognized
+      ;;
+  esac
+  unset auth_status
+
+  set +e
+  claude_version=$(run_claude_probe "$claude_executable" --version)
+  probe_status=$?
+  set -e
+  if [[ "$probe_status" -eq 124 ]]; then
+    preflight_error provider_auth_unavailable auth_probe_timeout
+  fi
+  if [[ "$probe_status" -ne 0 || -z "$claude_version" || "$claude_version" == *$'\n'* || ${#claude_version} -gt 128 || ! "$claude_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    preflight_error provider_auth_unavailable auth_probe_invalid
+  fi
+  provider_auth_expectation=$(/usr/bin/jq -cn \
+    --arg claudeExecutable "$claude_executable" \
+    --arg claudeVersion "$claude_version" \
+    '{mode:"subscription",claudeExecutable:$claudeExecutable,claudeVersion:$claudeVersion}')
 }
 
 fail_at() {
@@ -114,17 +245,20 @@ cleanup() {
       --arg candidateSha "$candidate_sha" \
       --arg stockSha "$actual_stock_sha" \
       --arg artifactDigest "$artifact_digest" \
+      --arg providerAuthMode "$provider_auth_mode" \
+      --arg claudeExecutable "$claude_executable" \
+      --arg claudeVersion "$claude_version" \
       --argjson live "$provisional_json" \
       --argjson negativeShellStatus "$negative_shell_status" \
       --argjson negativeDetailStatus "$negative_detail_status" \
-      '{runId:$runId,candidateSha:$candidateSha,stockSha:$stockSha,success:true,cleanBeforeBuild:true,artifactDigest:$artifactDigest,privateResolution:false,provenance:{stockInstall:{command:"corepack pnpm install --frozen-lockfile",status:0},stockBuild:{command:"corepack pnpm --filter t3 build:bundle",status:0},candidateInstall:{command:"bun install --frozen-lockfile",status:0},exactCharacterization:{command:"corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts",status:0},isolatedBasenames:["stock-tree","t3layer-clean","server-home","workspace"]},exactHttpNegative:{status:500,shellStatus:$negativeShellStatus,detailStatus:$negativeDetailStatus,code:"internal_error",reason:"orchestration_dispatch_failed",threadAbsent:true},live:($live|del(.provisional,.success,.runId)),teardown:{pidStopped:true,worktreeRemoved:true,rootRemoved:true}}')
+      '{runId:$runId,candidateSha:$candidateSha,stockSha:$stockSha,success:true,cleanBeforeBuild:true,artifactDigest:$artifactDigest,privateResolution:false,provenance:{stockInstall:{command:"corepack pnpm install --frozen-lockfile",status:0},stockBuild:{command:"corepack pnpm --filter t3 build:bundle",status:0},candidateInstall:{command:"bun install --frozen-lockfile",status:0},exactCharacterization:{command:"corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts",status:0},providerAuth:(if $providerAuthMode == "subscription" then {mode:"subscription",claudeExecutable:$claudeExecutable,claudeVersion:$claudeVersion} else {mode:"secret_ref"} end),isolatedBasenames:["stock-tree","t3layer-clean","server-home","workspace"]},exactHttpNegative:{status:500,shellStatus:$negativeShellStatus,detailStatus:$negativeDetailStatus,code:"internal_error",reason:"orchestration_dispatch_failed",threadAbsent:true},live:($live|del(.provisional,.success,.runId)),teardown:{pidStopped:true,worktreeRemoved:true,rootRemoved:true}}')
     printf '%s\n' "$final_body" >"$final_body_staging"
     if [[ ${T3_STOCK_FAIL_AT:-} == before-final-body-validation ]]; then
       rm -f -- "$final_body_staging" "$final_staging"
       echo "ERROR: injected failure: before-final-body-validation" >&2
       exit 91
     fi
-    if ! run_finalizer publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha"; then
+    if ! run_finalizer publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha" "$provider_auth_expectation"; then
       rm -f -- "$final_body_staging" "$final_staging"
       exit 2
     fi
@@ -155,7 +289,7 @@ cleanup() {
     fi
     chmod 600 "$proof_target"
     final_bytes=$(sha256_file "$proof_target")
-    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha"; then
+    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha" "$provider_auth_expectation"; then
       rm -f -- "$proof_target"
       echo "ERROR: final proof bytes, mode, checksum, identity, or teardown mismatch" >&2
       exit 2
@@ -165,7 +299,8 @@ cleanup() {
   exit "$cleanup_status"
 }
 
-: "${T3_STOCK_PROVIDER_SECRET_REF:?T3_STOCK_PROVIDER_SECRET_REF is required}"
+validate_candidate_identity
+preflight_provider_auth
 proof_root=$(mktemp -d "${TMPDIR:-/tmp}/t3layer-stock-proof.XXXXXX")
 trap cleanup EXIT INT TERM
 
@@ -213,15 +348,13 @@ if [[ "$test_mode" != 1 ]]; then
 fi
 run_stage_seam after-stock-build
 if [[ "$test_mode" == 1 ]]; then
-  candidate_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   artifact_digest=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   mkdir -p -- "$t3layer_clean/scripts" "$t3layer_clean/src"
-  /bin/cp "$candidate_repo/scripts/stock-proof-cli.ts" "$t3layer_clean/scripts/stock-proof-cli.ts"
-  /bin/cp "$candidate_repo/src/stockProof.ts" "$t3layer_clean/src/stockProof.ts"
+  /bin/cp "$implementation_repo/scripts/stock-proof-cli.ts" "$t3layer_clean/scripts/stock-proof-cli.ts"
+  /bin/cp "$implementation_repo/src/stockProof.ts" "$t3layer_clean/src/stockProof.ts"
 else
-  candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)
-  /usr/bin/git -C "$candidate_repo" archive HEAD | /usr/bin/tar -x -C "$t3layer_clean"
-  artifact_digest=$(/usr/bin/git -C "$candidate_repo" archive HEAD | sha256_stream)
+  /usr/bin/git -C "$candidate_repo" archive "$candidate_sha" | /usr/bin/tar -x -C "$t3layer_clean"
+  artifact_digest=$(/usr/bin/git -C "$candidate_repo" archive "$candidate_sha" | sha256_stream)
 fi
 run_stage_seam after-archive-extract
 if [[ "$test_mode" != 1 ]]; then
@@ -262,21 +395,38 @@ if [[ "$test_mode" != 1 ]] && /usr/sbin/lsof -nP -iTCP:3774 -sTCP:LISTEN >/dev/n
   exit 2
 fi
 set +x
-if [[ "$test_mode" == 1 ]]; then
-  provider_key=test-mode-redacted
-else
-  provider_key=$(op read "$T3_STOCK_PROVIDER_SECRET_REF")
+provider_key=''
+if [[ "$provider_auth_mode" == secret_ref ]]; then
+  if [[ "$test_mode" == 1 ]]; then
+    provider_key=test-mode-redacted
+  else
+    provider_key=$(op read "$provider_secret_ref")
+  fi
 fi
 run_stage_seam after-secret-read
-if [[ "$test_mode" != 1 ]]; then
-  (cd "$workspace" && ANTHROPIC_API_KEY="$provider_key" exec node "$stock_tree/apps/server/dist/bin.mjs" serve --host 127.0.0.1 --port 3774 --base-dir "$server_home") >"$server_log" 2>&1 &
+if [[ "$test_mode" == 1 ]]; then
+  if [[ -n ${T3_STOCK_HARNESS_SERVER_RUNNER:-} ]]; then
+    if [[ "$provider_auth_mode" == subscription ]]; then
+      "${clean_server_env[@]}" "$T3_STOCK_HARNESS_SERVER_RUNNER" "$provider_auth_mode" "$claude_executable" "$claude_version"
+    else
+      "${clean_server_env[@]}" "ANTHROPIC_API_KEY=$provider_key" "$T3_STOCK_HARNESS_SERVER_RUNNER" "$provider_auth_mode" '' ''
+    fi
+  fi
+  unset provider_key
+elif [[ "$provider_auth_mode" == subscription ]]; then
+  (cd "$workspace" && exec "${clean_server_env[@]}" node "$stock_tree/apps/server/dist/bin.mjs" serve --host 127.0.0.1 --port 3774 --base-dir "$server_home") >"$server_log" 2>&1 &
   server_pid=$!
   server_birth=$(/bin/ps -o lstart= -p "$server_pid" | /usr/bin/xargs)
   unset provider_key
   server_cwd=$(/usr/sbin/lsof -a -p "$server_pid" -d cwd -Fn | /usr/bin/sed -n 's/^n//p')
   [[ "$server_cwd" == "$workspace" ]]
 else
+  (cd "$workspace" && exec "${clean_server_env[@]}" "ANTHROPIC_API_KEY=$provider_key" node "$stock_tree/apps/server/dist/bin.mjs" serve --host 127.0.0.1 --port 3774 --base-dir "$server_home") >"$server_log" 2>&1 &
+  server_pid=$!
+  server_birth=$(/bin/ps -o lstart= -p "$server_pid" | /usr/bin/xargs)
   unset provider_key
+  server_cwd=$(/usr/sbin/lsof -a -p "$server_pid" -d cwd -Fn | /usr/bin/sed -n 's/^n//p')
+  [[ "$server_cwd" == "$workspace" ]]
 fi
 run_stage_seam after-server-launch
 

@@ -68,9 +68,12 @@ The exposed tools are `spawn`, `send`, `wait`, `observe`, `getState`,
 it does not create or cache a second state representation.
 
 Never log the bearer, authorization headers, bootstrap credentials, provider
-keys, prompts, or raw responses. The live harness accepts a 1Password reference
-through `T3_STOCK_PROVIDER_SECRET_REF`; the resolved value is scoped only to the
-owned isolated server child.
+keys, prompts, or raw responses. The live harness defaults to the machine's
+authenticated Claude Code subscription, probes the exact `claude` executable
+resolved by the isolated server's `PATH`, and scrubs ambient Anthropic and
+nested-agent variables. `T3_STOCK_PROVIDER_SECRET_REF` remains an optional
+1Password-backed override; its resolved value is scoped only to the owned
+isolated server child.
 
 ## Causal API
 
@@ -267,7 +270,7 @@ Declared toolchain target: Bun 1.3.11 and TypeScript 6.0.x.
 
 ```bash
 bun install --frozen-lockfile
-bun test
+bun run test ./test/*.test.ts
 bun run typecheck
 bash scripts/check-stock-only.sh
 bash scripts/stock-t3-canary-drill.sh --dry-run
@@ -276,17 +279,18 @@ bash scripts/stock-t3-canary-drill.sh --dry-run
 The opt-in exact-stock live proof is isolated from normal user state:
 
 ```bash
-set -a
-. ./.env.stock-proof
-set +a
+export T3_STOCK_CANDIDATE_REPO="$(pwd -P)"
+export T3_STOCK_CANDIDATE_SHA="$(git rev-parse HEAD)"
 bash scripts/stock-t3-live-harness.sh
 ```
 
-`.env.stock-proof` is ignored and must contain only a secret reference, never a
-secret value. The harness pins the adopted stock SHA, builds in detached clean
-worktrees, uses a dedicated base directory/workspace/bearer, validates exact PID
-birth and working-directory identity during teardown, and accepts proof freshness
-only for the caller-held current `{runId, candidateSha}` pair. Its TypeScript
+The candidate must be the merged tree: `HEAD`, local `main`, and `origin/main`
+must all equal `T3_STOCK_CANDIDATE_SHA`. `.env.stock-proof` is ignored and may
+hold the optional 1Password reference, never a resolved secret value. The harness
+pins the adopted stock SHA, builds in detached clean worktrees, uses a dedicated
+base directory/workspace/bearer, validates exact PID birth and working-directory
+identity during teardown, and accepts proof freshness only for the caller-held
+current `{runId, candidateSha}` pair. Its TypeScript
 validator requires clean-install/build provenance, executable exact-stock
 characterization, the HTTP negative, redacted endpoint/status observations,
 actual request/poll counters, scoped IDs and sequences, terminal outcomes,
@@ -294,8 +298,9 @@ isolation, and complete teardown before atomic mode-0600 publication. Literal
 stock SHA/provenance commands and isolation basenames are pinned, and final
 validation runs from the archived candidate rather than the mutable worktree.
 
-Because the harness exports `git archive HEAD`, it proves only a reviewed
-checkpoint commit. An uncommitted working tree cannot produce a current proof
+Because the harness exports `git archive "$T3_STOCK_CANDIDATE_SHA"` from
+`T3_STOCK_CANDIDATE_REPO`, it proves only the committed candidate. An
+uncommitted working tree cannot produce a current proof
 for those edits.
 
 ## First stock-only release

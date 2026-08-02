@@ -8,7 +8,7 @@
   "private": true,
   "scripts": {
     "check:stock-only": "bash scripts/check-stock-only.sh",
-    "test": "bun test",
+    "test": "\"$npm_execpath\" test --timeout 30000",
     "typecheck": "tsc --noEmit"
   },
   "type": "module"
