@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, open, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -845,6 +845,29 @@ describe("criterion-4 terminal projection rollover", () => {
     } finally {
       child.kill("SIGKILL");
       await child.exited;
+      await rm(traceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("uses a borrowed projection trace descriptor without taking ownership", async () => {
+    const traceRoot = await mkdtemp(join(tmpdir(), "t3layer-c4-projection-fd."));
+    const tracePath = join(traceRoot, "trace.jsonl");
+    await Bun.write(tracePath, "");
+    await chmod(tracePath, 0o640);
+    const traceHandle = await open(tracePath, "a");
+    const runtime = createStockT3NativeRuntime({
+      client: {} as StockT3RuntimeClient,
+      projectionTraceFd: traceHandle.fd,
+    });
+
+    try {
+      expect((await stat(tracePath)).mode & 0o777).toBe(0o600);
+      runtime.close();
+      await traceHandle.writeFile("caller-owned\n");
+      expect(await Bun.file(tracePath).text()).toBe("caller-owned\n");
+    } finally {
+      runtime.close();
+      await traceHandle.close();
       await rm(traceRoot, { recursive: true, force: true });
     }
   }, 20_000);

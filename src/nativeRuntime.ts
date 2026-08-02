@@ -537,6 +537,8 @@ export interface StockT3NativeRuntimeOptions {
   readonly clock?: () => number;
   /** Existing regular file opened append-only; each ids-only projection row is fsynced. */
   readonly projectionTracePath?: string;
+  /** Borrowed append descriptor for an existing regular trace file; ownership stays with caller. */
+  readonly projectionTraceFd?: number;
   readonly projectionTraceClock?: () => number;
 }
 
@@ -782,31 +784,55 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
   const projectionTraceClock = options.projectionTraceClock ?? (() => performance.now());
   const projectionTraceStartedAt = projectionTraceClock();
   let projectionTraceFd: number | null = null;
-  if (options.projectionTracePath !== undefined) {
+  let ownsProjectionTraceFd = false;
+  if (
+    options.projectionTracePath !== undefined &&
+    options.projectionTraceFd !== undefined
+  ) {
+    throw new StockRuntimeError("protocol_mismatch", {
+      reason: "projection_trace_source_invalid",
+    });
+  }
+  if (options.projectionTracePath !== undefined || options.projectionTraceFd !== undefined) {
     if (
-      options.projectionTracePath.trim().length === 0 ||
-      options.projectionTracePath.includes("\u0000")
+      options.projectionTracePath !== undefined &&
+      (options.projectionTracePath.trim().length === 0 ||
+        options.projectionTracePath.includes("\u0000"))
     ) {
       throw new StockRuntimeError("protocol_mismatch", {
         reason: "projection_trace_path_invalid",
       });
     }
+    if (
+      options.projectionTraceFd !== undefined &&
+      (!Number.isInteger(options.projectionTraceFd) || options.projectionTraceFd < 0)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "projection_trace_source_invalid",
+      });
+    }
     try {
-      projectionTraceFd = openSync(
-        options.projectionTracePath,
-        fsConstants.O_WRONLY |
-          fsConstants.O_APPEND |
-          fsConstants.O_NONBLOCK |
-          (fsConstants.O_NOFOLLOW ?? 0),
-      );
+      if (options.projectionTraceFd !== undefined) {
+        projectionTraceFd = options.projectionTraceFd;
+      } else {
+        projectionTraceFd = openSync(
+          options.projectionTracePath!,
+          fsConstants.O_WRONLY |
+            fsConstants.O_APPEND |
+            fsConstants.O_NONBLOCK |
+            (fsConstants.O_NOFOLLOW ?? 0),
+        );
+        ownsProjectionTraceFd = true;
+      }
       if (!fstatSync(projectionTraceFd).isFile()) {
         throw new Error("projection trace is not a regular file");
       }
       fchmodSync(projectionTraceFd, 0o600);
       fsyncSync(projectionTraceFd);
     } catch {
-      if (projectionTraceFd !== null) closeSync(projectionTraceFd);
+      if (projectionTraceFd !== null && ownsProjectionTraceFd) closeSync(projectionTraceFd);
       projectionTraceFd = null;
+      ownsProjectionTraceFd = false;
       throw new StockRuntimeError("protocol_mismatch", {
         reason: "projection_trace_unavailable",
       });
@@ -3412,10 +3438,11 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       for (const state of leases.values()) {
         releaseLease(state.receipt.agentRef, state.receipt.leaseId);
       }
-      if (projectionTraceFd !== null) {
+      if (projectionTraceFd !== null && ownsProjectionTraceFd) {
         closeSync(projectionTraceFd);
-        projectionTraceFd = null;
       }
+      projectionTraceFd = null;
+      ownsProjectionTraceFd = false;
     },
   };
 }

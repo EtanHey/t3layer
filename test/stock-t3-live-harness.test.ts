@@ -814,8 +814,8 @@ fi
       `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == after-trace-open ]]; then
-  [[ "$T3_STOCK_TRACE_PATH" == /dev/fd/9 ]]
-  printf '%s\n' inherited-descriptor >>"$T3_STOCK_TRACE_PATH"
+  [[ "$T3_STOCK_TRACE_FD" == 9 ]]
+  printf '%s\n' inherited-descriptor >&9
 fi
 `,
     );

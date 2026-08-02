@@ -191,12 +191,8 @@ prepare_projection_trace() {
     if [[ "$trace_fd_open" == true ]]; then exec 9>&-; trace_fd_open=false; fi
     preflight_error projection_trace_invalid "$trace_error"
   fi
-  if [[ ! -e /dev/fd/9 ]]; then
-    exec 9>&-
-    trace_fd_open=false
-    preflight_error projection_trace_invalid descriptor_unavailable
-  fi
-  export T3_STOCK_TRACE_PATH=/dev/fd/9
+  export T3_STOCK_TRACE_PATH="$trace_target"
+  export T3_STOCK_TRACE_FD=9
   run_stage_seam after-trace-open
 }
 

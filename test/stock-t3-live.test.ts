@@ -14,6 +14,7 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
     const workspaceRoot = Bun.env.T3_STOCK_WORKSPACE_ROOT;
     const receiptPath = Bun.env.T3_STOCK_RECEIPT_PATH;
     const projectionTracePath = Bun.env.T3_STOCK_TRACE_PATH;
+    const projectionTraceFd = Bun.env.T3_STOCK_TRACE_FD;
     const runId = Bun.env.T3_STOCK_RUN_ID;
     if (
       !baseUrl ||
@@ -21,6 +22,8 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
       !workspaceRoot ||
       !receiptPath ||
       !projectionTracePath ||
+      !projectionTraceFd ||
+      !/^\d+$/.test(projectionTraceFd) ||
       !runId
     ) {
       throw new Error("live harness contract is incomplete");
@@ -29,7 +32,7 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
       baseUrl,
       bearerToken,
       connectionProfile: "local",
-      projectionTracePath,
+      projectionTraceFd: Number(projectionTraceFd),
     });
     const facade = createStockT3Facade(runtime);
     const modelSelection = { instanceId: "claudeAgent", model: "claude-sonnet-4-5" };
