@@ -198,28 +198,66 @@ describe("stock live harness lifecycle", () => {
     const bin = root;
     const claude = join(bin, "claude");
     const authLog = join(root, "claude-auth.log");
+    const serverEnvLog = join(root, "server-env.log");
+    const serverRunner = join(root, "server-runner");
     const target = join(root, "proof.json");
     await Bun.write(
       claude,
-      `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' "$*" >> '${authLog}'\nprintf '%s\\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'\n`,
+      `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' "$*" >> '${authLog}'\ncase "\${1:-}" in\n  auth) printf '%s\\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"private@example.com","orgId":"private-org-id","orgName":"Private Org","subscriptionType":"max"}' ;;\n  --version) printf '%s\\n' '2.1.220 (Claude Code)' ;;\n  *) exit 64 ;;\nesac\n`,
     );
     await chmod(claude, 0o700);
+    await Bun.write(
+      serverRunner,
+      `#!/usr/bin/env bash\nset -euo pipefail\nfor name in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_PID CLAUDE_CODE_EXECPATH CMUX_CLAUDE_WRAPPER_SHIM SHELLBOOK_REAL_CLAUDE; do\n  if [[ \${!name+x} == x ]]; then printf '%s\\n' "unexpected environment: $name" >&2; exit 41; fi\ndone\nprintf '%s\\n' "$1|$2|$3" > '${serverEnvLog}'\n`,
+    );
+    await chmod(serverRunner, 0o700);
 
     const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
       ...candidateEnv(),
       PATH: `${bin}:${Bun.env.PATH ?? ""}`,
+      ANTHROPIC_API_KEY: "ambient-api-key-do-not-log",
+      ANTHROPIC_AUTH_TOKEN: "ambient-auth-token-do-not-log",
+      CLAUDECODE: "1",
+      CLAUDE_CODE_ENTRYPOINT: "nested-agent",
+      CLAUDE_CODE_SESSION_ID: "nested-session",
+      CLAUDE_PID: "123",
+      CLAUDE_CODE_EXECPATH: "/tmp/nested-claude",
+      CMUX_CLAUDE_WRAPPER_SHIM: "/tmp/cmux-shim",
+      SHELLBOOK_REAL_CLAUDE: "/tmp/shellbook-claude",
+      T3_STOCK_CLAUDE_EXECUTABLE: claude,
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_HARNESS_SERVER_RUNNER: serverRunner,
       T3_STOCK_PROOF_TARGET: target,
-    }, ["T3_STOCK_PROVIDER_SECRET_REF", "ANTHROPIC_API_KEY"]);
+    }, ["T3_STOCK_PROVIDER_SECRET_REF"]);
 
     expect(result.exitCode, result.stderr).toBe(0);
-    expect(await Bun.file(authLog).text()).toBe("auth status\n");
-    expect(result.stderr).not.toContain("ANTHROPIC_API_KEY");
-    await expect(Bun.file(target).json()).resolves.toMatchObject({ success: true });
+    expect(await Bun.file(authLog).text()).toBe("auth status\n--version\n");
+    expect(await Bun.file(serverEnvLog).text()).toBe(`subscription|${claude}|2.1.220 (Claude Code)\n`);
+    const combinedOutput = `${result.stdout}\n${result.stderr}`;
+    for (const redacted of [
+      "ambient-api-key-do-not-log", "ambient-auth-token-do-not-log",
+      "private@example.com", "private-org-id", "Private Org",
+    ]) expect(combinedOutput).not.toContain(redacted);
+    const receipt = await Bun.file(target).json();
+    expect(receipt).toMatchObject({
+      success: true,
+      provenance: {
+        providerAuth: {
+          mode: "subscription",
+          claudeExecutable: claude,
+          claudeVersion: "2.1.220 (Claude Code)",
+        },
+      },
+    });
+    expect(JSON.stringify(receipt)).not.toContain("private@example.com");
 
     const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
-    expect(source).toContain('(cd "$workspace" && exec node "$stock_tree/apps/server/dist/bin.mjs" serve');
+    for (const name of [
+      "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+      "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_EXECPATH",
+      "CMUX_CLAUDE_WRAPPER_SHIM", "SHELLBOOK_REAL_CLAUDE",
+    ]) expect(source).toContain(`-u ${name}`);
   });
 
   test("fails closed with a typed reason when Claude subscription auth is unavailable", async () => {
@@ -273,6 +311,9 @@ describe("stock live harness lifecycle", () => {
     expect(result.exitCode, result.stderr).toBe(0);
     expect(await Bun.file(authLog).exists()).toBe(false);
     expect(result.stderr).not.toContain("op://fixture/provider/key");
+    await expect(Bun.file(target).json()).resolves.toMatchObject({
+      provenance: { providerAuth: { mode: "secret_ref" } },
+    });
   });
 
   test("binds the archived candidate to caller-supplied repository and SHA inputs", async () => {
