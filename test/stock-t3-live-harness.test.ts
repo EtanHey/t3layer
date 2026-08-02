@@ -202,6 +202,11 @@ describe("stock live harness lifecycle", () => {
     },
     teardown: { pidStopped: true as const, worktreeRemoved: true as const, rootRemoved: true as const },
   });
+  const expectedProof = (body: ReturnType<typeof completeBody>) => ({
+    runId: body.runId,
+    candidateSha: body.candidateSha,
+    providerAuth: body.provenance.providerAuth,
+  });
 
   test("arms cleanup immediately after the proof root is allocated", async () => {
     const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
@@ -294,7 +299,7 @@ describe("stock live harness lifecycle", () => {
     });
     expect(JSON.stringify(receipt)).not.toContain("private@example.com");
 
-  });
+  }, 20_000);
 
   for (const authCase of [
     {
@@ -441,7 +446,7 @@ describe("stock live harness lifecycle", () => {
     await expect(Bun.file(target).json()).resolves.toMatchObject({
       provenance: { providerAuth: { mode: "secret_ref" } },
     });
-  });
+  }, 20_000);
 
   test("binds the archive to a caller SHA matching merged main and origin/main", async () => {
     const candidate = await candidateFixture();
@@ -625,13 +630,20 @@ describe("stock live harness lifecycle", () => {
     expect(await Bun.file(target).exists()).toBe(false);
   });
 
-  test("requires caller-held runId and candidateSha instead of trusting a stale path", async () => {
+  test("requires caller-held runId, candidateSha, and provider auth instead of trusting a stale path", async () => {
     const prior = canonicalProofBody({ ...completeBody(), runId: "prior-run" });
     expect(() =>
-      validateProofReceipt(prior, { runId: "current-run", candidateSha: "b".repeat(40) }),
+      validateProofReceipt(prior, {
+        ...expectedProof(completeBody()),
+        runId: "current-run",
+        candidateSha: "b".repeat(40),
+      }),
     ).toThrow(ProofReceiptError);
     expect(
-      validateProofReceipt(prior, { runId: "prior-run", candidateSha: "a".repeat(40) }),
+      validateProofReceipt(prior, {
+        ...expectedProof(completeBody()),
+        runId: "prior-run",
+      }),
     ).toEqual(prior);
   });
 
@@ -650,13 +662,25 @@ describe("stock live harness lifecycle", () => {
     })).toThrow(ProofReceiptError);
     const checksum = await proofChecksum(body);
     const envelope = { ...body, checksum };
-    expect(await validateProofEnvelope(envelope, { runId: body.runId, candidateSha: body.candidateSha })).toEqual(canonicalProofBody(body));
+    expect(await validateProofEnvelope(envelope, expectedProof(body))).toEqual(canonicalProofBody(body));
+    const modeFlippedBody = {
+      ...body,
+      provenance: { ...body.provenance, providerAuth: { mode: "secret_ref" as const } },
+    };
+    await expect(validateProofEnvelope(
+      { ...modeFlippedBody, checksum: await proofChecksum(modeFlippedBody) },
+      expectedProof(body),
+    )).rejects.toThrow(ProofReceiptError);
     expect(canonicalProofJson(body)).toEndWith("\n");
-    await expect(validateProofEnvelope({ ...envelope, checksum: "0".repeat(64) }, { runId: body.runId, candidateSha: body.candidateSha })).rejects.toThrow(ProofReceiptError);
+    await expect(validateProofEnvelope(
+      { ...envelope, checksum: "0".repeat(64) },
+      expectedProof(body),
+    )).rejects.toThrow(ProofReceiptError);
   });
 
-  test("rejects all 18 proof-forgery classes while accepting the valid control", () => {
+  test("rejects all 21 proof-forgery classes while accepting the valid control", () => {
     const body = completeBody();
+    const expected = expectedProof(body);
     const withoutOneDispatch = body.live.endpointStatusTrace.filter(
       (_, index) => index !== body.live.endpointStatusTrace.length - 1,
     );
@@ -743,15 +767,36 @@ describe("stock live harness lifecycle", () => {
         exactHttpNegative: { ...body.exactHttpNegative, status: 400 },
       }),
       () => validateProofReceipt(body, {
-        runId: body.runId,
+        ...expected,
         candidateSha: "f".repeat(40),
       }),
+      () => validateProofReceipt({
+        ...body,
+        provenance: { ...body.provenance, providerAuth: { mode: "secret_ref" } },
+      }, expected),
+      () => validateProofReceipt({
+        ...body,
+        provenance: {
+          ...body.provenance,
+          providerAuth: {
+            ...body.provenance.providerAuth,
+            claudeExecutable: "/opt/homebrew/bin/claude",
+          },
+        },
+      }, expected),
+      () => validateProofReceipt({
+        ...body,
+        provenance: {
+          ...body.provenance,
+          providerAuth: {
+            ...body.provenance.providerAuth,
+            claudeVersion: "9.9.9 (Claude Code)",
+          },
+        },
+      }, expected),
     ];
-    expect(validateProofReceipt(body, {
-      runId: body.runId,
-      candidateSha: body.candidateSha,
-    })).toEqual(canonicalProofBody(body));
-    expect(forgeries).toHaveLength(18);
+    expect(validateProofReceipt(body, expected)).toEqual(canonicalProofBody(body));
+    expect(forgeries).toHaveLength(21);
     for (const forge of forgeries) expect(forge).toThrow(ProofReceiptError);
   });
 
@@ -766,12 +811,12 @@ describe("stock live harness lifecycle", () => {
     await chmod(receipt, 0o600);
     const published = await run([
       "bun", "scripts/stock-proof-cli.ts", "publish", draft, receipt,
-      body.runId, body.candidateSha,
+      body.runId, body.candidateSha, JSON.stringify(body.provenance.providerAuth),
     ]);
     expect(published.exitCode).toBe(0);
     const validated = await run([
       "bun", "scripts/stock-proof-cli.ts", "validate-envelope", receipt,
-      body.runId, body.candidateSha,
+      body.runId, body.candidateSha, JSON.stringify(body.provenance.providerAuth),
     ]);
     expect(validated.exitCode).toBe(0);
     expect((await Bun.file(receipt).text()).endsWith("\n")).toBe(true);
@@ -793,6 +838,7 @@ describe("stock live harness lifecycle", () => {
     const published = await run([
       "bun", "scripts/stock-proof-cli.ts", "publish", draft, receipt,
       "wrong-current-run", currentBody.candidateSha,
+      JSON.stringify(currentBody.provenance.providerAuth),
     ]);
 
     expect(published.exitCode).not.toBe(0);

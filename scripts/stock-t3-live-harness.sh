@@ -28,6 +28,7 @@ provider_secret_ref=${T3_STOCK_PROVIDER_SECRET_REF:-}
 provider_auth_mode=''
 claude_executable=''
 claude_version=''
+provider_auth_expectation=''
 clean_server_env=(/usr/bin/env -i "HOME=$HOME" "PATH=$PATH")
 for preserved_name in USER LOGNAME LANG LC_ALL SHELL TMPDIR; do
   if [[ -n ${!preserved_name:-} ]]; then
@@ -122,6 +123,7 @@ process.stdout.write(result.stdout);
 preflight_provider_auth() {
   if [[ -n "$provider_secret_ref" ]]; then
     provider_auth_mode=secret_ref
+    provider_auth_expectation='{"mode":"secret_ref"}'
     return
   fi
   provider_auth_mode=subscription
@@ -174,6 +176,10 @@ preflight_provider_auth() {
   if [[ "$probe_status" -ne 0 || -z "$claude_version" || "$claude_version" == *$'\n'* || ${#claude_version} -gt 128 || ! "$claude_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     preflight_error provider_auth_unavailable auth_probe_invalid
   fi
+  provider_auth_expectation=$(/usr/bin/jq -cn \
+    --arg claudeExecutable "$claude_executable" \
+    --arg claudeVersion "$claude_version" \
+    '{mode:"subscription",claudeExecutable:$claudeExecutable,claudeVersion:$claudeVersion}')
 }
 
 fail_at() {
@@ -247,7 +253,7 @@ cleanup() {
       echo "ERROR: injected failure: before-final-body-validation" >&2
       exit 91
     fi
-    if ! run_finalizer publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha"; then
+    if ! run_finalizer publish "$final_body_staging" "$final_staging" "$run_id" "$candidate_sha" "$provider_auth_expectation"; then
       rm -f -- "$final_body_staging" "$final_staging"
       exit 2
     fi
@@ -278,7 +284,7 @@ cleanup() {
     fi
     chmod 600 "$proof_target"
     final_bytes=$(sha256_file "$proof_target")
-    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha"; then
+    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha" "$provider_auth_expectation"; then
       rm -f -- "$proof_target"
       echo "ERROR: final proof bytes, mode, checksum, identity, or teardown mismatch" >&2
       exit 2
