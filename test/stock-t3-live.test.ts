@@ -13,14 +13,26 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
     const bearerToken = Bun.env.T3_STOCK_HTTP_TOKEN;
     const workspaceRoot = Bun.env.T3_STOCK_WORKSPACE_ROOT;
     const receiptPath = Bun.env.T3_STOCK_RECEIPT_PATH;
+    const projectionTracePath = Bun.env.T3_STOCK_TRACE_PATH;
+    const projectionTraceFd = Bun.env.T3_STOCK_TRACE_FD;
     const runId = Bun.env.T3_STOCK_RUN_ID;
-    if (!baseUrl || !bearerToken || !workspaceRoot || !receiptPath || !runId) {
+    if (
+      !baseUrl ||
+      !bearerToken ||
+      !workspaceRoot ||
+      !receiptPath ||
+      !projectionTracePath ||
+      !projectionTraceFd ||
+      !/^\d+$/.test(projectionTraceFd) ||
+      !runId
+    ) {
       throw new Error("live harness contract is incomplete");
     }
     const runtime = createStockT3NativeRuntime({
       baseUrl,
       bearerToken,
       connectionProfile: "local",
+      projectionTraceFd: Number(projectionTraceFd),
     });
     const facade = createStockT3Facade(runtime);
     const modelSelection = { instanceId: "claudeAgent", model: "claude-sonnet-4-5" };
@@ -99,5 +111,6 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
         timestamps: { startedAt, completedAt: new Date().toISOString() },
       }, runId);
     await Bun.write(receiptPath, `${JSON.stringify(provisional)}\n`);
+    runtime.close();
   }, 120_000);
 });

@@ -7,6 +7,15 @@ import type {
   ThreadDetailSnapshot,
   ConnectionProfile,
 } from "./stockT3Contracts";
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  openSync,
+  writeSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import {
@@ -488,6 +497,35 @@ export interface StockT3RuntimeClient {
   };
 }
 
+export interface StockT3ProjectionTraceEntry {
+  readonly endpoint: "shell" | "detail";
+  readonly snapshotSequence: number;
+  readonly monotonicOffsetMs: number;
+  readonly latestTurn: null | {
+    readonly turnId: string;
+    readonly state: string;
+    readonly requestedAt: string;
+    readonly assistantMessageId: string | null;
+  };
+  readonly session: null | {
+    readonly status: string;
+    readonly activeTurnId: string | null;
+  };
+  readonly runtime: {
+    readonly boundTurnId: string | null;
+    readonly boundRequestedAt: string | null;
+    readonly boundAssistantMessageId: string | null;
+    readonly uniqueAssistantFallbackBlocked: boolean;
+  };
+  readonly messages: readonly {
+    readonly id: string;
+    readonly role: string;
+    readonly turnId: string | null;
+    readonly streaming: boolean;
+    readonly textLength: number;
+  }[];
+}
+
 export interface StockT3NativeRuntimeOptions {
   readonly client?: StockT3RuntimeClient;
   readonly baseUrl?: string | URL;
@@ -497,6 +535,11 @@ export interface StockT3NativeRuntimeOptions {
   readonly id?: () => string;
   readonly now?: () => string;
   readonly clock?: () => number;
+  /** Existing regular file opened append-only; each ids-only projection row is fsynced. */
+  readonly projectionTracePath?: string;
+  /** Borrowed append descriptor for an existing regular trace file; ownership stays with caller. */
+  readonly projectionTraceFd?: number;
+  readonly projectionTraceClock?: () => number;
 }
 
 export interface RuntimeOperationOptions {
@@ -515,6 +558,7 @@ interface LeaseState {
   boundTurnId: string | null;
   boundRequestedAt: string | null;
   boundAssistantMessageId: string | null;
+  uniqueAssistantFallbackBlocked: boolean;
 }
 
 interface TurnSlotClaim {
@@ -737,6 +781,63 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
   const id = options.id ?? (() => crypto.randomUUID());
   const now = options.now ?? (() => new Date().toISOString());
   const clock = options.clock ?? Date.now;
+  const projectionTraceClock = options.projectionTraceClock ?? (() => performance.now());
+  const projectionTraceStartedAt = projectionTraceClock();
+  let projectionTraceFd: number | null = null;
+  let ownsProjectionTraceFd = false;
+  if (
+    options.projectionTracePath !== undefined &&
+    options.projectionTraceFd !== undefined
+  ) {
+    throw new StockRuntimeError("protocol_mismatch", {
+      reason: "projection_trace_source_invalid",
+    });
+  }
+  if (options.projectionTracePath !== undefined || options.projectionTraceFd !== undefined) {
+    if (
+      options.projectionTracePath !== undefined &&
+      (options.projectionTracePath.trim().length === 0 ||
+        options.projectionTracePath.includes("\u0000"))
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "projection_trace_path_invalid",
+      });
+    }
+    if (
+      options.projectionTraceFd !== undefined &&
+      (!Number.isInteger(options.projectionTraceFd) || options.projectionTraceFd < 0)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "projection_trace_source_invalid",
+      });
+    }
+    try {
+      if (options.projectionTraceFd !== undefined) {
+        projectionTraceFd = options.projectionTraceFd;
+      } else {
+        projectionTraceFd = openSync(
+          options.projectionTracePath!,
+          fsConstants.O_WRONLY |
+            fsConstants.O_APPEND |
+            fsConstants.O_NONBLOCK |
+            (fsConstants.O_NOFOLLOW ?? 0),
+        );
+        ownsProjectionTraceFd = true;
+      }
+      if (!fstatSync(projectionTraceFd).isFile()) {
+        throw new Error("projection trace is not a regular file");
+      }
+      fchmodSync(projectionTraceFd, 0o600);
+      fsyncSync(projectionTraceFd);
+    } catch {
+      if (projectionTraceFd !== null && ownsProjectionTraceFd) closeSync(projectionTraceFd);
+      projectionTraceFd = null;
+      ownsProjectionTraceFd = false;
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "projection_trace_unavailable",
+      });
+    }
+  }
   const leases = new Map<string, LeaseState>();
   const turnSlotClaims = new Map<string, TurnSlotClaim>();
   const leaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -747,6 +848,72 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     getThread: (threadId, boundary) => client.getThread(threadId, boundary),
     now: clock,
   });
+
+  function appendProjectionTrace(entry: StockT3ProjectionTraceEntry): void {
+    if (projectionTraceFd === null) return;
+    try {
+      const bytes = new TextEncoder().encode(`${JSON.stringify(entry)}\n`);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const written = writeSync(
+          projectionTraceFd,
+          bytes,
+          offset,
+          bytes.byteLength - offset,
+        );
+        if (written <= 0) throw new Error("projection trace write made no progress");
+        offset += written;
+      }
+      fsyncSync(projectionTraceFd);
+    } catch {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "projection_trace_write_failed",
+      });
+    }
+  }
+
+  function traceProjection(
+    endpoint: StockT3ProjectionTraceEntry["endpoint"],
+    snapshotSequence: number,
+    projection: Pick<StockThreadShell, "latestTurn" | "session">,
+    messages: readonly StockMessage[],
+    state: LeaseState,
+  ): void {
+    if (projectionTraceFd === null) return;
+    const offset = projectionTraceClock() - projectionTraceStartedAt;
+    appendProjectionTrace({
+      endpoint,
+      snapshotSequence,
+      monotonicOffsetMs: Number.isFinite(offset) ? Math.max(0, offset) : 0,
+      latestTurn: projection.latestTurn === null
+        ? null
+        : {
+            turnId: projection.latestTurn.turnId,
+            state: projection.latestTurn.state,
+            requestedAt: projection.latestTurn.requestedAt,
+            assistantMessageId: projection.latestTurn.assistantMessageId,
+          },
+      session: projection.session === null
+        ? null
+        : {
+            status: projection.session.status,
+            activeTurnId: projection.session.activeTurnId,
+          },
+      runtime: {
+        boundTurnId: state.boundTurnId,
+        boundRequestedAt: state.boundRequestedAt,
+        boundAssistantMessageId: state.boundAssistantMessageId,
+        uniqueAssistantFallbackBlocked: state.uniqueAssistantFallbackBlocked,
+      },
+      messages: messages.map((message) => ({
+        id: message.id,
+        role: message.role,
+        turnId: message.turnId,
+        streaming: message.streaming,
+        textLength: message.text.length,
+      })),
+    });
+  }
 
   function scopedThreadKey(ref: AgentRef): string {
     return `${ref.environmentId}\u0000${ref.threadId}`;
@@ -1137,6 +1304,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       boundTurnId: null,
       boundRequestedAt: null,
       boundAssistantMessageId: null,
+      uniqueAssistantFallbackBlocked: false,
     });
     const delay = Math.max(0, Math.min(2_147_483_647, deadlineMs - clock()));
     const timer = setTimeout(() => releaseLease(ref, leaseId), delay);
@@ -3004,6 +3172,23 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           if (shellThread === undefined) {
             throw new StockRuntimeError("protocol_mismatch", { reason: "shell_thread_missing" });
           }
+          if (detailSnapshot === undefined) {
+            traceProjection(
+              "shell",
+              shellSnapshot.snapshotSequence,
+              shellThread,
+              [],
+              state,
+            );
+          } else {
+            traceProjection(
+              "detail",
+              detailSnapshot.snapshotSequence,
+              detailSnapshot.thread,
+              detailSnapshot.thread.messages,
+              state,
+            );
+          }
           const shellLatest = shellThread.latestTurn;
           const captureAdvertisedAssistant = (assistantMessageId: string) => {
             if (
@@ -3020,11 +3205,19 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             state.boundTurnId !== null &&
             state.boundRequestedAt !== null &&
             shellLatest !== null &&
-            shellLatest.turnId === state.boundTurnId &&
-            shellLatest.requestedAt === state.boundRequestedAt &&
             shellLatest.assistantMessageId !== null
           ) {
-            captureAdvertisedAssistant(shellLatest.assistantMessageId);
+            if (
+              shellLatest.turnId === state.boundTurnId &&
+              shellLatest.requestedAt === state.boundRequestedAt
+            ) {
+              captureAdvertisedAssistant(shellLatest.assistantMessageId);
+            } else if (
+              shellLatest.turnId === state.boundTurnId ||
+              shellLatest.turnId !== state.preflightLatestTurnId
+            ) {
+              state.uniqueAssistantFallbackBlocked = true;
+            }
           }
           if (detailSnapshot === undefined) return { done: false, detail: true };
           if (
@@ -3085,21 +3278,30 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             });
           }
           if (latest !== null && latest.assistantMessageId !== null) {
-            captureAdvertisedAssistant(latest.assistantMessageId);
+            if (latest.requestedAt === state.boundRequestedAt) {
+              captureAdvertisedAssistant(latest.assistantMessageId);
+            } else {
+              state.uniqueAssistantFallbackBlocked = true;
+            }
           }
           if (shellThread.hasPendingApprovals) throw new StockRuntimeError("pending_approval");
           if (shellThread.hasPendingUserInput) throw new StockRuntimeError("pending_input");
-          const completeFromBoundAssistant = () => {
-            if (state.boundAssistantMessageId === null) {
-              return { done: false as const, detail: true as const };
-            }
-            const assistant = detailSnapshot.thread.messages.find(
+          const completeFromBoundAssistant = (allowUniqueFallback: boolean) => {
+            const qualifyingAssistants = detailSnapshot.thread.messages.filter(
               (entry) =>
-                entry.id === state.boundAssistantMessageId &&
                 entry.role === "assistant" &&
                 entry.turnId === state.boundTurnId &&
                 !entry.streaming,
             );
+            const assistant = state.boundAssistantMessageId === null
+              ? allowUniqueFallback &&
+                !state.uniqueAssistantFallbackBlocked &&
+                qualifyingAssistants.length === 1
+                ? qualifyingAssistants[0]
+                : undefined
+              : qualifyingAssistants.find(
+                  (entry) => entry.id === state.boundAssistantMessageId,
+                );
             if (assistant === undefined) return { done: false as const, detail: true as const };
             const retained = boundedUtf8(assistant.text);
             const terminalReceipt = releaseLeaseAndSnapshot(receipt);
@@ -3140,7 +3342,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             ) {
               return { done: false, detail: true };
             }
-            return completeFromBoundAssistant();
+            return completeFromBoundAssistant(true);
           }
           if (latest?.state === "interrupted") throw new StockRuntimeError("turn_interrupted");
           if (latest?.state === "error") throw new StockRuntimeError("turn_error");
@@ -3153,7 +3355,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           ) {
             return { done: false, detail: true };
           }
-          return completeFromBoundAssistant();
+          return completeFromBoundAssistant(false);
         },
       });
     } catch (error) {
@@ -3236,6 +3438,11 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       for (const state of leases.values()) {
         releaseLease(state.receipt.agentRef, state.receipt.leaseId);
       }
+      if (projectionTraceFd !== null && ownsProjectionTraceFd) {
+        closeSync(projectionTraceFd);
+      }
+      projectionTraceFd = null;
+      ownsProjectionTraceFd = false;
     },
   };
 }

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -247,7 +247,8 @@ describe("stock live harness lifecycle", () => {
   test("declares fault seams across setup, live execution, and atomic finalization", async () => {
     const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
     for (const seam of [
-      "after-proof-root", "after-worktree-add", "after-stock-install", "after-stock-build",
+      "after-trace-parent-validation", "after-trace-open", "after-proof-root", "after-worktree-add",
+      "after-stock-install", "after-stock-build",
       "after-archive-extract", "after-candidate-install", "after-exact-characterization",
       "after-generated-fixture",
       "after-bearer-issue", "after-secret-read", "after-server-launch", "after-readiness",
@@ -689,6 +690,163 @@ fi
       teardown: { pidStopped: true, worktreeRemoved: true, rootRemoved: true },
     });
   });
+
+  test("creates a caller-owned mode-600 projection trace outside the disposable proof root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-external-trace."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const traceTarget = join(root, "projection-trace.jsonl");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stderr).toContain("cleanup root_removed=true");
+    expect(await Bun.file(traceTarget).exists()).toBe(true);
+    expect((await stat(traceTarget)).mode & 0o777).toBe(0o600);
+    expect(await Bun.file(traceTarget).text()).toBe("");
+  }, 20_000);
+
+  test("uses a portable mode probe for traces and proof receipts", async () => {
+    const source = await Bun.file(
+      join(import.meta.dir, "../scripts/stock-t3-live-harness.sh"),
+    ).text();
+
+    expect(source).toContain("file_mode() {");
+    expect(source).toContain("/usr/bin/stat -c '%a'");
+    expect(source).toContain("/usr/bin/stat -f '%Lp'");
+    expect(source).not.toContain("$(/usr/bin/stat -f '%Lp'");
+    expect(source.match(/\$\(file_mode /g)).toHaveLength(4);
+  });
+
+  test("rejects a projection trace that canonically aliases the proof receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-trace-alias."));
+    temporaryRoots.push(root);
+    const receiptRoot = join(root, "receipts");
+    const linkedRoot = join(root, "linked-receipts");
+    await mkdir(receiptRoot, { mode: 0o700 });
+    await symlink(receiptRoot, linkedRoot);
+    const proofTarget = join(receiptRoot, "proof.json");
+    const traceTarget = join(linkedRoot, "proof.json");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: proofTarget,
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=path_conflicts_with_proof_target");
+    expect(await Bun.file(proofTarget).exists()).toBe(false);
+  }, 20_000);
+
+  test("rejects a projection trace beneath a group-or-world-writable parent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-trace-parent."));
+    temporaryRoots.push(root);
+    const traceRoot = join(root, "shared");
+    await mkdir(traceRoot, { mode: 0o700 });
+    await chmod(traceRoot, 0o777);
+    const traceTarget = join(traceRoot, "projection-trace.jsonl");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: join(root, "proof.json"),
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=insecure_parent");
+    expect(await Bun.file(traceTarget).exists()).toBe(false);
+  }, 20_000);
+
+  test("does not redirect trace creation when an ancestor swaps the validated parent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-trace-swap."));
+    temporaryRoots.push(root);
+    const traceRoot = join(root, "trace-root");
+    const heldTraceRoot = join(root, "held-trace-root");
+    const attackerRoot = join(root, "attacker-root");
+    const runner = join(root, "swap-runner");
+    await mkdir(traceRoot, { mode: 0o700 });
+    await mkdir(attackerRoot, { mode: 0o700 });
+    await Bun.write(
+      runner,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == after-trace-parent-validation ]]; then
+  mv -- "$TRACE_SECURE_PARENT" "$TRACE_HELD_PARENT"
+  ln -s -- "$TRACE_ATTACKER_PARENT" "$TRACE_SECURE_PARENT"
+fi
+`,
+    );
+    await chmod(runner, 0o700);
+    const traceTarget = join(traceRoot, "projection-trace.jsonl");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: runner,
+      T3_STOCK_PROOF_TARGET: join(root, "proof.json"),
+      T3_STOCK_TRACE_PATH: traceTarget,
+      TRACE_SECURE_PARENT: traceRoot,
+      TRACE_HELD_PARENT: heldTraceRoot,
+      TRACE_ATTACKER_PARENT: attackerRoot,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=parent_identity_changed");
+    expect(await Bun.file(join(attackerRoot, "projection-trace.jsonl")).exists()).toBe(false);
+  }, 20_000);
+
+  test("passes the pinned trace descriptor to the live child process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-trace-fd."));
+    temporaryRoots.push(root);
+    const runner = join(root, "trace-fd-runner");
+    await Bun.write(
+      runner,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == after-trace-open ]]; then
+  [[ "$T3_STOCK_TRACE_FD" == 9 ]]
+  printf '%s\n' inherited-descriptor >&9
+fi
+`,
+    );
+    await chmod(runner, 0o700);
+    const traceTarget = join(root, "projection-trace.jsonl");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: runner,
+      T3_STOCK_PROOF_TARGET: join(root, "proof.json"),
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(await Bun.file(traceTarget).text()).toBe("inherited-descriptor\n");
+    expect((await stat(traceTarget)).mode & 0o777).toBe(0o600);
+  }, 20_000);
+
+  test("requires a fresh external projection trace before a real proof can allocate work", async () => {
+    const result = await run(
+      ["bash", "scripts/stock-t3-live-harness.sh"],
+      { T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key" },
+      ["T3_STOCK_TRACE_PATH"],
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=missing_path");
+    expect(result.stderr).toContain("cleanup root_removed=true");
+    expect(result.stderr).not.toContain("op://fixture/provider/key");
+  }, 20_000);
 
   test("test-mode teardown failure cannot exit zero or publish a receipt", async () => {
     const root = await mkdtemp(join(tmpdir(), "t3layer-harness-teardown-failure."));
