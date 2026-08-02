@@ -437,6 +437,24 @@ describe("bounded orchestration policy", () => {
     policy.close();
   });
 
+  test("rejects a whitespace-only scope before dispatch", async () => {
+    const policy = createOrchestrationPolicy({
+      maxActive: 1,
+      maxActivePerScope: 1,
+      maxQueued: 0,
+    });
+    let dispatches = 0;
+
+    await expect(
+      policy.dispatch({ scopeId: " ", queue: "fail" }, async () => {
+        dispatches += 1;
+      }),
+    ).rejects.toBeInstanceOf(TypeError);
+    expect(dispatches).toBe(0);
+    expect(policy.metrics()).toMatchObject({ active: 0, queued: 0 });
+    policy.close();
+  });
+
   test("returns partial fan-out outcomes without exceeding policy caps", async () => {
     const policy = createOrchestrationPolicy({
       maxActive: 2,

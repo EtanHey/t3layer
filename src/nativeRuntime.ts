@@ -149,7 +149,13 @@ export type ControlOperationName =
   | "respond_to_approval"
   | "respond_to_user_input";
 
-export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+export const APPROVAL_DECISIONS = [
+  "accept",
+  "acceptForSession",
+  "decline",
+  "cancel",
+] as const;
+export type ApprovalDecision = (typeof APPROVAL_DECISIONS)[number];
 
 export interface ApprovalResponse {
   readonly requestId: string;
@@ -2731,7 +2737,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     operation: RuntimeOperationOptions = {},
   ): Promise<ControlOperationResult> {
     const requestId = controlIdentifier(response.requestId, "requestId");
-    if (!["accept", "acceptForSession", "decline", "cancel"].includes(response.decision)) {
+    if (!APPROVAL_DECISIONS.includes(response.decision)) {
       throw new StockRuntimeError("protocol_mismatch", { field: "decision" });
     }
     const bounded = boundedControlOperation(operation);
@@ -2778,12 +2784,13 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       throw new StockRuntimeError("user_input_not_pending", { requestId });
     }
     const commandId = id();
+    const answers = Object.freeze({ ...response.answers });
     const command = Object.freeze({
       type: "thread.user-input.respond",
       commandId,
       threadId: ref.threadId,
       requestId,
-      answers: response.answers,
+      answers,
       createdAt: now(),
     });
     return dispatchControl(

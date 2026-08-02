@@ -316,7 +316,7 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
       if (terminal) {
         terminalRecords.add(key);
       } else {
-        if (wasTerminal && activeRecordCount() >= maxWorkers) {
+        if (wasTerminal && activeRecordCount() + pending.size >= maxWorkers) {
           throw new WorkerOverlayError("overlay_capacity_exceeded", { maxWorkers });
         }
         terminalRecords.delete(key);

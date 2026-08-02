@@ -165,6 +165,7 @@ function reconciledRef(result: SpawnResult): AgentRef | null {
 function isTerminalSnapshot(snapshot: ThreadDetailSnapshot): boolean {
   return (
     snapshot.thread.latestTurn?.state === "completed" ||
+    snapshot.thread.latestTurn?.state === "interrupted" ||
     snapshot.thread.latestTurn?.state === "error" ||
     snapshot.thread.session?.status === "stopped" ||
     snapshot.thread.session?.status === "error"
@@ -279,7 +280,10 @@ export function createStockT3Facade(
         recordWorkerTerminalState(overlay, receipt.agentRef, true);
         return result;
       } catch (error) {
-        if (error instanceof StockRuntimeError && error.code === "turn_error") {
+        if (
+          error instanceof StockRuntimeError &&
+          (error.code === "turn_interrupted" || error.code === "turn_error")
+        ) {
           recordWorkerTerminalState(overlay, receipt.agentRef, true);
         }
         throw error;
@@ -289,17 +293,29 @@ export function createStockT3Facade(
       ref: AgentRef,
       options?: RuntimeOperationOptions,
     ): Promise<ControlOperationResult> {
-      const result = await runtime.interrupt(ref, options);
-      recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
-      return result;
+      const wasTerminal = recordWorkerTerminalState(overlay, ref, false);
+      try {
+        const result = await runtime.interrupt(ref, options);
+        recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
+        return result;
+      } catch (error) {
+        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
+        throw error;
+      }
     },
     async stop(
       ref: AgentRef,
       options?: RuntimeOperationOptions,
     ): Promise<ControlOperationResult> {
-      const result = await runtime.stop(ref, options);
-      recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
-      return result;
+      const wasTerminal = recordWorkerTerminalState(overlay, ref, false);
+      try {
+        const result = await runtime.stop(ref, options);
+        recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
+        return result;
+      } catch (error) {
+        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
+        throw error;
+      }
     },
     respondToApproval: (
       ref: AgentRef,
@@ -313,8 +329,8 @@ export function createStockT3Facade(
     ) => runtime.respondToUserInput(ref, response, options),
     async observe(ref: AgentRef, options?: RuntimeOperationOptions) {
       const snapshot = await runtime.observe(ref, options);
-      if (snapshot !== undefined) {
-        recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(snapshot));
+      if (snapshot !== undefined && isTerminalSnapshot(snapshot)) {
+        recordWorkerTerminalState(overlay, ref, true);
       }
       return snapshot;
     },

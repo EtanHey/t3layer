@@ -334,6 +334,41 @@ describe("stock control operations", () => {
     facade.close();
   });
 
+  test("snapshots user-input answers across an identical ambiguity retry", async () => {
+    const payloads: string[] = [];
+    const answers: Record<string, unknown> = { answer: "yes" };
+    let inputPending = true;
+    const currentThread = () => shellThread({ pendingInput: inputPending });
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => shell(inputPending ? 1 : 2, currentThread()),
+        getThread: async () => detail(inputPending ? 1 : 2, currentThread()),
+        dispatch: async (command) => {
+          payloads.push(JSON.stringify(command));
+          if (payloads.length === 1) {
+            answers.answer = "mutated";
+            throw new StockT3HttpError("transport_unavailable", null);
+          }
+          inputPending = false;
+          return { sequence: 2 };
+        },
+      }),
+      id: ids("input-command"),
+      now: () => iso,
+    });
+
+    await expect(
+      runtime.respondToUserInput(ref, { requestId: "input-1", answers }, { timeoutMs: 1_000 }),
+    ).resolves.toMatchObject({
+      kind: "applied",
+      receipt: { retryState: "identical_retry_accepted" },
+    });
+    expect(payloads).toHaveLength(2);
+    expect(payloads[1]).toBe(payloads[0]);
+    expect(JSON.parse(payloads[0]!).answers).toEqual({ answer: "yes" });
+    runtime.close();
+  });
+
   test("returns typed no-ops for already-terminal interrupt and stop targets", async () => {
     let dispatches = 0;
     const current = shellThread({
@@ -722,6 +757,33 @@ describe("stock control operations", () => {
         answers: [] as unknown as Record<string, unknown>,
       }),
     ).rejects.toMatchObject({ code: "protocol_mismatch" });
+    expect(dispatches).toBe(0);
+    runtime.close();
+  });
+
+  test("rejects responses when the stock projection reports no pending request", async () => {
+    let dispatches = 0;
+    const current = shellThread({ pendingApproval: false, pendingInput: false });
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => shell(5, current),
+        getThread: async () => detail(5, current),
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 6 };
+        },
+      }),
+    });
+
+    await expect(
+      runtime.respondToApproval(ref, { requestId: "approval-1", decision: "accept" }),
+    ).rejects.toMatchObject({ code: "approval_not_pending" });
+    await expect(
+      runtime.respondToUserInput(ref, {
+        requestId: "input-1",
+        answers: { answer: "yes" },
+      }),
+    ).rejects.toMatchObject({ code: "user_input_not_pending" });
     expect(dispatches).toBe(0);
     runtime.close();
   });

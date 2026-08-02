@@ -1264,6 +1264,7 @@ describe("facade worker hierarchy overlay", () => {
       "replacement",
       "terminal",
     ]);
+    facade.close();
   });
 
   test("rejects terminal-worker reactivation before send when its freed slot is occupied", async () => {
@@ -1351,6 +1352,199 @@ describe("facade worker hierarchy overlay", () => {
     ).resolves.toMatchObject({ ref: replacementRef });
   });
 
+  test("counts pending reservations before reactivating a terminal worker", async () => {
+    const terminalRef = { environmentId: "env-1", threadId: "terminal" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    let releaseReplacement!: () => void;
+    const replacementGate = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    let signalReplacementObserved!: () => void;
+    const replacementObserved = new Promise<void>((resolve) => {
+      signalReplacementObserved = resolve;
+    });
+    let sends = 0;
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => {
+        const snapshot = detailFor(ref.threadId, 3);
+        if (ref.threadId === replacementRef.threadId) {
+          signalReplacementObserved();
+          await replacementGate;
+          return snapshot;
+        }
+        return {
+          ...snapshot,
+          thread: {
+            ...snapshot.thread,
+            latestTurn: {
+              turnId: "turn-terminal",
+              state: "completed" as const,
+              requestedAt: iso,
+              startedAt: iso,
+              completedAt: iso,
+              assistantMessageId: "assistant-terminal",
+            },
+          },
+        };
+      },
+      send: async () => {
+        sends += 1;
+        return {
+          agentRef: terminalRef,
+          leaseId: "lease-reactivated",
+          commandId: "command-reactivated",
+          messageId: "message-reactivated",
+          acceptedSequence: 4,
+          observedSequence: 4,
+          leaseExpiresAt: Date.now() + 1_000,
+          leaseState: "active" as const,
+        };
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(terminalRef, { role: "worker", parentRef: null });
+    await facade.observe(terminalRef);
+    const pendingAttach = facade.attach(replacementRef, {
+      role: "worker",
+      parentRef: null,
+    });
+    await replacementObserved;
+
+    try {
+      await expect(facade.send(terminalRef, "restart")).rejects.toMatchObject({
+        code: "overlay_capacity_exceeded",
+      });
+      expect(sends).toBe(0);
+    } finally {
+      releaseReplacement();
+      await pendingAttach;
+    }
+  });
+
+  test("rejects terminal-worker control reactivation before invoking the runtime", async () => {
+    const terminalRef = { environmentId: "env-1", threadId: "terminal" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const terminalSnapshot = {
+      ...detailFor(terminalRef.threadId, 3),
+      thread: {
+        ...detailFor(terminalRef.threadId, 3).thread,
+        latestTurn: {
+          turnId: "turn-terminal",
+          state: "completed" as const,
+          requestedAt: iso,
+          startedAt: iso,
+          completedAt: iso,
+          assistantMessageId: "assistant-terminal",
+        },
+      },
+    };
+    let interrupts = 0;
+    let stops = 0;
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) =>
+        ref.threadId === terminalRef.threadId
+          ? terminalSnapshot
+          : detailFor(ref.threadId, 3),
+      interrupt: async () => {
+        interrupts += 1;
+        return { kind: "applied", snapshot: detailFor(terminalRef.threadId, 4) };
+      },
+      stop: async () => {
+        stops += 1;
+        return { kind: "applied", snapshot: detailFor(terminalRef.threadId, 4) };
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(terminalRef, { role: "worker", parentRef: null });
+    await facade.observe(terminalRef);
+    await facade.attach(replacementRef, { role: "worker", parentRef: null });
+
+    await expect(facade.interrupt(terminalRef)).rejects.toMatchObject({
+      code: "overlay_capacity_exceeded",
+    });
+    await expect(facade.stop(terminalRef)).rejects.toMatchObject({
+      code: "overlay_capacity_exceeded",
+    });
+    expect({ interrupts, stops }).toEqual({ interrupts: 0, stops: 0 });
+  });
+
+  test("does not reactivate a terminal worker from an observational non-terminal read", async () => {
+    const terminalRef = { environmentId: "env-1", threadId: "terminal" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    let terminalProjection = true;
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => {
+        const snapshot = detailFor(ref.threadId, 3);
+        if (ref.threadId !== terminalRef.threadId || !terminalProjection) return snapshot;
+        return {
+          ...snapshot,
+          thread: {
+            ...snapshot.thread,
+            latestTurn: {
+              turnId: "turn-terminal",
+              state: "completed" as const,
+              requestedAt: iso,
+              startedAt: iso,
+              completedAt: iso,
+              assistantMessageId: "assistant-terminal",
+            },
+          },
+        };
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(terminalRef, { role: "worker", parentRef: null });
+    await facade.observe(terminalRef);
+    await facade.attach(replacementRef, { role: "worker", parentRef: null });
+    terminalProjection = false;
+
+    await expect(facade.observe(terminalRef)).resolves.toMatchObject({
+      thread: { latestTurn: null },
+    });
+  });
+
+  test("restores terminal capacity when an admitted control operation fails", async () => {
+    const terminalRef = { environmentId: "env-1", threadId: "terminal" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => {
+        const snapshot = detailFor(ref.threadId, 3);
+        return ref.threadId === terminalRef.threadId
+          ? {
+              ...snapshot,
+              thread: {
+                ...snapshot.thread,
+                latestTurn: {
+                  turnId: "turn-terminal",
+                  state: "completed" as const,
+                  requestedAt: iso,
+                  startedAt: iso,
+                  completedAt: iso,
+                  assistantMessageId: "assistant-terminal",
+                },
+              },
+            }
+          : snapshot;
+      },
+      interrupt: async () => {
+        throw new StockRuntimeError("command_rejected");
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(terminalRef, { role: "worker", parentRef: null });
+    await facade.observe(terminalRef);
+    await expect(facade.interrupt(terminalRef)).rejects.toMatchObject({
+      code: "command_rejected",
+    });
+    await expect(
+      facade.attach(replacementRef, { role: "worker", parentRef: null }),
+    ).resolves.toMatchObject({ ref: replacementRef });
+  });
+
   test("releases overlay capacity when wait classifies a worker error", async () => {
     const failedRef = { environmentId: "env-1", threadId: "failed" };
     const replacementRef = { environmentId: "env-1", threadId: "replacement" };
@@ -1378,6 +1572,67 @@ describe("facade worker hierarchy overlay", () => {
       facade.attach(replacementRef, { role: "worker", parentRef: null }),
     ).resolves.toMatchObject({ ref: replacementRef });
     expect(facade.listWorkers()).toHaveLength(2);
+  });
+
+  test("releases overlay capacity when wait classifies a worker interruption", async () => {
+    const interruptedRef = { environmentId: "env-1", threadId: "interrupted" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const receipt = {
+      agentRef: interruptedRef,
+      leaseId: "lease-interrupted",
+      commandId: "command-interrupted",
+      messageId: "message-interrupted",
+      acceptedSequence: 2,
+      observedSequence: 2,
+      leaseExpiresAt: Date.now() + 1_000,
+      leaseState: "active" as const,
+    };
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => detailFor(ref.threadId, 3),
+      wait: async () => {
+        throw new StockRuntimeError("turn_interrupted", { receipt });
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(interruptedRef, { role: "worker", parentRef: null });
+    await expect(facade.wait(receipt)).rejects.toMatchObject({ code: "turn_interrupted" });
+    await expect(
+      facade.attach(replacementRef, { role: "worker", parentRef: null }),
+    ).resolves.toMatchObject({ ref: replacementRef });
+  });
+
+  test("releases overlay capacity after observing an interrupted worker", async () => {
+    const interruptedRef = { environmentId: "env-1", threadId: "interrupted" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const interruptedTurn = {
+      turnId: "turn-interrupted",
+      state: "interrupted" as const,
+      requestedAt: iso,
+      startedAt: iso,
+      completedAt: iso,
+      assistantMessageId: "assistant-interrupted",
+    };
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => {
+        const snapshot = detailFor(ref.threadId, 3);
+        return ref.threadId === interruptedRef.threadId
+          ? {
+              ...snapshot,
+              thread: { ...snapshot.thread, latestTurn: interruptedTurn },
+            }
+          : snapshot;
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(interruptedRef, { role: "worker", parentRef: null });
+    await expect(facade.observe(interruptedRef)).resolves.toMatchObject({
+      thread: { latestTurn: { state: "interrupted" } },
+    });
+    await expect(
+      facade.attach(replacementRef, { role: "worker", parentRef: null }),
+    ).resolves.toMatchObject({ ref: replacementRef });
   });
 
   test("fails missing canonical parents and hierarchy capacity before spawn dispatch", async () => {
