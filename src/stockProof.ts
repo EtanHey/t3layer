@@ -46,6 +46,13 @@ export interface StockProofBody extends ExpectedProofIdentity {
     readonly stockBuild: CommandResult;
     readonly candidateInstall: CommandResult;
     readonly exactCharacterization: CommandResult;
+    readonly providerAuth:
+      | {
+          readonly mode: "subscription";
+          readonly claudeExecutable: string;
+          readonly claudeVersion: string;
+        }
+      | { readonly mode: "secret_ref" };
     readonly isolatedBasenames: readonly string[];
   };
   readonly exactHttpNegative: {
@@ -251,6 +258,26 @@ function commandResult(
   if (result.status !== 0) throw new ProofReceiptError(`${key}_status`);
 }
 
+function providerAuth(value: unknown): void {
+  const auth = record(value, "provider_auth");
+  if (auth.mode === "secret_ref") {
+    if (Object.keys(auth).length !== 1) throw new ProofReceiptError("provider_auth_secret_ref_shape");
+    return;
+  }
+  if (auth.mode !== "subscription") throw new ProofReceiptError("provider_auth_mode");
+  if (
+    Object.keys(auth).length !== 3 ||
+    typeof auth.claudeExecutable !== "string" ||
+    !auth.claudeExecutable.startsWith("/") ||
+    auth.claudeExecutable.includes("\n") ||
+    typeof auth.claudeVersion !== "string" ||
+    !/^[0-9]+\.[0-9]+\.[0-9]+/.test(auth.claudeVersion) ||
+    auth.claudeVersion.includes("\n")
+  ) {
+    throw new ProofReceiptError("provider_auth_subscription_shape");
+  }
+}
+
 export function canonicalProofBody(value: unknown): StockProofBody {
   const input = record(value);
   if (Object.keys(input).some((key) => !PROOF_BODY_KEYS.has(key))) {
@@ -268,6 +295,7 @@ export function canonicalProofBody(value: unknown): StockProofBody {
   commandResult(provenance.stockBuild, "stock_build");
   commandResult(provenance.candidateInstall, "candidate_install");
   commandResult(provenance.exactCharacterization, "exact_characterization");
+  providerAuth(provenance.providerAuth);
   if (
     !Array.isArray(provenance.isolatedBasenames) ||
     provenance.isolatedBasenames.length !== EXPECTED_ISOLATED_BASENAMES.length ||

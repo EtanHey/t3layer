@@ -157,6 +157,11 @@ describe("stock live harness lifecycle", () => {
         command: "corepack pnpm --filter t3 exec vp test run src/orchestration/Layers/T3LayerStockProjectionCharacterization.generated.test.ts",
         status: 0,
       },
+      providerAuth: {
+        mode: "subscription" as const,
+        claudeExecutable: "/usr/local/bin/claude",
+        claudeVersion: "2.1.220 (Claude Code)",
+      },
       isolatedBasenames: ["stock-tree", "t3layer-clean", "server-home", "workspace"],
     },
     exactHttpNegative: {
@@ -634,6 +639,10 @@ describe("stock live harness lifecycle", () => {
     const body = completeBody();
     expect(() => canonicalProofBody({ ...body, live: { ...body.live, endpointStatusTrace: [] } })).toThrow(ProofReceiptError);
     expect(() => canonicalProofBody({ ...body, provenance: undefined })).toThrow(ProofReceiptError);
+    expect(() => canonicalProofBody({
+      ...body,
+      provenance: { ...body.provenance, providerAuth: undefined },
+    })).toThrow(ProofReceiptError);
     expect(() => canonicalProofBody({ ...body, forgedTopLevel: true })).toThrow(ProofReceiptError);
     expect(() => canonicalProofJson({
       ...body,
