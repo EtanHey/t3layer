@@ -364,13 +364,17 @@ function validateSchema(value: unknown, schemaValue: unknown, field: string): vo
   if (schema.type === "object") {
     const input = objectValue(value, field);
     for (const required of schema.required ?? []) {
-      if (!Object.hasOwn(input, required)) protocolMismatch(fieldPath(field, required));
+      if (!Object.hasOwn(input, required)) {
+        protocolMismatch(schemaErrorField(fieldPath(field, required)));
+      }
     }
     const properties = schema.properties ?? {};
     for (const [key, child] of Object.entries(input)) {
       const childSchema = properties[key];
       if (childSchema === undefined) {
-        if (schema.additionalProperties === false) protocolMismatch(fieldPath(field, key));
+        if (schema.additionalProperties === false) {
+          protocolMismatch(schemaErrorField(fieldPath(field, key)));
+        }
         continue;
       }
       validateSchema(child, childSchema, fieldPath(field, key));

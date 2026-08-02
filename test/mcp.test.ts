@@ -10,8 +10,10 @@ import {
   StockRuntimeError,
   createStockT3NativeRuntime,
   type AgentRef,
+  type ApprovalResponse,
   type RuntimeOperationOptions,
   type T3NativeRuntime,
+  type UserInputResponse,
 } from "../src/nativeRuntime";
 import { WorkerOverlayError } from "../src/overlay";
 
@@ -312,6 +314,60 @@ describe("stock T3 MCP facade", () => {
       evidence: {},
     });
     expect(counted.calls).toEqual([]);
+  });
+
+  test("keeps missing response-field evidence identical across direct and MCP calls", async () => {
+    const approval = countingRuntime();
+    const directApproval = await directError(
+      (runtime) => runtime.respondToApproval(
+        ref,
+        { decision: "accept" } as ApprovalResponse,
+      ),
+      approval.runtime,
+      {},
+    );
+    const mcpApproval = await createStockT3McpFacade(
+      createStockT3Facade(approval.runtime),
+    ).callTool("respondToApproval", {
+      ref,
+      response: { decision: "accept" },
+    });
+    expect(error(mcpApproval)).toEqual({
+      type: "stock_runtime",
+      code: directApproval.code,
+      evidence: directApproval.evidence,
+    });
+    expect(directApproval).toMatchObject({
+      code: "protocol_mismatch",
+      evidence: { field: "requestId" },
+    });
+    expect(approval.calls).toEqual([]);
+
+    const userInput = countingRuntime();
+    const directUserInput = await directError(
+      (runtime) => runtime.respondToUserInput(
+        ref,
+        { requestId: "input-1" } as UserInputResponse,
+      ),
+      userInput.runtime,
+      {},
+    );
+    const mcpUserInput = await createStockT3McpFacade(
+      createStockT3Facade(userInput.runtime),
+    ).callTool("respondToUserInput", {
+      ref,
+      response: { requestId: "input-1" },
+    });
+    expect(error(mcpUserInput)).toEqual({
+      type: "stock_runtime",
+      code: directUserInput.code,
+      evidence: directUserInput.evidence,
+    });
+    expect(directUserInput).toMatchObject({
+      code: "protocol_mismatch",
+      evidence: { field: "answers" },
+    });
+    expect(userInput.calls).toEqual([]);
   });
 });
 
