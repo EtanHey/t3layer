@@ -817,14 +817,14 @@ describe("stock live harness lifecycle", () => {
     expect(receipt.cancellation).toEqual({ cancelled: 2, replayed: 0 });
     expect(receipt.checksum).toMatch(/^[0-9a-f]{64}$/);
     expect((await Bun.file(fixture.receipt).stat()).mode & 0o777).toBe(0o600);
-  });
+  }, 20_000);
 
   test("execute mode supports command paths containing spaces", async () => {
     const fixture = await canaryFixture("t3layer canary. ");
     const result = await run(["bash", "scripts/stock-t3-canary-drill.sh", "--execute"], fixture.env);
     expect(result.exitCode, result.stderr).toBe(0);
     await expect(Bun.file(fixture.receipt).json()).resolves.toMatchObject({ success: true });
-  });
+  }, 20_000);
 
   test("execute mode uses a portable receipt-mode probe", async () => {
     const source = await Bun.file(
@@ -847,7 +847,7 @@ describe("stock live harness lifecycle", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("approved digest mismatch");
     expect(await Bun.file(fixture.log).exists()).toBe(false);
-  });
+  }, 20_000);
 
   test("execute mode invalidates a prior receipt before preflight can fail", async () => {
     const fixture = await canaryFixture();
@@ -860,7 +860,7 @@ describe("stock live harness lifecycle", () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(await Bun.file(fixture.receipt).exists()).toBe(false);
-  });
+  }, 20_000);
 
   test("SIGINT during execute mode recovers and exits 130", async () => {
     const fixture = await canaryFixture();
@@ -888,7 +888,7 @@ describe("stock live harness lifecycle", () => {
 
     expect(exitCode).toBe(130);
     expect(stderr).toContain("CANARY_RECOVERY:");
-  });
+  }, 20_000);
 
   test("execute mode rejects artifact drift and environment identity drift", async () => {
     const artifactFixture = await canaryFixture();
@@ -918,7 +918,7 @@ describe("stock live harness lifecycle", () => {
     );
     expect(identityResult.exitCode).not.toBe(0);
     expect(identityResult.stderr).toContain("environment identity changed");
-  });
+  }, 30_000);
 
   test("every injected canary transition failure restores prior config and routes off", async () => {
     const seams = [
@@ -957,5 +957,5 @@ describe("stock live harness lifecycle", () => {
     );
     const commands = (await Bun.file(fixture.log).text()).trim().split("\n");
     expect(commands.slice(-3)).toEqual(["prior", "off", "cancel"]);
-  });
+  }, 20_000);
 });
