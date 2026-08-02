@@ -38,6 +38,10 @@ const boundTurn: StockLatestTurn = {
   ...pendingBoundTurn,
   assistantMessageId: "assistant-a",
 };
+const reboundAssistantTurn: StockLatestTurn = {
+  ...boundTurn,
+  assistantMessageId: "assistant-b",
+};
 const newerTurn: StockLatestTurn = {
   turnId: "turn-b",
   state: "running",
@@ -245,6 +249,26 @@ describe("criterion-4 terminal projection rollover", () => {
     await expect(runtime.wait(receipt, { timeoutMs: 1_000 })).rejects.toMatchObject({
       code: "concurrent_writer",
       evidence: { reason: "turn_changed" },
+    });
+    runtime.close();
+  });
+
+  test("rejects a different assistant id advertised later for the bound turn", async () => {
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      { sequence: 14, latestTurn: boundTurn, session: runningSession, messages: completedMessages },
+      {
+        sequence: 15,
+        latestTurn: reboundAssistantTurn,
+        session: runningSession,
+        messages: mismatchedAssistantMessages,
+      },
+    ]);
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+      code: "concurrent_writer",
+      evidence: { reason: "assistant_message_changed" },
     });
     runtime.close();
   });
