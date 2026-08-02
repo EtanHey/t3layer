@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import {
   ProofReceiptError,
@@ -13,15 +13,46 @@ import {
   validateProofReceipt,
 } from "../src/stockProof";
 
-const worktreeRepo = join(import.meta.dir, "..");
+function gitCommand(repo: string, ...args: string[]) {
+  const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+}
 function gitOutput(repo: string, ...args: string[]) {
   const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
   return new TextDecoder().decode(result.stdout).trim();
 }
-const candidateRepo = dirname(gitOutput(worktreeRepo, "rev-parse", "--path-format=absolute", "--git-common-dir"));
-const candidateSha = gitOutput(candidateRepo, "rev-parse", "HEAD");
-const candidateEnv = (expectedSha = candidateSha, repo = candidateRepo) => ({
+async function candidateFixture(unmerged = false) {
+  const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate-repo."));
+  gitCommand(root, "init", "--quiet", "--initial-branch=main");
+  await Bun.write(join(root, "candidate.txt"), "merged\n");
+  gitCommand(root, "add", "candidate.txt");
+  gitCommand(root, "-c", "user.name=T3Layer Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "merged candidate");
+  const mainSha = gitOutput(root, "rev-parse", "HEAD");
+  gitCommand(root, "update-ref", "refs/remotes/origin/main", mainSha);
+  if (unmerged) {
+    gitCommand(root, "switch", "--quiet", "--create", "feature");
+    await Bun.write(join(root, "candidate.txt"), "unmerged\n");
+    gitCommand(root, "add", "candidate.txt");
+    gitCommand(root, "-c", "user.name=T3Layer Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "unmerged candidate");
+  }
+  return { root, headSha: gitOutput(root, "rev-parse", "HEAD") };
+}
+
+let defaultCandidateRepo = "";
+let defaultCandidateSha = "";
+let defaultCandidateRoot = "";
+beforeAll(async () => {
+  const fixture = await candidateFixture();
+  defaultCandidateRepo = fixture.root;
+  defaultCandidateSha = fixture.headSha;
+  defaultCandidateRoot = fixture.root;
+});
+afterAll(async () => {
+  await rm(defaultCandidateRoot, { recursive: true, force: true });
+});
+
+const candidateEnv = (expectedSha = defaultCandidateSha, repo = defaultCandidateRepo) => ({
   T3_STOCK_CANDIDATE_REPO: repo,
   T3_STOCK_CANDIDATE_SHA: expectedSha,
 });
@@ -408,11 +439,13 @@ describe("stock live harness lifecycle", () => {
   });
 
   test("binds the archive to a caller SHA matching merged main and origin/main", async () => {
+    const candidate = await candidateFixture();
+    temporaryRoots.push(candidate.root);
     const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate."));
     temporaryRoots.push(root);
     const target = join(root, "proof.json");
     const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
-      ...candidateEnv(),
+      ...candidateEnv(candidate.headSha, candidate.root),
       T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
@@ -420,7 +453,7 @@ describe("stock live harness lifecycle", () => {
     });
 
     expect(result.exitCode, result.stderr).toBe(0);
-    await expect(Bun.file(target).json()).resolves.toMatchObject({ candidateSha });
+    await expect(Bun.file(target).json()).resolves.toMatchObject({ candidateSha: candidate.headSha });
 
     const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
     expect(source).not.toContain("/Users/etanheyman/Gits/t3layer-stock-http-runtime");
@@ -446,12 +479,13 @@ describe("stock live harness lifecycle", () => {
   });
 
   test("rejects a candidate HEAD that is not merged main and origin/main", async () => {
+    const candidate = await candidateFixture(true);
+    temporaryRoots.push(candidate.root);
     const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate-unmerged."));
     temporaryRoots.push(root);
     const target = join(root, "proof.json");
-    const worktreeSha = gitOutput(worktreeRepo, "rev-parse", "HEAD");
     const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
-      ...candidateEnv(worktreeSha, worktreeRepo),
+      ...candidateEnv(candidate.headSha, candidate.root),
       T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
