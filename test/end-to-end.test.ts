@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import { createStockT3Facade } from "../src/facade";
 import { createStockT3McpFacade, type StockT3McpToolResult } from "../src/mcp";
@@ -234,8 +234,11 @@ function createAuthenticatedFixture() {
   return { commands, project, server, threads };
 }
 
-const fixture = createAuthenticatedFixture();
-afterAll(() => fixture.server.stop(true));
+let fixture: ReturnType<typeof createAuthenticatedFixture>;
+beforeAll(() => {
+  fixture = createAuthenticatedFixture();
+});
+afterAll(() => fixture?.server.stop(true));
 
 function value<T = unknown>(result: StockT3McpToolResult): T {
   expect(result.isError).toBeFalse();

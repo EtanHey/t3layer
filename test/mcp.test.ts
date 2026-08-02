@@ -435,13 +435,15 @@ async function directError(
   runtime: T3NativeRuntime,
   operation: RuntimeOperationOptions,
 ) {
+  let caught: unknown;
   try {
     await action(runtime, operation);
-    throw new Error("expected direct call to reject");
-  } catch (caught) {
-    expect(caught).toBeInstanceOf(StockRuntimeError);
-    return caught as StockRuntimeError;
+  } catch (error) {
+    caught = error;
   }
+  expect(caught).toBeInstanceOf(StockRuntimeError);
+  if (!(caught instanceof StockRuntimeError)) throw new Error("expected StockRuntimeError");
+  return caught;
 }
 
 describe("runtime numeric-bound ingress", () => {
@@ -528,6 +530,33 @@ describe("runtime numeric-bound ingress", () => {
         evidence: { field },
       });
       expect(mcpControlRuntime.calls).toEqual([]);
+    });
+  }
+
+  for (const [field, value] of [
+    ["deadlineMs", 0],
+    ["timeoutMs", 1],
+    ["maxReconciliationReads", 1],
+  ] as const) {
+    test(`accepts the documented ${field}=${value} boundary`, async () => {
+      const operation = { [field]: value } as RuntimeOperationOptions;
+      const direct = countingRuntime();
+      const directOutcome = await direct.runtime.send(ref, "hello", operation).catch(
+        (caught) => caught,
+      );
+      if (directOutcome instanceof StockRuntimeError) {
+        expect(directOutcome.code).not.toBe("protocol_mismatch");
+      }
+      if (field === "deadlineMs") expect(direct.calls).toEqual([]);
+      else expect(direct.calls.length).toBeGreaterThan(0);
+
+      const throughMcp = countingRuntime();
+      const mcpOutcome = await createStockT3McpFacade(
+        createStockT3Facade(throughMcp.runtime),
+      ).callTool("send", { ref, message: "hello", operation });
+      expect(error(mcpOutcome).code).not.toBe("protocol_mismatch");
+      if (field === "deadlineMs") expect(throughMcp.calls).toEqual([]);
+      else expect(throughMcp.calls.length).toBeGreaterThan(0);
     });
   }
 });
