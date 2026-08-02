@@ -54,6 +54,16 @@ sha256_stream() {
   fi
 }
 
+file_mode() {
+  local path=$1
+  local mode
+  if mode=$(/usr/bin/stat -c '%a' "$path" 2>/dev/null); then
+    printf '%s\n' "$mode"
+  else
+    /usr/bin/stat -f '%Lp' "$path"
+  fi
+}
+
 run_finalizer() {
   printf '%s' "$finalizer_source" | bun run - "$@"
 }
@@ -103,7 +113,7 @@ prepare_projection_trace() {
     preflight_error projection_trace_invalid create_failed
   fi
   chmod 600 "$trace_target"
-  if [[ ! -f "$trace_target" || -L "$trace_target" || $(/usr/bin/stat -f '%Lp' "$trace_target") != 600 ]]; then
+  if [[ ! -f "$trace_target" || -L "$trace_target" || $(file_mode "$trace_target") != 600 ]]; then
     preflight_error projection_trace_invalid mode_or_type_mismatch
   fi
   export T3_STOCK_TRACE_PATH="$trace_target"
@@ -306,7 +316,7 @@ cleanup() {
       echo "ERROR: injected failure: after-final-body-validation" >&2
       exit 91
     fi
-    if [[ $(/usr/bin/stat -f '%Lp' "$final_staging") != 600 ]]; then
+    if [[ $(file_mode "$final_staging") != 600 ]]; then
       rm -f -- "$final_body_staging" "$final_staging"
       cleanup_status=2
     fi
@@ -328,7 +338,7 @@ cleanup() {
     fi
     chmod 600 "$proof_target"
     final_bytes=$(sha256_file "$proof_target")
-    if [[ $(/usr/bin/stat -f '%Lp' "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha" "$provider_auth_expectation"; then
+    if [[ $(file_mode "$proof_target") != 600 || "$final_bytes" != "$staging_bytes" ]] || ! run_finalizer validate-envelope "$proof_target" "$run_id" "$candidate_sha" "$provider_auth_expectation"; then
       rm -f -- "$proof_target"
       echo "ERROR: final proof bytes, mode, checksum, identity, or teardown mismatch" >&2
       exit 2

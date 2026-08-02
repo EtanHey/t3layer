@@ -710,6 +710,18 @@ fi
     expect(await Bun.file(traceTarget).text()).toBe("");
   }, 20_000);
 
+  test("uses a portable mode probe for traces and proof receipts", async () => {
+    const source = await Bun.file(
+      join(import.meta.dir, "../scripts/stock-t3-live-harness.sh"),
+    ).text();
+
+    expect(source).toContain("file_mode() {");
+    expect(source).toContain("/usr/bin/stat -c '%a'");
+    expect(source).toContain("/usr/bin/stat -f '%Lp'");
+    expect(source).not.toContain("$(/usr/bin/stat -f '%Lp'");
+    expect(source.match(/\$\(file_mode /g)).toHaveLength(3);
+  });
+
   test("requires a fresh external projection trace before a real proof can allocate work", async () => {
     const result = await run(
       ["bash", "scripts/stock-t3-live-harness.sh"],
