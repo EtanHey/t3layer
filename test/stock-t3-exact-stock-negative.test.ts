@@ -108,10 +108,10 @@ describe("exact-stock characterization driver", () => {
 
   test("forwards TERM to the exact-stock runner and cleans the generated fixture", async () => {
     const fixture = await exactDriverFixture(
-      "#!/usr/bin/env bash\n" +
+        "#!/usr/bin/env bash\n" +
         "set -euo pipefail\n" +
-        'printf \'%s\\n\' "$$" > "$T3_STOCK_TEST_RUNNER_PID"\n' +
         "trap 'echo TERM > \"$T3_STOCK_TEST_RUNNER_SIGNAL\"; exit 143' TERM\n" +
+        'printf \'%s\\n\' "$$" > "$T3_STOCK_TEST_RUNNER_PID"\n' +
         "while :; do sleep 0.05; done\n",
     );
     const runnerPidPath = join(fixture.root, "runner.pid");
