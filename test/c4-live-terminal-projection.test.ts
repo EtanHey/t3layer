@@ -471,6 +471,49 @@ describe("criterion-4 terminal projection rollover", () => {
     runtime.close();
   }, 20_000);
 
+  test("does not capture an assistant id when shell requestedAt disagrees with the bound target", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const skewedAdvertisement = {
+      ...boundTurn,
+      requestedAt: laterAt,
+    };
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 14,
+          latestTurn: skewedAdvertisement,
+          session: runningSession,
+          messages: completedMessages,
+        },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
   test("does not capture an assistant id from a shell pointer re-pointed to another turn", async () => {
     let currentMs = 0;
     let terminalObserved!: () => void;
