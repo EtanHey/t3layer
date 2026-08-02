@@ -265,9 +265,13 @@ export function createStockT3Facade(
     listChildren: (parentRef: AgentRef) => overlay.listChildren(parentRef),
     listWorkers: () => overlay.listWorkers(),
     async send(ref: AgentRef, message: string, options?: RuntimeOperationOptions) {
-      const receipt = await runtime.send(ref, message, options);
-      recordWorkerTerminalState(overlay, ref, false);
-      return receipt;
+      const wasTerminal = recordWorkerTerminalState(overlay, ref, false);
+      try {
+        return await runtime.send(ref, message, options);
+      } catch (error) {
+        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
+        throw error;
+      }
     },
     async wait(receipt: TurnReceipt, options?: RuntimeOperationOptions) {
       try {

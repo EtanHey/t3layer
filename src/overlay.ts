@@ -309,11 +309,19 @@ export function createWorkerOverlay(options: WorkerOverlayOptions = {}) {
   }
 
   return Object.freeze({
-    [setTerminalState](ref: AgentRef, terminal: boolean): void {
+    [setTerminalState](ref: AgentRef, terminal: boolean): boolean {
       const key = scopedKey(ref);
-      if (!records.has(key)) return;
-      if (terminal) terminalRecords.add(key);
-      else terminalRecords.delete(key);
+      if (!records.has(key)) return false;
+      const wasTerminal = terminalRecords.has(key);
+      if (terminal) {
+        terminalRecords.add(key);
+      } else {
+        if (wasTerminal && activeRecordCount() >= maxWorkers) {
+          throw new WorkerOverlayError("overlay_capacity_exceeded", { maxWorkers });
+        }
+        terminalRecords.delete(key);
+      }
+      return wasTerminal;
     },
     reserve,
     attach(ref: AgentRef, identity: WorkerOverlayIdentity): WorkerOverlayRecord {
@@ -364,6 +372,6 @@ export function recordWorkerTerminalState(
   overlay: WorkerOverlay,
   ref: AgentRef,
   terminal: boolean,
-): void {
-  overlay[setTerminalState](ref, terminal);
+): boolean {
+  return overlay[setTerminalState](ref, terminal);
 }

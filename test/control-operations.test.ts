@@ -367,6 +367,55 @@ describe("stock control operations", () => {
     runtime.close();
   });
 
+  test("returns a typed stop no-op when no stock session exists", async () => {
+    let dispatches = 0;
+    const current = shellThread({ latestTurn: null, session: null });
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => shell(8, current),
+        getThread: async () => detail(8, current),
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 9 };
+        },
+      }),
+    });
+
+    await expect(runtime.stop(ref, { timeoutMs: 300 })).resolves.toMatchObject({
+      kind: "no_op",
+      operation: "stop",
+      reason: "session_terminal",
+      snapshot: { snapshotSequence: 8, thread: { session: null } },
+    });
+    expect(dispatches).toBe(0);
+    runtime.close();
+  });
+
+  test("returns an interrupt no-op when one aligned projection omits the terminal turn", async () => {
+    let dispatches = 0;
+    const shellView = shellThread({ latestTurn: null });
+    const detailView = shellThread({ latestTurn: terminalTurn("completed") });
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => shell(8, shellView),
+        getThread: async () => detail(8, detailView),
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 9 };
+        },
+      }),
+    });
+
+    await expect(runtime.interrupt(ref, { timeoutMs: 300 })).resolves.toMatchObject({
+      kind: "no_op",
+      operation: "interrupt",
+      reason: "turn_terminal",
+      snapshot: { snapshotSequence: 8 },
+    });
+    expect(dispatches).toBe(0);
+    runtime.close();
+  });
+
   test("does not return a terminal no-op from a detail snapshot behind the shell", async () => {
     let detailReads = 0;
     let dispatches = 0;
@@ -403,6 +452,35 @@ describe("stock control operations", () => {
       receipt: { commandId: "interrupt-command", acceptedSequence: 3 },
     });
     expect(dispatches).toBe(1);
+    runtime.close();
+  });
+
+  test("accepts a detail snapshot ahead of the shell during control preflight", async () => {
+    let dispatched = false;
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        getShell: async () => {
+          const latestTurn = dispatched ? terminalTurn("interrupted") : runningTurn;
+          return shell(dispatched ? 3 : 1, shellThread({ latestTurn }));
+        },
+        getThread: async () => {
+          const latestTurn = dispatched ? terminalTurn("interrupted") : runningTurn;
+          return detail(dispatched ? 3 : 2, shellThread({ latestTurn }));
+        },
+        dispatch: async () => {
+          dispatched = true;
+          return { sequence: 3 };
+        },
+      }),
+      id: ids("interrupt-command"),
+      now: () => iso,
+    });
+
+    await expect(runtime.interrupt(ref, { timeoutMs: 1_000 })).resolves.toMatchObject({
+      kind: "applied",
+      receipt: { commandId: "interrupt-command", acceptedSequence: 3 },
+    });
+    expect(dispatched).toBe(true);
     runtime.close();
   });
 
@@ -523,6 +601,31 @@ describe("stock control operations", () => {
     runtime.close();
   });
 
+  test("fails closed on a malformed received identical-control retry", async () => {
+    const commands: Array<Readonly<Record<string, unknown>>> = [];
+    const runtime = createStockT3NativeRuntime({
+      client: client({
+        dispatch: async (command) => {
+          commands.push(command);
+          if (commands.length === 1) {
+            throw new StockT3HttpError("transport_unavailable", null);
+          }
+          throw new StockT3HttpError("protocol_mismatch", 400);
+        },
+      }),
+      id: ids("interrupt-command"),
+      now: () => iso,
+    });
+
+    await expect(runtime.interrupt(ref, { timeoutMs: 300 })).rejects.toMatchObject({
+      code: "protocol_mismatch",
+      evidence: { status: 400 },
+    });
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toEqual(commands[0]);
+    runtime.close();
+  });
+
   test("does not confirm interrupt until shell and detail agree on the terminal turn", async () => {
     let dispatched = false;
     const runtime = createStockT3NativeRuntime({
@@ -546,7 +649,13 @@ describe("stock control operations", () => {
 
     await expect(runtime.interrupt(ref, { timeoutMs: 300 })).rejects.toMatchObject({
       code: "timeout",
-      evidence: { receipt: { commandId: "interrupt-command", acceptedSequence: 2 } },
+      evidence: {
+        receipt: {
+          commandId: "interrupt-command",
+          acceptedSequence: 2,
+          observedSequence: 1,
+        },
+      },
     });
     runtime.close();
   });

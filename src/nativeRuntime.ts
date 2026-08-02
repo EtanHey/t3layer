@@ -2357,10 +2357,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     if (stoppedAfterRead !== null) throw new StockRuntimeError(stoppedAfterRead);
     const identity = validateControlIdentity(ref, shellSnapshot, detailSnapshot);
     if (shellSnapshot.snapshotSequence !== identity.detail.snapshotSequence) {
-      const minimumSequence = Math.max(
-        shellSnapshot.snapshotSequence,
-        identity.detail.snapshotSequence,
-      );
+      const minimumSequence = shellSnapshot.snapshotSequence;
       try {
         return await poller.waitFor({
           environmentId: ref.environmentId,
@@ -2463,6 +2460,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     commandId: string,
     acceptedSequence: number | null,
     retryState: ControlReceipt["retryState"],
+    observedSequence: number,
     operation: RuntimeOperationOptions & { readonly deadlineMs: number },
     predicate: ControlPredicate,
   ): Promise<ControlOperationResult> {
@@ -2470,7 +2468,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       operation: operationName,
       commandId,
       acceptedSequence,
-      observedSequence: 0,
+      observedSequence,
       retryState,
     };
     try {
@@ -2531,6 +2529,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     ref: AgentRef,
     command: Readonly<Record<string, unknown>>,
     commandId: string,
+    observedSequence: number,
     operation: RuntimeOperationOptions & { readonly deadlineMs: number },
     predicate: ControlPredicate,
   ): Promise<ControlOperationResult> {
@@ -2585,11 +2584,12 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
         }
         if (
           retryFailure.kind === "received" &&
-          ![400, 401, 403, 500].includes(
-            typeof retryFailure.error.evidence.status === "number"
-              ? retryFailure.error.evidence.status
-              : 0,
-          )
+          (retryFailure.error.code === "protocol_mismatch" ||
+            ![400, 401, 403, 500].includes(
+              typeof retryFailure.error.evidence.status === "number"
+                ? retryFailure.error.evidence.status
+                : 0,
+            ))
         ) {
           throw retryFailure.error;
         }
@@ -2602,6 +2602,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       commandId,
       acceptedSequence,
       retryState,
+      observedSequence,
       operation,
       predicate,
     );
@@ -2632,10 +2633,8 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       throw new StockRuntimeError("identity_conflict", { reason: "turn_not_found" });
     }
     if (
-      shellTurn !== null &&
-      shellTurn.state !== "running" &&
-      detailTurn !== null &&
-      detailTurn.state !== "running"
+      (shellTurn === null || shellTurn.state !== "running") &&
+      (detailTurn === null || detailTurn.state !== "running")
     ) {
       return {
         kind: "no_op",
@@ -2659,6 +2658,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       ref,
       command,
       commandId,
+      observedControlSequence(preflight),
       bounded,
       (shellThread, detailSnapshot) => {
         const shellLatest = shellThread.latestTurn;
@@ -2688,8 +2688,8 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     const shellStatus = preflight.shellThread.session?.status;
     const detailStatus = preflight.detail.thread.session?.status;
     if (
-      (shellStatus === "stopped" || shellStatus === "error") &&
-      (detailStatus === "stopped" || detailStatus === "error")
+      (shellStatus === undefined || shellStatus === "stopped" || shellStatus === "error") &&
+      (detailStatus === undefined || detailStatus === "stopped" || detailStatus === "error")
     ) {
       return {
         kind: "no_op",
@@ -2712,13 +2712,14 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       ref,
       command,
       commandId,
+      observedControlSequence(preflight),
       bounded,
       (shellThread, detailSnapshot) => {
         const shellStatus = shellThread.session?.status;
         const detailStatus = detailSnapshot.thread.session?.status;
         return (
-          (shellStatus === "stopped" || shellStatus === "error") &&
-          (detailStatus === "stopped" || detailStatus === "error")
+          (shellStatus === undefined || shellStatus === "stopped" || shellStatus === "error") &&
+          (detailStatus === undefined || detailStatus === "stopped" || detailStatus === "error")
         );
       },
     );
@@ -2752,6 +2753,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       ref,
       command,
       commandId,
+      observedControlSequence(preflight),
       bounded,
       (shellThread) => !shellThread.hasPendingApprovals,
     );
@@ -2789,6 +2791,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       ref,
       command,
       commandId,
+      observedControlSequence(preflight),
       bounded,
       (shellThread) => !shellThread.hasPendingUserInput,
     );
