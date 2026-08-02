@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -560,6 +560,71 @@ describe("stock live harness lifecycle", () => {
     expect(result.stderr).toContain("injected failure: after-proof-root");
     expect(result.stderr).toContain("cleanup root_removed=true");
     expect(result.stderr).not.toContain("op://fixture/provider/key");
+  });
+
+  test("canonicalizes a symlinked temp root before cleanup identity is recorded", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-canonical-root."));
+    temporaryRoots.push(root);
+    const realTemp = join(root, "real-temp");
+    const linkedTemp = join(root, "linked-temp");
+    const observedRootPath = join(root, "observed-root.txt");
+    const childPidPath = join(root, "child.pid");
+    const childStatePath = join(root, "child-state.txt");
+    const commandRunner = join(root, "command-runner");
+    await mkdir(realTemp);
+    await symlink(realTemp, linkedTemp);
+    await Bun.write(
+      commandRunner,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == after-proof-root ]]; then
+  proof_root=$2
+  printf '%s\\n' "$proof_root" > '${observedRootPath}'
+  (cd "$proof_root/workspace" && exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &
+  child_pid=$!
+  printf '%s\\n' "$child_pid" > '${childPidPath}'
+  child_cwd=''
+  for _attempt in {1..20}; do
+    child_cwd=$(/usr/sbin/lsof -a -p "$child_pid" -d cwd -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p')
+    [[ -n "$child_cwd" ]] && break
+    sleep 0.05
+  done
+  if [[ "$child_cwd" == "$proof_root/workspace" ]]; then
+    /bin/kill -TERM "$child_pid"
+    wait "$child_pid" 2>/dev/null || true
+    printf '%s\\n' stopped > '${childStatePath}'
+  else
+    printf '%s\\n' orphaned > '${childStatePath}'
+  fi
+fi
+`,
+    );
+    await chmod(commandRunner, 0o700);
+
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      TMPDIR: linkedTemp,
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: commandRunner,
+      T3_STOCK_FAIL_AT: "after-proof-root",
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("injected failure: after-proof-root");
+    expect(result.stderr).toContain("cleanup root_removed=true");
+    const observedRoot = (await Bun.file(observedRootPath).text()).trim();
+    const childPid = Number.parseInt((await Bun.file(childPidPath).text()).trim(), 10);
+    const childState = (await Bun.file(childStatePath).text()).trim();
+    const childWasLeftAlive = Bun.spawnSync(["/bin/kill", "-0", String(childPid)]).exitCode === 0;
+    try {
+      expect(childState).toBe("stopped");
+      expect(childWasLeftAlive).toBe(false);
+      expect(observedRoot).toStartWith(`${await realpath(realTemp)}/t3layer-stock-proof.`);
+      expect(observedRoot).not.toStartWith(`${linkedTemp}/t3layer-stock-proof.`);
+      expect(await Bun.file(observedRoot).exists()).toBe(false);
+    } finally {
+      if (childWasLeftAlive) Bun.spawnSync(["/bin/kill", "-TERM", String(childPid)]);
+    }
   });
 
   test("all setup/live fault seams preserve secret redaction and clean the proof root", async () => {
