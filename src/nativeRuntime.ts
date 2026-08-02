@@ -3185,7 +3185,10 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
               shellLatest.requestedAt === state.boundRequestedAt
             ) {
               captureAdvertisedAssistant(shellLatest.assistantMessageId);
-            } else {
+            } else if (
+              shellLatest.turnId === state.boundTurnId ||
+              shellLatest.turnId !== state.preflightLatestTurnId
+            ) {
               state.uniqueAssistantFallbackBlocked = true;
             }
           }
@@ -3256,7 +3259,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           }
           if (shellThread.hasPendingApprovals) throw new StockRuntimeError("pending_approval");
           if (shellThread.hasPendingUserInput) throw new StockRuntimeError("pending_input");
-          const completeFromBoundAssistant = () => {
+          const completeFromBoundAssistant = (allowUniqueFallback: boolean) => {
             const qualifyingAssistants = detailSnapshot.thread.messages.filter(
               (entry) =>
                 entry.role === "assistant" &&
@@ -3264,7 +3267,9 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
                 !entry.streaming,
             );
             const assistant = state.boundAssistantMessageId === null
-              ? !state.uniqueAssistantFallbackBlocked && qualifyingAssistants.length === 1
+              ? allowUniqueFallback &&
+                !state.uniqueAssistantFallbackBlocked &&
+                qualifyingAssistants.length === 1
                 ? qualifyingAssistants[0]
                 : undefined
               : qualifyingAssistants.find(
@@ -3310,7 +3315,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             ) {
               return { done: false, detail: true };
             }
-            return completeFromBoundAssistant();
+            return completeFromBoundAssistant(true);
           }
           if (latest?.state === "interrupted") throw new StockRuntimeError("turn_interrupted");
           if (latest?.state === "error") throw new StockRuntimeError("turn_error");
@@ -3323,7 +3328,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           ) {
             return { done: false, detail: true };
           }
-          return completeFromBoundAssistant();
+          return completeFromBoundAssistant(false);
         },
       });
     } catch (error) {

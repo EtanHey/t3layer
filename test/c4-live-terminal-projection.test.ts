@@ -18,6 +18,7 @@ import type {
 
 const requestedAt = "2026-08-02T16:13:16.955Z";
 const laterAt = "2026-08-02T16:13:29.676Z";
+const earlierAt = "2026-08-02T16:12:00.000Z";
 const selection = { instanceId: "claudeAgent", model: "claude-sonnet-4-5" };
 const project = {
   id: "project-1",
@@ -41,6 +42,11 @@ const boundTurn: StockLatestTurn = {
   ...pendingBoundTurn,
   assistantMessageId: "assistant-a",
 };
+const completedUnadvertisedTurn: StockLatestTurn = {
+  ...pendingBoundTurn,
+  state: "completed",
+  completedAt: laterAt,
+};
 const reboundAssistantTurn: StockLatestTurn = {
   ...boundTurn,
   assistantMessageId: "assistant-b",
@@ -52,6 +58,14 @@ const newerTurn: StockLatestTurn = {
   startedAt: laterAt,
   completedAt: null,
   assistantMessageId: null,
+};
+const previousTurnAdvertisement: StockLatestTurn = {
+  turnId: "turn-previous",
+  state: "completed",
+  requestedAt: earlierAt,
+  startedAt: earlierAt,
+  completedAt: earlierAt,
+  assistantMessageId: "assistant-previous",
 };
 const runningSession: StockSession = {
   threadId: ref.threadId,
@@ -249,6 +263,7 @@ function clientForIndependentProjections(
   shellProjections: readonly Projection[],
   detailProjections: readonly Projection[],
   onDetailProjection?: (sequence: number) => void,
+  preflightLatestTurn: StockLatestTurn | null = null,
 ): StockT3RuntimeClient {
   let shellReads = 0;
   let detailReads = 0;
@@ -275,7 +290,14 @@ function clientForIndependentProjections(
     },
     getThread: async () => {
       detailReads += 1;
-      if (detailReads === 1) return detail(1, null, null, []);
+      if (detailReads === 1) {
+        return detail(
+          1,
+          preflightLatestTurn,
+          preflightLatestTurn === null ? null : readySession,
+          [],
+        );
+      }
       const current = projection(detailProjections, detailReads - 2);
       onDetailProjection?.(current.sequence);
       return detail(
@@ -294,6 +316,7 @@ function runtimeForIndependentProjections(
   detailProjections: readonly Projection[],
   onDetailProjection?: (sequence: number) => void,
   clock?: () => number,
+  preflightLatestTurn: StockLatestTurn | null = null,
 ) {
   const ids = ["command-1", "message-1", "lease-1"];
   return createStockT3NativeRuntime({
@@ -301,6 +324,7 @@ function runtimeForIndependentProjections(
       shellProjections,
       detailProjections,
       onDetailProjection,
+      preflightLatestTurn,
     ),
     id: () => ids.shift()!,
     now: () => requestedAt,
@@ -495,6 +519,37 @@ describe("criterion-4 terminal projection rollover", () => {
       assistantContent: "done",
       snapshotSequence: 16,
     });
+    runtime.close();
+  }, 20_000);
+
+  test("does not use uniqueness while latestTurn remains non-null without an advertised id", async () => {
+    let currentMs = 0;
+    let completedProjectionObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      completedProjectionObserved = resolve;
+    });
+    const runtime = runtimeFor(
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 16,
+          latestTurn: completedUnadvertisedTurn,
+          session: readySession,
+          messages: completedMessages,
+        },
+      ],
+      (sequence) => {
+        if (sequence === 16) completedProjectionObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
     runtime.close();
   }, 20_000);
 
@@ -819,6 +874,50 @@ describe("criterion-4 terminal projection rollover", () => {
     currentMs = 30_001;
 
     await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
+  test("ignores a stale preflight-turn advertisement before unique terminal fallback", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 14,
+          latestTurn: previousTurnAdvertisement,
+          session: readySession,
+          messages: completedMessages,
+        },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+      previousTurnAdvertisement,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).resolves.toMatchObject({
+      kind: "completed",
+      assistantContent: "done",
+      snapshotSequence: 16,
+    });
     runtime.close();
   }, 20_000);
 
