@@ -1506,6 +1506,68 @@ describe("facade worker hierarchy overlay", () => {
     });
   });
 
+  test("ignores terminal observation evidence older than a successful send receipt", async () => {
+    const terminalRef = { environmentId: "env-1", threadId: "terminal" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const terminalSnapshot = {
+      ...detailFor(terminalRef.threadId, 3),
+      thread: {
+        ...detailFor(terminalRef.threadId, 3).thread,
+        latestTurn: {
+          turnId: "turn-terminal",
+          state: "completed" as const,
+          requestedAt: iso,
+          startedAt: iso,
+          completedAt: iso,
+          assistantMessageId: "assistant-terminal",
+        },
+      },
+    };
+    let terminalReads = 0;
+    let releaseStaleObservation!: () => void;
+    const staleObservationGate = new Promise<void>((resolve) => {
+      releaseStaleObservation = resolve;
+    });
+    let signalStaleObservation!: () => void;
+    const staleObservationStarted = new Promise<void>((resolve) => {
+      signalStaleObservation = resolve;
+    });
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) => {
+        if (ref.threadId !== terminalRef.threadId) return detailFor(ref.threadId, 4);
+        terminalReads += 1;
+        if (terminalReads === 3) {
+          signalStaleObservation();
+          await staleObservationGate;
+        }
+        return terminalSnapshot;
+      },
+      send: async () => ({
+        agentRef: terminalRef,
+        leaseId: "lease-reactivated",
+        commandId: "command-reactivated",
+        messageId: "message-reactivated",
+        acceptedSequence: 4,
+        observedSequence: 4,
+        leaseExpiresAt: Date.now() + 1_000,
+        leaseState: "active" as const,
+      }),
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(terminalRef, { role: "worker", parentRef: null });
+    await facade.observe(terminalRef);
+    const staleObservation = facade.observe(terminalRef);
+    await staleObservationStarted;
+    await facade.send(terminalRef, "restart");
+    releaseStaleObservation();
+    await staleObservation;
+
+    await expect(
+      facade.attach(replacementRef, { role: "worker", parentRef: null }),
+    ).rejects.toMatchObject({ code: "overlay_capacity_exceeded" });
+  });
+
   test("restores terminal capacity when an admitted control operation fails", async () => {
     const terminalRef = { environmentId: "env-1", threadId: "terminal" };
     const replacementRef = { environmentId: "env-1", threadId: "replacement" };
