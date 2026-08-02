@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   ProofReceiptError,
@@ -13,10 +13,17 @@ import {
   validateProofReceipt,
 } from "../src/stockProof";
 
-const candidateRepo = join(import.meta.dir, "..");
-const candidateEnv = (candidateSha = "a".repeat(40)) => ({
-  T3_STOCK_CANDIDATE_REPO: candidateRepo,
-  T3_STOCK_CANDIDATE_SHA: candidateSha,
+const worktreeRepo = join(import.meta.dir, "..");
+function gitOutput(repo: string, ...args: string[]) {
+  const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+  return new TextDecoder().decode(result.stdout).trim();
+}
+const candidateRepo = dirname(gitOutput(worktreeRepo, "rev-parse", "--path-format=absolute", "--git-common-dir"));
+const candidateSha = gitOutput(candidateRepo, "rev-parse", "HEAD");
+const candidateEnv = (expectedSha = candidateSha, repo = candidateRepo) => ({
+  T3_STOCK_CANDIDATE_REPO: repo,
+  T3_STOCK_CANDIDATE_SHA: expectedSha,
 });
 
 async function run(
@@ -208,7 +215,7 @@ describe("stock live harness lifecycle", () => {
     await chmod(claude, 0o700);
     await Bun.write(
       serverRunner,
-      `#!/usr/bin/env bash\nset -euo pipefail\nfor name in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_PID CLAUDE_CODE_EXECPATH CMUX_CLAUDE_WRAPPER_SHIM SHELLBOOK_REAL_CLAUDE; do\n  if [[ \${!name+x} == x ]]; then printf '%s\\n' "unexpected environment: $name" >&2; exit 41; fi\ndone\nprintf '%s\\n' "$1|$2|$3" > '${serverEnvLog}'\n`,
+      `#!/usr/bin/env bash\nset -euo pipefail\nfor name in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_PID CLAUDE_CODE_EXECPATH CMUX_CLAUDE_WRAPPER_SHIM SHELLBOOK_REAL_CLAUDE; do\n  if [[ \${!name+x} == x ]]; then printf '%s\\n' "unexpected environment: $name" >&2; exit 41; fi\ndone\n[[ $(command -v claude) == "$2" ]]\nprintf '%s\\n' "$1|$2|$3" > '${serverEnvLog}'\n`,
     );
     await chmod(serverRunner, 0o700);
 
@@ -224,7 +231,6 @@ describe("stock live harness lifecycle", () => {
       CLAUDE_CODE_EXECPATH: "/tmp/nested-claude",
       CMUX_CLAUDE_WRAPPER_SHIM: "/tmp/cmux-shim",
       SHELLBOOK_REAL_CLAUDE: "/tmp/shellbook-claude",
-      T3_STOCK_CLAUDE_EXECUTABLE: claude,
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
       T3_STOCK_HARNESS_SERVER_RUNNER: serverRunner,
@@ -252,37 +258,100 @@ describe("stock live harness lifecycle", () => {
     });
     expect(JSON.stringify(receipt)).not.toContain("private@example.com");
 
-    const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
-    for (const name of [
-      "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
-      "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_EXECPATH",
-      "CMUX_CLAUDE_WRAPPER_SHIM", "SHELLBOOK_REAL_CLAUDE",
-    ]) expect(source).toContain(`-u ${name}`);
   });
 
-  test("fails closed with a typed reason when Claude subscription auth is unavailable", async () => {
-    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-no-subscription."));
+  for (const authCase of [
+    {
+      name: "API-key auth",
+      body: "printf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"apiKey\",\"apiProvider\":\"firstParty\"}'",
+      reason: "subscription_auth_method_api_key",
+    },
+    {
+      name: "logged-out status",
+      body: "printf '%s\\n' '{\"loggedIn\":false,\"authMethod\":\"none\"}'",
+      reason: "subscription_not_authenticated",
+    },
+    { name: "probe failure", body: "exit 73", reason: "auth_probe_failed" },
+    { name: "malformed status", body: "printf '%s\\n' 'not-json'", reason: "auth_probe_invalid" },
+    { name: "probe timeout", body: "sleep 30", reason: "auth_probe_timeout" },
+    { name: "missing executable", body: null, reason: "claude_executable_not_found" },
+  ] as const) {
+    test(`fails closed before server launch for ${authCase.name}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "t3layer-harness-no-subscription."));
+      temporaryRoots.push(root);
+      const claude = join(root, "claude");
+      const target = join(root, "proof.json");
+      const launchLog = join(root, "server-launched");
+      const serverRunner = join(root, "server-runner");
+      if (authCase.body !== null) {
+        await Bun.write(claude, `#!/usr/bin/env bash\nset -euo pipefail\n${authCase.body}\n`);
+        await chmod(claude, 0o700);
+      }
+      await Bun.write(
+        serverRunner,
+        `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' launched > '${launchLog}'\n`,
+      );
+      await chmod(serverRunner, 0o700);
+
+      const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+        ...candidateEnv(),
+        PATH: authCase.body === null ? "/usr/bin:/bin" : `${root}:${Bun.env.PATH ?? ""}`,
+        T3_STOCK_HARNESS_TEST_MODE: "1",
+        T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+        T3_STOCK_HARNESS_SERVER_RUNNER: serverRunner,
+        T3_STOCK_PROOF_TARGET: target,
+      }, [
+        "T3_STOCK_PROVIDER_SECRET_REF", "T3_STOCK_CLAUDE_EXECUTABLE",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+      ]);
+
+      expect(result.exitCode, authCase.name).not.toBe(0);
+      expect(result.stderr, authCase.name).toContain("provider_auth_unavailable");
+      expect(result.stderr, authCase.name).toContain(`reason=${authCase.reason}`);
+      expect(result.stderr, authCase.name).not.toContain("cleanup root_removed=");
+      expect(await Bun.file(launchLog).exists(), authCase.name).toBe(false);
+      expect(await Bun.file(target).exists(), authCase.name).toBe(false);
+    }, 10_000);
+  }
+
+  test("rejects a probed Claude override that differs from server PATH resolution", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-claude-mismatch."));
     temporaryRoots.push(root);
-    const bin = root;
-    const claude = join(bin, "claude");
+    const binA = join(root, "bin-a");
+    const binB = join(root, "bin-b");
+    await mkdir(binA);
+    await mkdir(binB);
+    const claudeA = join(binA, "claude");
+    const claudeB = join(binB, "claude");
+    const probeLog = join(root, "probe.log");
+    const launchLog = join(root, "server-launched");
+    const serverRunner = join(root, "server-runner");
     const target = join(root, "proof.json");
-    await Bun.write(
-      claude,
-      "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"apiKey\",\"apiProvider\":\"firstParty\"}'\n",
-    );
-    await chmod(claude, 0o700);
+    for (const path of [claudeA, claudeB]) {
+      await Bun.write(
+        path,
+        `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' "$0 $*" >> '${probeLog}'\nprintf '%s\\n' '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}'\n`,
+      );
+      await chmod(path, 0o700);
+    }
+    await Bun.write(serverRunner, `#!/usr/bin/env bash\nprintf '%s\\n' launched > '${launchLog}'\n`);
+    await chmod(serverRunner, 0o700);
 
     const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
       ...candidateEnv(),
-      PATH: `${bin}:${Bun.env.PATH ?? ""}`,
+      PATH: `${binB}:${Bun.env.PATH ?? ""}`,
+      T3_STOCK_CLAUDE_EXECUTABLE: claudeA,
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_HARNESS_SERVER_RUNNER: serverRunner,
       T3_STOCK_PROOF_TARGET: target,
-    }, ["T3_STOCK_PROVIDER_SECRET_REF", "ANTHROPIC_API_KEY"]);
+    }, ["T3_STOCK_PROVIDER_SECRET_REF", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
 
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("provider_auth_unavailable");
-    expect(result.stderr).toContain("reason=subscription_not_authenticated");
+    expect(result.stderr).toContain("reason=claude_executable_mismatch");
+    expect(await Bun.file(probeLog).exists()).toBe(false);
+    expect(await Bun.file(launchLog).exists()).toBe(false);
     expect(await Bun.file(target).exists()).toBe(false);
   });
 
@@ -292,37 +361,58 @@ describe("stock live harness lifecycle", () => {
     const bin = root;
     const claude = join(bin, "claude");
     const authLog = join(root, "claude-auth.log");
+    const serverEnvLog = join(root, "server-env.log");
+    const serverRunner = join(root, "server-runner");
     const target = join(root, "proof.json");
     await Bun.write(
       claude,
       `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' "$*" >> '${authLog}'\nexit 99\n`,
     );
     await chmod(claude, 0o700);
+    await Bun.write(
+      serverRunner,
+      `#!/usr/bin/env bash\nset -euo pipefail\n[[ \${ANTHROPIC_API_KEY+x} == x ]]\n[[ "$ANTHROPIC_API_KEY" == test-mode-redacted ]]\nfor name in ANTHROPIC_AUTH_TOKEN CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_PID CLAUDE_CODE_EXECPATH CMUX_CLAUDE_WRAPPER_SHIM SHELLBOOK_REAL_CLAUDE; do\n  [[ \${!name+x} != x ]]\ndone\nprintf '%s\\n' "$1" > '${serverEnvLog}'\n`,
+    );
+    await chmod(serverRunner, 0o700);
 
     const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
       ...candidateEnv(),
       PATH: `${bin}:${Bun.env.PATH ?? ""}`,
+      ANTHROPIC_API_KEY: "ambient-api-key-do-not-log",
+      ANTHROPIC_AUTH_TOKEN: "ambient-auth-token-do-not-log",
+      CLAUDECODE: "1",
+      CLAUDE_CODE_ENTRYPOINT: "nested-agent",
+      CLAUDE_CODE_SESSION_ID: "nested-session",
+      CLAUDE_PID: "123",
+      CLAUDE_CODE_EXECPATH: "/tmp/nested-claude",
+      CMUX_CLAUDE_WRAPPER_SHIM: "/tmp/cmux-shim",
+      SHELLBOOK_REAL_CLAUDE: "/tmp/shellbook-claude",
       T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_HARNESS_SERVER_RUNNER: serverRunner,
       T3_STOCK_PROOF_TARGET: target,
     });
 
     expect(result.exitCode, result.stderr).toBe(0);
     expect(await Bun.file(authLog).exists()).toBe(false);
+    const serverLaunched = await Bun.file(serverEnvLog).exists();
+    expect(serverLaunched).toBe(true);
+    if (serverLaunched) expect(await Bun.file(serverEnvLog).text()).toBe("secret_ref\n");
     expect(result.stderr).not.toContain("op://fixture/provider/key");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("test-mode-redacted");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("ambient-api-key-do-not-log");
     await expect(Bun.file(target).json()).resolves.toMatchObject({
       provenance: { providerAuth: { mode: "secret_ref" } },
     });
   });
 
-  test("binds the archived candidate to caller-supplied repository and SHA inputs", async () => {
+  test("binds the archive to a caller SHA matching merged main and origin/main", async () => {
     const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate."));
     temporaryRoots.push(root);
     const target = join(root, "proof.json");
-    const expectedSha = "c".repeat(40);
     const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
-      ...candidateEnv(expectedSha),
+      ...candidateEnv(),
       T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
       T3_STOCK_HARNESS_TEST_MODE: "1",
       T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
@@ -330,16 +420,49 @@ describe("stock live harness lifecycle", () => {
     });
 
     expect(result.exitCode, result.stderr).toBe(0);
-    await expect(Bun.file(target).json()).resolves.toMatchObject({ candidateSha: expectedSha });
+    await expect(Bun.file(target).json()).resolves.toMatchObject({ candidateSha });
 
     const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
     expect(source).not.toContain("/Users/etanheyman/Gits/t3layer-stock-http-runtime");
-    expect(source).toContain("T3_STOCK_CANDIDATE_REPO");
-    expect(source).toContain("T3_STOCK_CANDIDATE_SHA");
-    expect(source).not.toContain('candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)');
-    expect(source).toContain('actual_candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)');
-    expect(source).toContain('main_candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse refs/heads/main)');
-    expect(source).toContain('origin_candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse refs/remotes/origin/main)');
+  });
+
+  test("rejects a caller SHA that does not match candidate HEAD", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate-mismatch."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      ...candidateEnv("c".repeat(40)),
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("candidate_identity_mismatch");
+    expect(result.stderr).toContain("reason=expected_sha_does_not_match_head");
+    expect(result.stderr).not.toContain("cleanup root_removed=");
+    expect(await Bun.file(target).exists()).toBe(false);
+  });
+
+  test("rejects a candidate HEAD that is not merged main and origin/main", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate-unmerged."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const worktreeSha = gitOutput(worktreeRepo, "rev-parse", "HEAD");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      ...candidateEnv(worktreeSha, worktreeRepo),
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("candidate_identity_unmerged");
+    expect(result.stderr).toContain("reason=head_not_main_and_origin_main");
+    expect(result.stderr).not.toContain("cleanup root_removed=");
+    expect(await Bun.file(target).exists()).toBe(false);
   });
 
   test("fails closed before allocation when caller candidate identity is missing", async () => {
@@ -352,6 +475,7 @@ describe("stock live harness lifecycle", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("candidate_identity_invalid");
     expect(result.stderr).not.toContain("op://fixture/provider/key");
+    expect(result.stderr).not.toContain("cleanup root_removed=");
   });
 
   test("asserts both requested live sentinels in-process", async () => {
