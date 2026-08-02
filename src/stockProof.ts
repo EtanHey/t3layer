@@ -99,6 +99,7 @@ export class ProofReceiptError extends TypeError {
 
 const SHA40 = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const ATTESTED_EXECUTABLE_PATH = "receipt.provenance.providerAuth.claudeExecutable";
 const HTTP_METHOD = /^(GET|POST)$/;
 const ALLOWED_PATH = /^(?:\/\.well-known\/t3\/environment|\/api\/orchestration\/(?:shell|dispatch|threads\/[^/?#]+))$/;
 const EXPECTED_STOCK_SHA = "d3037064e61a9f059eafbd4f9869679779bd2a7c";
@@ -150,6 +151,7 @@ function integerField(input: Record<string, unknown>, key: string): number {
 
 function assertNoSecretMaterial(value: unknown, path = "receipt"): void {
   if (typeof value === "string") {
+    if (path === ATTESTED_EXECUTABLE_PATH) return;
     if (/op:\/\/|bearer\s|api[_-]?key|token/i.test(value)) {
       throw new ProofReceiptError(`secret_material:${path}`);
     }

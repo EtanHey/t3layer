@@ -160,8 +160,13 @@ preflight_provider_auth() {
   local normalized_auth_method
   normalized_auth_method=$(/usr/bin/jq -r '.authMethod | ascii_downcase | gsub("[^a-z]"; "")' <<<"$auth_status")
   case "$normalized_auth_method" in
+    claudeai|subscription)
+      ;;
     apikey|anthropicapikey|anthropicauthtoken)
       preflight_error provider_auth_unavailable subscription_auth_method_api_key
+      ;;
+    *)
+      preflight_error provider_auth_unavailable subscription_auth_method_unrecognized
       ;;
   esac
   unset auth_status

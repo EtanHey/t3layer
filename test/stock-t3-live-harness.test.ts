@@ -241,7 +241,7 @@ describe("stock live harness lifecycle", () => {
   });
 
   test("defaults to a verified Claude subscription without requiring or injecting a provider secret", async () => {
-    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-subscription."));
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-token-subscription."));
     temporaryRoots.push(root);
     const bin = root;
     const claude = join(bin, "claude");
@@ -311,6 +311,11 @@ describe("stock live harness lifecycle", () => {
       name: "logged-out status",
       body: "printf '%s\\n' '{\"loggedIn\":false,\"authMethod\":\"none\"}'",
       reason: "subscription_not_authenticated",
+    },
+    {
+      name: "unrecognized auth",
+      body: "case \"${1:-}\" in auth) printf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"mystery\",\"apiProvider\":\"firstParty\"}' ;; --version) printf '%s\\n' '2.1.220 (Claude Code)' ;; esac",
+      reason: "subscription_auth_method_unrecognized",
     },
     { name: "probe failure", body: "exit 73", reason: "auth_probe_failed" },
     { name: "malformed status", body: "printf '%s\\n' 'not-json'", reason: "auth_probe_invalid" },
