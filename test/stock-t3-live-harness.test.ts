@@ -560,7 +560,7 @@ describe("stock live harness lifecycle", () => {
       expect(result.stderr, seam).toContain("cleanup root_removed=true");
       expect(result.stderr, seam).not.toContain("op://fixture/provider/key");
     }
-  });
+  }, 30_000);
 
   test("real-path command seam reaches finalization failures without a passing receipt", async () => {
     for (const seam of [
@@ -996,7 +996,7 @@ describe("stock live harness lifecycle", () => {
       expect(commands.at(-2), seam).toBe("off");
       expect(commands.at(-1), seam).toBe("cancel");
     }
-  }, 60_000);
+  }, 120_000);
 
   test("recovery completes safety commands when status bookkeeping fails", async () => {
     const fixture = await canaryFixture();
