@@ -92,6 +92,26 @@ const completedMessages: readonly StockMessage[] = [
 const mismatchedAssistantMessages: readonly StockMessage[] = completedMessages.map((entry) =>
   entry.role === "assistant" ? { ...entry, id: "assistant-b" } : entry,
 );
+const secondAssistantMessage: StockMessage = {
+  id: "assistant-b",
+  role: "assistant",
+  text: "also done",
+  attachments: [],
+  turnId: boundTurn.turnId,
+  streaming: false,
+  createdAt: laterAt,
+  updatedAt: laterAt,
+};
+const ambiguousAssistantMessages: readonly StockMessage[] = [
+  ...completedMessages,
+  secondAssistantMessage,
+];
+const wrongTurnAssistantMessages: readonly StockMessage[] = completedMessages.map((entry) =>
+  entry.role === "assistant" ? { ...entry, turnId: newerTurn.turnId } : entry,
+);
+const streamingAssistantMessages: readonly StockMessage[] = completedMessages.map((entry) =>
+  entry.role === "assistant" ? { ...entry, streaming: true } : entry,
+);
 
 function shellThread(
   latestTurn: StockLatestTurn | null,
@@ -437,7 +457,7 @@ describe("criterion-4 terminal projection rollover", () => {
     runtime.close();
   }, 20_000);
 
-  test("does not infer an assistant id when neither projection ever advertises one", async () => {
+  test("completes from the unique finalized assistant when both projections miss the advertisement window", async () => {
     let currentMs = 0;
     let terminalObserved!: () => void;
     const observed = new Promise<void>((resolve) => {
@@ -455,6 +475,147 @@ describe("criterion-4 terminal projection rollover", () => {
         { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
         { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
         { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).resolves.toMatchObject({
+      kind: "completed",
+      assistantContent: "done",
+      snapshotSequence: 16,
+    });
+    runtime.close();
+  }, 20_000);
+
+  test("refuses an ambiguous unadvertised pair of finalized assistants for the bound turn", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 14,
+          latestTurn: pendingBoundTurn,
+          session: runningSession,
+          messages: ambiguousAssistantMessages,
+        },
+        {
+          sequence: 16,
+          latestTurn: null,
+          session: readySession,
+          messages: ambiguousAssistantMessages,
+        },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 16,
+          latestTurn: null,
+          session: readySession,
+          messages: ambiguousAssistantMessages,
+        },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
+  test("uses an advertised assistant id even when another finalized assistant shares the bound turn", async () => {
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      {
+        sequence: 14,
+        latestTurn: boundTurn,
+        session: runningSession,
+        messages: ambiguousAssistantMessages,
+      },
+      {
+        sequence: 16,
+        latestTurn: null,
+        session: readySession,
+        messages: ambiguousAssistantMessages,
+      },
+    ]);
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).resolves.toMatchObject({
+      kind: "completed",
+      assistantContent: "done",
+      snapshotSequence: 16,
+    });
+    runtime.close();
+  }, 20_000);
+
+  test("does not infer an unadvertised finalized assistant from a different turn", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeFor(
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 16,
+          latestTurn: null,
+          session: readySession,
+          messages: wrongTurnAssistantMessages,
+        },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
+  test("does not infer an unadvertised streaming assistant for the bound turn", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeFor(
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 16,
+          latestTurn: null,
+          session: readySession,
+          messages: streamingAssistantMessages,
+        },
       ],
       (sequence) => {
         if (sequence === 16) terminalObserved();
@@ -643,7 +804,7 @@ describe("criterion-4 terminal projection rollover", () => {
       code: "timeout",
     });
     runtime.close();
-  });
+  }, 20_000);
 
   test("still rejects a newer turn after the session pointer first clears", async () => {
     const observedSequences: number[] = [];
