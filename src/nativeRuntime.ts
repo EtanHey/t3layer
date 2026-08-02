@@ -791,9 +791,26 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     return input.deadlineMs ?? clock() + (input.timeoutMs ?? DEFAULT_DEADLINE_MS);
   }
 
+  function validateBoundedOperationInteger(
+    value: number | undefined,
+    field: "deadlineMs" | "timeoutMs" | "maxReconciliationReads",
+    minimum: number,
+  ): void {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < minimum)) {
+      throw new StockRuntimeError("protocol_mismatch", { field });
+    }
+  }
+
   function boundedOperation(input: RuntimeOperationOptions): RuntimeOperationOptions & {
     readonly deadlineMs: number;
   } {
+    validateBoundedOperationInteger(input.deadlineMs, "deadlineMs", 0);
+    validateBoundedOperationInteger(input.timeoutMs, "timeoutMs", 1);
+    validateBoundedOperationInteger(
+      input.maxReconciliationReads,
+      "maxReconciliationReads",
+      1,
+    );
     return { ...input, deadlineMs: operationDeadline(input) };
   }
 
@@ -2265,18 +2282,6 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
   function boundedControlOperation(
     operation: RuntimeOperationOptions,
   ): RuntimeOperationOptions & { readonly deadlineMs: number } {
-    if (
-      operation.deadlineMs !== undefined &&
-      (!Number.isSafeInteger(operation.deadlineMs) || operation.deadlineMs < 0)
-    ) {
-      throw new StockRuntimeError("protocol_mismatch", { field: "deadlineMs" });
-    }
-    if (
-      operation.timeoutMs !== undefined &&
-      (!Number.isSafeInteger(operation.timeoutMs) || operation.timeoutMs < 1)
-    ) {
-      throw new StockRuntimeError("protocol_mismatch", { field: "timeoutMs" });
-    }
     return boundedOperation(operation);
   }
 

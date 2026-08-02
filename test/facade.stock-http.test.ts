@@ -1470,6 +1470,63 @@ describe("facade worker hierarchy overlay", () => {
     expect({ interrupts, stops }).toEqual({ interrupts: 0, stops: 0 });
   });
 
+  test("routes response operations through the terminal-worker lifecycle fence", async () => {
+    const terminalRef = { environmentId: "env-1", threadId: "terminal" };
+    const replacementRef = { environmentId: "env-1", threadId: "replacement" };
+    const terminalSnapshot = {
+      ...detailFor(terminalRef.threadId, 3),
+      thread: {
+        ...detailFor(terminalRef.threadId, 3).thread,
+        latestTurn: {
+          turnId: "turn-terminal",
+          state: "completed" as const,
+          requestedAt: iso,
+          startedAt: iso,
+          completedAt: iso,
+          assistantMessageId: "assistant-terminal",
+        },
+      },
+    };
+    let approvalResponses = 0;
+    let userInputResponses = 0;
+    const runtime = {
+      observe: async (ref: { readonly threadId: string }) =>
+        ref.threadId === terminalRef.threadId
+          ? terminalSnapshot
+          : detailFor(ref.threadId, 3),
+      respondToApproval: async () => {
+        approvalResponses += 1;
+        return { kind: "applied", snapshot: detailFor(terminalRef.threadId, 4) };
+      },
+      respondToUserInput: async () => {
+        userInputResponses += 1;
+        return { kind: "applied", snapshot: detailFor(terminalRef.threadId, 4) };
+      },
+    } as unknown as T3NativeRuntime;
+    const facade = createStockT3Facade(runtime, { overlay: { maxWorkers: 1 } });
+
+    await facade.attach(terminalRef, { role: "worker", parentRef: null });
+    await facade.observe(terminalRef);
+    await facade.attach(replacementRef, { role: "worker", parentRef: null });
+
+    await expect(
+      facade.respondToApproval(terminalRef, {
+        requestId: "approval-1",
+        decision: "accept",
+      }),
+    ).rejects.toMatchObject({ code: "overlay_capacity_exceeded" });
+    await expect(
+      facade.respondToUserInput(terminalRef, {
+        requestId: "input-1",
+        answers: { choice: "a" },
+      }),
+    ).rejects.toMatchObject({ code: "overlay_capacity_exceeded" });
+    expect({ approvalResponses, userInputResponses }).toEqual({
+      approvalResponses: 0,
+      userInputResponses: 0,
+    });
+  });
+
   test("does not reactivate a terminal worker from an observational non-terminal read", async () => {
     const terminalRef = { environmentId: "env-1", threadId: "terminal" };
     const replacementRef = { environmentId: "env-1", threadId: "replacement" };

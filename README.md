@@ -41,6 +41,32 @@ const runtime = createStockT3NativeRuntime({
 const t3 = createStockT3Facade(runtime);
 ```
 
+Create the MCP tool surface from that same facade instance:
+
+```ts
+import { createStockT3McpFacade } from "./src/mcp";
+
+const mcp = createStockT3McpFacade(t3);
+const toolDefinitions = mcp.listTools();
+const result = await mcp.callTool("observe", {
+  ref: { environmentId, threadId },
+  operation: { timeoutMs: 15_000 },
+});
+```
+
+`createStockT3McpFacade` is transport-neutral: register `listTools()` and
+`callTool()` with the MCP server library used by the host application. Do not
+construct another native runtime, facade, or worker overlay for MCP. Direct and
+MCP calls must share the same instance so receipts, lifecycle fences, and
+process-local hierarchy metadata have one owner. MCP context cancellation is
+merged into the operation signal; callers cannot provide an `AbortSignal` in a
+JSON tool argument.
+
+The exposed tools are `spawn`, `send`, `wait`, `observe`, `getState`,
+`listChildren`, `listWorkers`, `interrupt`, `stop`, `respondToApproval`, and
+`respondToUserInput`. `getState` is an alias for the canonical `observe` path;
+it does not create or cache a second state representation.
+
 Never log the bearer, authorization headers, bootstrap credentials, provider
 keys, prompts, or raw responses. The live harness accepts a 1Password reference
 through `T3_STOCK_PROVIDER_SECRET_REF`; the resolved value is scoped only to the
@@ -160,6 +186,79 @@ environment. The operation that observes the roll returns `environment_changed`;
 new-environment work cannot be blocked or cleared by a colliding old ref. Scoped
 old project-create evidence fails closed, while stable work may reuse the same
 unscoped caller-held project command identity without minting a second ID.
+
+Operation budgets are bounded integers at every direct and MCP ingress:
+`deadlineMs` is a non-negative safe integer, while `timeoutMs` and
+`maxReconciliationReads` are positive safe integers. `NaN`, infinities,
+fractions, unsafe integers, and values below those minima fail before HTTP as
+`protocol_mismatch` with the offending field in evidence.
+
+## MCP outcomes and supported errors
+
+Successful MCP calls return `{ ok: true, value }` in `structuredContent` and as
+JSON text. Failures set `isError: true` and retain the direct error family:
+
+- `stock_runtime` carries a `StockRuntimeError` code and `evidence`.
+- `worker_overlay` carries a `WorkerOverlayError` code and `details`.
+
+Runtime codes currently include `command_rejected`, `authentication_failed`,
+`permission_denied`, `server_internal`, `internal_error`,
+`transport_unavailable`, `protocol_mismatch`, `environment_changed`,
+`identity_conflict`, `send_in_progress`, `receipt_expired`,
+`correlation_capacity`, `cancelled`, `timeout`, `superseded`,
+`concurrent_writer`, `causality_unverifiable`, `pending_approval`,
+`pending_input`, `approval_not_pending`, `user_input_not_pending`,
+`turn_interrupted`, and `turn_error`. Overlay failures retain their
+`overlay_*` codes. JSON-compatible evidence is preserved across the MCP
+boundary; unhandled exceptions are reduced to a non-secret `internal_error`
+instead of exposing exception text.
+
+At adopted stock T3 commit `d3037064`, optional acceleration is **N/A**. The
+public environment descriptor exposes no supported orchestration contract ID or
+fingerprint that could safely negotiate a faster path. T3Layer therefore uses
+the public authenticated HTTP endpoints and polling budgets above. A stream,
+socket, private package, or server-source import is never a prerequisite.
+
+## Migrating to the stock facade
+
+To replace an older private runtime-client integration:
+
+1. Remove the private client dependency and imports; configure the public stock
+   base URL and a scoped bearer for `createStockT3NativeRuntime`.
+2. Create one `createStockT3Facade(runtime)` and inject that exact facade into
+   `createStockT3McpFacade`. Do not copy refs into another registry.
+3. Persist caller-owned project-create identities when creation may need to be
+   resumed. Treat returned `TurnReceipt` objects as the only causal wait handle.
+4. Replace state-cache reads with `observe` or MCP `getState`, and handle
+   pending approval/input by responding through the facade before retrying
+   `wait` with the same receipt.
+5. Run the authenticated in-process fixture, the stock-only scan, and the opt-in
+   live proof before enabling MCP traffic.
+
+For rollback, stop routing new direct/MCP operations to the candidate and cancel
+in-flight waits without replaying a turn. Stock remains authoritative and is not
+modified by disabling T3Layer. Keep the same reviewed artifact when rolling
+back configuration during the first stock-only release; after another artifact
+passes the same gates, roll back only to a previously accepted stock-only
+artifact.
+
+## Troubleshooting
+
+- `authentication_failed`: issue a fresh scoped bearer and confirm the base URL;
+  never print the token while diagnosing.
+- `protocol_mismatch`: inspect `evidence.field`; numeric budgets must follow the
+  bounded-integer rules above, and scoped refs require both IDs.
+- `pending_approval` or `pending_input`: respond to the pending request, then
+  call `wait` again with the same active receipt.
+- `receipt_expired`: do not reconstruct or replay the causal claim. Observe the
+  stock thread and decide explicitly whether to start a new turn.
+- `environment_changed`: discard refs and receipts scoped to the old
+  environment ID, rediscover the descriptor, and reattach canonical workers.
+- `transport_unavailable` or `timeout`: retain an active receipt and retry the
+  same `wait`; do not issue a duplicate `send`.
+- Missing hierarchy after restart: stock state is still available through
+  `observe`, but overlay role/parent metadata is process-local and must be
+  restored with explicit canonical attachment.
 
 ## Development and proof
 

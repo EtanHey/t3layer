@@ -13,6 +13,7 @@ import {
   type RuntimeOperationOptions,
   type T3NativeRuntime,
 } from "../src/nativeRuntime";
+import { WorkerOverlayError } from "../src/overlay";
 
 const ref: AgentRef = Object.freeze({ environmentId: "environment-1", threadId: "thread-1" });
 const operation = Object.freeze({ deadlineMs: 1_000 });
@@ -25,6 +26,17 @@ const receipt = Object.freeze({
   observedSequence: 2,
   leaseExpiresAt: 1_000,
   leaseState: "active" as const,
+});
+const spawnInput = Object.freeze({
+  workspaceRoot: "/tmp/project",
+  projectId: "project-1",
+  title: "worker",
+  message: "start",
+  modelSelection: Object.freeze({ instanceId: "claudeAgent", model: "claude-opus-5" }),
+  runtimeMode: "full-access" as const,
+  interactionMode: "default" as const,
+  branch: null,
+  worktreePath: null,
 });
 
 function value(result: StockT3McpToolResult): unknown {
@@ -106,22 +118,16 @@ describe("stock T3 MCP facade", () => {
       expect(tool.inputSchema.additionalProperties).toBeFalse();
       expect(tool.description.length).toBeGreaterThan(10);
     }
+    const spawn = tools.find((entry) => entry.name === "spawn");
+    const nestedInput = spawn?.inputSchema.properties.input as
+      | { readonly additionalProperties?: boolean }
+      | undefined;
+    expect(nestedInput?.additionalProperties).toBeFalse();
   });
 
   test("routes every tool through the same injected facade instance", async () => {
     const { facade, calls, snapshot } = fakeFacade();
     const mcp = createStockT3McpFacade(facade);
-    const spawnInput = {
-      workspaceRoot: "/tmp/project",
-      title: "worker",
-      message: "start",
-      modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5" },
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      branch: null,
-      worktreePath: null,
-    };
-
     expect(value(await mcp.callTool("spawn", { input: spawnInput, operation }))).toMatchObject({
       marker: "spawn",
     });
@@ -174,7 +180,7 @@ describe("stock T3 MCP facade", () => {
     (facade as unknown as { interrupt: () => Promise<never> }).interrupt = async () => {
       throw new StockRuntimeError("identity_conflict", {
         reason: "invalid_agent_ref",
-        secret: undefined,
+        observedSequence: 9,
       });
     };
     const result = await createStockT3McpFacade(facade).callTool("interrupt", {
@@ -185,7 +191,7 @@ describe("stock T3 MCP facade", () => {
     expect(error(result)).toEqual({
       type: "stock_runtime",
       code: "identity_conflict",
-      evidence: { reason: "invalid_agent_ref" },
+      evidence: { reason: "invalid_agent_ref", observedSequence: 9 },
     });
     expect(result.content).toEqual([
       {
@@ -195,11 +201,22 @@ describe("stock T3 MCP facade", () => {
           error: {
             type: "stock_runtime",
             code: "identity_conflict",
-            evidence: { reason: "invalid_agent_ref" },
+            evidence: { reason: "invalid_agent_ref", observedSequence: 9 },
           },
         }),
       },
     ]);
+
+    (facade as unknown as { listChildren: () => never }).listChildren = () => {
+      throw new WorkerOverlayError("overlay_unknown", { ref });
+    };
+    expect(error(await createStockT3McpFacade(facade).callTool("listChildren", {
+      parentRef: ref,
+    }))).toEqual({
+      type: "worker_overlay",
+      code: "overlay_unknown",
+      details: { ref },
+    });
   });
 
   test("rejects malformed scoped refs and unknown tools at the MCP boundary", async () => {
@@ -214,6 +231,24 @@ describe("stock T3 MCP facade", () => {
       type: "stock_runtime",
       code: "protocol_mismatch",
       evidence: { field: "ref.environmentId" },
+    });
+    expect(calls).toHaveLength(0);
+
+    const malformedArguments = await mcp.callTool("send", null);
+    expect(error(malformedArguments)).toEqual({
+      type: "stock_runtime",
+      code: "protocol_mismatch",
+      evidence: { field: "arguments" },
+    });
+    expect(calls).toHaveLength(0);
+
+    const extraSpawnField = await mcp.callTool("spawn", {
+      input: { ...spawnInput, privateRuntimeClient: "forbidden" },
+    });
+    expect(error(extraSpawnField)).toEqual({
+      type: "stock_runtime",
+      code: "protocol_mismatch",
+      evidence: { field: "input.privateRuntimeClient" },
     });
     expect(calls).toHaveLength(0);
 
@@ -237,6 +272,46 @@ describe("stock T3 MCP facade", () => {
 
     expect(value(result)).toBeDefined();
     expect(calls[0]?.args).toEqual([ref, { timeoutMs: 500, signal }]);
+
+    const rawSignal = await createStockT3McpFacade(facade).callTool("observe", {
+      ref,
+      operation: { signal: {} },
+    });
+    expect(error(rawSignal)).toEqual({
+      type: "stock_runtime",
+      code: "protocol_mismatch",
+      evidence: { field: "operation.signal" },
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("serializes receipts and snapshots without losing MCP transport fields", async () => {
+    const { facade } = fakeFacade();
+    const mcp = createStockT3McpFacade(facade);
+
+    for (const result of [
+      await mcp.callTool("send", { ref, message: "hello" }),
+      await mcp.callTool("observe", { ref }),
+    ]) {
+      expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+      expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+    }
+  });
+
+  test("turns an aborted MCP context into the runtime's typed cancellation before HTTP", async () => {
+    const counted = countingRuntime();
+    const result = await createStockT3McpFacade(createStockT3Facade(counted.runtime)).callTool(
+      "observe",
+      { ref },
+      { signal: AbortSignal.abort() },
+    );
+
+    expect(error(result)).toEqual({
+      type: "stock_runtime",
+      code: "cancelled",
+      evidence: {},
+    });
+    expect(counted.calls).toEqual([]);
   });
 });
 
@@ -288,57 +363,89 @@ async function directError(
 }
 
 describe("runtime numeric-bound ingress", () => {
-  const malformedDeadlines = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 1.5, Number.MAX_SAFE_INTEGER + 1];
+  const malformedOperations = [
+    ...[Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]
+      .map((value) => ({ field: "deadlineMs" as const, value })),
+    ...[Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1]
+      .map((value) => ({ field: "timeoutMs" as const, value })),
+    ...[Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1]
+      .map((value) => ({ field: "maxReconciliationReads" as const, value })),
+  ];
 
-  for (const deadlineMs of malformedDeadlines) {
-    test(`send and spawn reject malformed deadlineMs=${String(deadlineMs)} before HTTP`, async () => {
+  for (const { field, value } of malformedOperations) {
+    test(`send, spawn, and control reject malformed ${field}=${String(value)} before HTTP`, async () => {
+      const invalidOperation = { [field]: value } as RuntimeOperationOptions;
       const direct = countingRuntime();
       const sendError = await directError(
         (runtime, options) => runtime.send(ref, "hello", options),
         direct.runtime,
-        { deadlineMs },
+        invalidOperation,
       );
       expect(sendError.code).toBe("protocol_mismatch");
-      expect(sendError.evidence).toEqual({ field: "deadlineMs" });
+      expect(sendError.evidence).toEqual({ field });
       expect(direct.calls).toEqual([]);
 
       const spawn = countingRuntime();
       const spawnError = await directError(
         (runtime, options) =>
           runtime.spawn(
-            {
-              workspaceRoot: "/tmp/project",
-              projectId: "project-1",
-              title: "worker",
-              message: "start",
-              modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5" },
-              runtimeMode: "full-access",
-              interactionMode: "default",
-              branch: null,
-              worktreePath: null,
-            },
+            spawnInput,
             options,
           ),
         spawn.runtime,
-        { deadlineMs },
+        invalidOperation,
       );
       expect(spawnError.code).toBe("protocol_mismatch");
-      expect(spawnError.evidence).toEqual({ field: "deadlineMs" });
+      expect(spawnError.evidence).toEqual({ field });
       expect(spawn.calls).toEqual([]);
+
+      const control = countingRuntime();
+      const controlError = await directError(
+        (runtime, options) => runtime.interrupt(ref, options),
+        control.runtime,
+        invalidOperation,
+      );
+      expect(controlError.code).toBe("protocol_mismatch");
+      expect(controlError.evidence).toEqual({ field });
+      expect(control.calls).toEqual([]);
 
       const mcpRuntime = countingRuntime();
       const mcp = createStockT3McpFacade(createStockT3Facade(mcpRuntime.runtime));
       const mcpResult = await mcp.callTool("send", {
         ref,
         message: "hello",
-        operation: { deadlineMs },
+        operation: invalidOperation,
       });
       expect(error(mcpResult)).toEqual({
         type: "stock_runtime",
         code: "protocol_mismatch",
-        evidence: { field: "deadlineMs" },
+        evidence: { field },
       });
       expect(mcpRuntime.calls).toEqual([]);
+
+      const mcpSpawnRuntime = countingRuntime();
+      const mcpSpawn = createStockT3McpFacade(createStockT3Facade(mcpSpawnRuntime.runtime));
+      expect(error(await mcpSpawn.callTool("spawn", {
+        input: spawnInput,
+        operation: invalidOperation,
+      }))).toEqual({
+        type: "stock_runtime",
+        code: "protocol_mismatch",
+        evidence: { field },
+      });
+      expect(mcpSpawnRuntime.calls).toEqual([]);
+
+      const mcpControlRuntime = countingRuntime();
+      const mcpControl = createStockT3McpFacade(createStockT3Facade(mcpControlRuntime.runtime));
+      expect(error(await mcpControl.callTool("interrupt", {
+        ref,
+        operation: invalidOperation,
+      }))).toEqual({
+        type: "stock_runtime",
+        code: "protocol_mismatch",
+        evidence: { field },
+      });
+      expect(mcpControlRuntime.calls).toEqual([]);
     });
   }
 });

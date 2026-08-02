@@ -202,6 +202,44 @@ export function createStockT3Facade(
     else lifecycleMutationsByRef.set(key, remaining);
   }
 
+  function pruneLifecycleTracking(ref: AgentRef): void {
+    const key = lifecycleKey(ref);
+    lifecycleSequenceByRef.delete(key);
+    if ((lifecycleMutationsByRef.get(key) ?? 0) === 0) {
+      lifecycleMutationsByRef.delete(key);
+    }
+  }
+
+  async function runControlLifecycleMutation(
+    ref: AgentRef,
+    action: () => Promise<ControlOperationResult>,
+  ): Promise<ControlOperationResult> {
+    const mutationKey = beginLifecycleMutation(ref);
+    let wasTerminal: boolean;
+    try {
+      wasTerminal = recordWorkerTerminalState(overlay, ref, false);
+    } catch (error) {
+      endLifecycleMutation(mutationKey);
+      throw error;
+    }
+    try {
+      const result = await action();
+      lifecycleSequenceByRef.set(mutationKey, result.snapshot.snapshotSequence);
+      const terminal = isTerminalSnapshot(result.snapshot);
+      recordWorkerTerminalState(overlay, ref, terminal);
+      endLifecycleMutation(mutationKey);
+      if (terminal) pruneLifecycleTracking(ref);
+      return result;
+    } catch (error) {
+      endLifecycleMutation(mutationKey);
+      if (wasTerminal) {
+        recordWorkerTerminalState(overlay, ref, true);
+        pruneLifecycleTracking(ref);
+      }
+      throw error;
+    }
+  }
+
   async function requireCanonical(
     ref: AgentRef,
     operation?: RuntimeOperationOptions,
@@ -310,6 +348,7 @@ export function createStockT3Facade(
       try {
         const result = await runtime.wait(receipt, options);
         recordWorkerTerminalState(overlay, receipt.agentRef, true);
+        pruneLifecycleTracking(receipt.agentRef);
         return result;
       } catch (error) {
         if (
@@ -317,6 +356,7 @@ export function createStockT3Facade(
           (error.code === "turn_interrupted" || error.code === "turn_error")
         ) {
           recordWorkerTerminalState(overlay, receipt.agentRef, true);
+          pruneLifecycleTracking(receipt.agentRef);
         }
         throw error;
       }
@@ -325,60 +365,30 @@ export function createStockT3Facade(
       ref: AgentRef,
       options?: RuntimeOperationOptions,
     ): Promise<ControlOperationResult> {
-      const mutationKey = beginLifecycleMutation(ref);
-      let wasTerminal: boolean;
-      try {
-        wasTerminal = recordWorkerTerminalState(overlay, ref, false);
-      } catch (error) {
-        endLifecycleMutation(mutationKey);
-        throw error;
-      }
-      try {
-        const result = await runtime.interrupt(ref, options);
-        lifecycleSequenceByRef.set(mutationKey, result.snapshot.snapshotSequence);
-        recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
-        endLifecycleMutation(mutationKey);
-        return result;
-      } catch (error) {
-        endLifecycleMutation(mutationKey);
-        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
-        throw error;
-      }
+      return runControlLifecycleMutation(ref, () => runtime.interrupt(ref, options));
     },
     async stop(
       ref: AgentRef,
       options?: RuntimeOperationOptions,
     ): Promise<ControlOperationResult> {
-      const mutationKey = beginLifecycleMutation(ref);
-      let wasTerminal: boolean;
-      try {
-        wasTerminal = recordWorkerTerminalState(overlay, ref, false);
-      } catch (error) {
-        endLifecycleMutation(mutationKey);
-        throw error;
-      }
-      try {
-        const result = await runtime.stop(ref, options);
-        lifecycleSequenceByRef.set(mutationKey, result.snapshot.snapshotSequence);
-        recordWorkerTerminalState(overlay, ref, isTerminalSnapshot(result.snapshot));
-        endLifecycleMutation(mutationKey);
-        return result;
-      } catch (error) {
-        endLifecycleMutation(mutationKey);
-        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
-        throw error;
-      }
+      return runControlLifecycleMutation(ref, () => runtime.stop(ref, options));
     },
-    respondToApproval: (
+    respondToApproval: async (
       ref: AgentRef,
       response: ApprovalResponse,
       options?: RuntimeOperationOptions,
-    ) => runtime.respondToApproval(ref, response, options),
-    respondToUserInput: (
+    ) => runControlLifecycleMutation(
+      ref,
+      () => runtime.respondToApproval(ref, response, options),
+    ),
+    respondToUserInput: async (
       ref: AgentRef,
       response: UserInputResponse,
       options?: RuntimeOperationOptions,
-    ) => runtime.respondToUserInput(ref, response, options),
+    ) => runControlLifecycleMutation(
+      ref,
+      () => runtime.respondToUserInput(ref, response, options),
+    ),
     async observe(ref: AgentRef, options?: RuntimeOperationOptions) {
       const snapshot = await runtime.observe(ref, options);
       if (snapshot !== undefined) {
@@ -391,6 +401,7 @@ export function createStockT3Facade(
           lifecycleSequenceByRef.set(key, snapshot.snapshotSequence);
           if (isTerminalSnapshot(snapshot)) {
             recordWorkerTerminalState(overlay, ref, true);
+            pruneLifecycleTracking(ref);
           }
         }
       }
