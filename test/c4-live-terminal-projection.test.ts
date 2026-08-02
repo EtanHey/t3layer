@@ -129,7 +129,7 @@ function detail(
   sequence: number,
   latestTurn: StockLatestTurn | null,
   session: StockSession | null,
-  projectedMessages: readonly StockMessage[] = messages,
+  projectedMessages: readonly StockMessage[] = [],
 ): ThreadDetailSnapshot {
   const identity = shellThread(latestTurn, session);
   return {
