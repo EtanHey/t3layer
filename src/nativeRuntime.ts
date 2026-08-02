@@ -513,6 +513,7 @@ interface LeaseState {
   readonly preflightLatestTurnId: string | null;
   readonly expectedInputDigest: string;
   boundTurnId: string | null;
+  boundRequestedAt: string | null;
   boundAssistantMessageId: string | null;
 }
 
@@ -1134,6 +1135,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       preflightLatestTurnId: preflight.thread.latestTurn?.turnId ?? null,
       expectedInputDigest: digestSync({ text: inputText, attachments: [] }),
       boundTurnId: null,
+      boundRequestedAt: null,
       boundAssistantMessageId: null,
     });
     const delay = Math.max(0, Math.min(2_147_483_647, deadlineMs - clock()));
@@ -3002,6 +3004,28 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           if (shellThread === undefined) {
             throw new StockRuntimeError("protocol_mismatch", { reason: "shell_thread_missing" });
           }
+          const shellLatest = shellThread.latestTurn;
+          const captureAdvertisedAssistant = (assistantMessageId: string) => {
+            if (
+              state.boundAssistantMessageId !== null &&
+              state.boundAssistantMessageId !== assistantMessageId
+            ) {
+              throw new StockRuntimeError("concurrent_writer", {
+                reason: "assistant_message_changed",
+              });
+            }
+            state.boundAssistantMessageId = assistantMessageId;
+          };
+          if (
+            state.boundTurnId !== null &&
+            state.boundRequestedAt !== null &&
+            shellLatest !== null &&
+            shellLatest.turnId === state.boundTurnId &&
+            shellLatest.requestedAt === state.boundRequestedAt &&
+            shellLatest.assistantMessageId !== null
+          ) {
+            captureAdvertisedAssistant(shellLatest.assistantMessageId);
+          }
           if (detailSnapshot === undefined) return { done: false, detail: true };
           if (
             detailSnapshot.thread.id !== shellThread.id ||
@@ -3030,6 +3054,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             latest.requestedAt === target.createdAt
           ) {
             state.boundTurnId = latest.turnId;
+            state.boundRequestedAt = target.createdAt;
           } else if (
             state.boundTurnId === null &&
             latest !== null &&
@@ -3045,7 +3070,6 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             throw new StockRuntimeError("concurrent_writer", { reason: "turn_changed" });
           }
           if (state.boundTurnId === null) return { done: false, detail: true };
-          const shellLatest = shellThread.latestTurn;
           if ((latest === null) !== (shellLatest === null)) {
             throw new StockRuntimeError("concurrent_writer", {
               reason: "shell_detail_turn_conflict",
@@ -3061,15 +3085,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
             });
           }
           if (latest !== null && latest.assistantMessageId !== null) {
-            if (
-              state.boundAssistantMessageId !== null &&
-              state.boundAssistantMessageId !== latest.assistantMessageId
-            ) {
-              throw new StockRuntimeError("concurrent_writer", {
-                reason: "assistant_message_changed",
-              });
-            }
-            state.boundAssistantMessageId = latest.assistantMessageId;
+            captureAdvertisedAssistant(latest.assistantMessageId);
           }
           if (shellThread.hasPendingApprovals) throw new StockRuntimeError("pending_approval");
           if (shellThread.hasPendingUserInput) throw new StockRuntimeError("pending_input");

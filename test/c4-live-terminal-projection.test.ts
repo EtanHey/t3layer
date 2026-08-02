@@ -222,6 +222,69 @@ function runtimeFor(
   });
 }
 
+function clientForIndependentProjections(
+  shellProjections: readonly Projection[],
+  detailProjections: readonly Projection[],
+  onDetailProjection?: (sequence: number) => void,
+): StockT3RuntimeClient {
+  let shellReads = 0;
+  let detailReads = 0;
+  const projection = (stream: readonly Projection[], index: number) =>
+    stream[Math.min(index, stream.length - 1)]!;
+  return {
+    getDescriptor: async () => ({
+      environmentId: ref.environmentId,
+      label: "local",
+      platform: { os: "darwin", arch: "arm64" },
+      serverVersion: "stock",
+      capabilities: { repositoryIdentity: false },
+    }),
+    getShell: async () => {
+      const current = projection(shellProjections, shellReads);
+      shellReads += 1;
+      return shell(
+        current.sequence,
+        current.shellLatestTurn === undefined
+          ? current.latestTurn
+          : current.shellLatestTurn,
+        current.session,
+      );
+    },
+    getThread: async () => {
+      detailReads += 1;
+      if (detailReads === 1) return detail(1, null, null, []);
+      const current = projection(detailProjections, detailReads - 2);
+      onDetailProjection?.(current.sequence);
+      return detail(
+        current.sequence,
+        current.latestTurn,
+        current.session,
+        current.messages,
+      );
+    },
+    dispatch: async () => ({ sequence: 4 }),
+  };
+}
+
+function runtimeForIndependentProjections(
+  shellProjections: readonly Projection[],
+  detailProjections: readonly Projection[],
+  onDetailProjection?: (sequence: number) => void,
+  clock?: () => number,
+) {
+  const ids = ["command-1", "message-1", "lease-1"];
+  return createStockT3NativeRuntime({
+    client: clientForIndependentProjections(
+      shellProjections,
+      detailProjections,
+      onDetailProjection,
+    ),
+    id: () => ids.shift()!,
+    now: () => requestedAt,
+    ...(clock === undefined ? {} : { clock }),
+  });
+}
+
 describe("criterion-4 terminal projection rollover", () => {
   test("completes from the bound finalized assistant after stock clears latestTurn", async () => {
     const runtime = runtimeFor([
@@ -301,6 +364,198 @@ describe("criterion-4 terminal projection rollover", () => {
     });
     runtime.close();
   });
+
+  test("captures the exact assistant id from shell when detail misses the advertising snapshot", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 14, latestTurn: boundTurn, session: runningSession, messages: completedMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).resolves.toMatchObject({
+      kind: "completed",
+      assistantContent: "done",
+      snapshotSequence: 16,
+    });
+    runtime.close();
+  }, 20_000);
+
+  test("refuses a terminal assistant id substituted after a shell-only advertisement", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 14, latestTurn: boundTurn, session: runningSession, messages: completedMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: mismatchedAssistantMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: mismatchedAssistantMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
+  test("does not infer an assistant id when neither projection ever advertises one", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 14, latestTurn: pendingBoundTurn, session: runningSession, messages: completedMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
+  test("does not capture an assistant id when shell requestedAt disagrees with the bound target", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const skewedAdvertisement = {
+      ...boundTurn,
+      requestedAt: laterAt,
+    };
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 14,
+          latestTurn: skewedAdvertisement,
+          session: runningSession,
+          messages: completedMessages,
+        },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
+
+  test("does not capture an assistant id from a shell pointer re-pointed to another turn", async () => {
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const otherTurnAdvertisement = {
+      ...newerTurn,
+      assistantMessageId: "assistant-a",
+    };
+    const runtime = runtimeForIndependentProjections(
+      [
+        { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 14,
+          latestTurn: otherTurnAdvertisement,
+          session: { ...runningSession, activeTurnId: otherTurnAdvertisement.turnId },
+          messages: completedMessages,
+        },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: completedMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
+    const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
+
+    await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    runtime.close();
+  }, 20_000);
 
   test.each([
     ["error", "turn_error"],
