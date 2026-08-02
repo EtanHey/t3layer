@@ -13,12 +13,28 @@ import {
   validateProofReceipt,
 } from "../src/stockProof";
 
+const isolatedGitEnv = {
+  ...Bun.env,
+  GIT_CONFIG_COUNT: "0",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+};
+
 function gitCommand(repo: string, ...args: string[]) {
-  const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+    env: isolatedGitEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
 function gitOutput(repo: string, ...args: string[]) {
-  const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+    env: isolatedGitEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
   return new TextDecoder().decode(result.stdout).trim();
 }
@@ -27,14 +43,14 @@ async function candidateFixture(unmerged = false) {
   gitCommand(root, "init", "--quiet", "--initial-branch=main");
   await Bun.write(join(root, "candidate.txt"), "merged\n");
   gitCommand(root, "add", "candidate.txt");
-  gitCommand(root, "-c", "user.name=T3Layer Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "merged candidate");
+  gitCommand(root, "-c", "user.name=T3Layer Test", "-c", "user.email=test@example.com", "commit", "--quiet", "--no-gpg-sign", "-m", "merged candidate");
   const mainSha = gitOutput(root, "rev-parse", "HEAD");
   gitCommand(root, "update-ref", "refs/remotes/origin/main", mainSha);
   if (unmerged) {
     gitCommand(root, "switch", "--quiet", "--create", "feature");
     await Bun.write(join(root, "candidate.txt"), "unmerged\n");
     gitCommand(root, "add", "candidate.txt");
-    gitCommand(root, "-c", "user.name=T3Layer Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "unmerged candidate");
+    gitCommand(root, "-c", "user.name=T3Layer Test", "-c", "user.email=test@example.com", "commit", "--quiet", "--no-gpg-sign", "-m", "unmerged candidate");
   }
   return { root, headSha: gitOutput(root, "rev-parse", "HEAD") };
 }

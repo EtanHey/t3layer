@@ -298,8 +298,9 @@ isolation, and complete teardown before atomic mode-0600 publication. Literal
 stock SHA/provenance commands and isolation basenames are pinned, and final
 validation runs from the archived candidate rather than the mutable worktree.
 
-Because the harness exports `git archive HEAD`, it proves only a reviewed
-checkpoint commit. An uncommitted working tree cannot produce a current proof
+Because the harness exports `git archive "$T3_STOCK_CANDIDATE_SHA"` from
+`T3_STOCK_CANDIDATE_REPO`, it proves only the committed candidate. An
+uncommitted working tree cannot produce a current proof
 for those edits.
 
 ## First stock-only release
