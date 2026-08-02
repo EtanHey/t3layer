@@ -270,7 +270,7 @@ Declared toolchain target: Bun 1.3.11 and TypeScript 6.0.x.
 
 ```bash
 bun install --frozen-lockfile
-bun test
+bun run test ./test/*.test.ts
 bun run typecheck
 bash scripts/check-stock-only.sh
 bash scripts/stock-t3-canary-drill.sh --dry-run
