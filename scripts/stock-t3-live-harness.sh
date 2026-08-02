@@ -8,6 +8,7 @@ implementation_repo=$(cd "$script_dir/.." && pwd -P)
 candidate_repo=${T3_STOCK_CANDIDATE_REPO:-}
 expected_candidate_sha=${T3_STOCK_CANDIDATE_SHA:-}
 proof_target=${T3_STOCK_PROOF_TARGET:-/Users/etanheyman/Gits/t3layer/docs.local/audits/t3layer-stock-t3-realignment/phase-3-stock-live-proof.json}
+trace_target=${T3_STOCK_TRACE_PATH:-}
 proof_root=''
 stock_tree=''
 server_pid=''
@@ -68,6 +69,44 @@ run_stage_seam() {
     "$T3_STOCK_HARNESS_COMMAND_RUNNER" "$stage" "$proof_root"
   fi
   fail_at "$stage"
+}
+
+prepare_projection_trace() {
+  if [[ -z "$trace_target" ]]; then
+    if [[ "$test_mode" != 1 ]]; then
+      preflight_error projection_trace_invalid missing_path
+    fi
+    return
+  fi
+  if [[ "$trace_target" != /* ]]; then
+    preflight_error projection_trace_invalid path_not_absolute
+  fi
+  local trace_parent
+  local trace_name
+  local canonical_trace_parent
+  trace_parent=$(dirname -- "$trace_target")
+  trace_name=$(basename -- "$trace_target")
+  if [[ -z "$trace_name" || "$trace_name" == . || "$trace_name" == .. ]] ||
+     ! canonical_trace_parent=$(cd "$trace_parent" 2>/dev/null && pwd -P); then
+    preflight_error projection_trace_invalid parent_unavailable
+  fi
+  trace_target="$canonical_trace_parent/$trace_name"
+  case "$trace_target" in
+    "$proof_root"|"$proof_root"/*)
+      preflight_error projection_trace_invalid path_inside_proof_root
+      ;;
+  esac
+  if [[ -e "$trace_target" || -L "$trace_target" ]]; then
+    preflight_error projection_trace_invalid path_already_exists
+  fi
+  if ! (umask 077; set -o noclobber; : > "$trace_target") 2>/dev/null; then
+    preflight_error projection_trace_invalid create_failed
+  fi
+  chmod 600 "$trace_target"
+  if [[ ! -f "$trace_target" || -L "$trace_target" || $(/usr/bin/stat -f '%Lp' "$trace_target") != 600 ]]; then
+    preflight_error projection_trace_invalid mode_or_type_mismatch
+  fi
+  export T3_STOCK_TRACE_PATH="$trace_target"
 }
 
 preflight_error() {
@@ -317,6 +356,7 @@ if [[ -L "$proof_root" || "$canonical_root" == / || "$canonical_root" == "$HOME"
 fi
 proof_root=$canonical_root
 cleanup_root_valid=true
+prepare_projection_trace
 run_id=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
 stock_tree="$proof_root/stock-tree"
 t3layer_clean="$proof_root/t3layer-clean"

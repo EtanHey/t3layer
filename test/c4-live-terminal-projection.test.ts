@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   createStockT3NativeRuntime,
@@ -630,6 +633,107 @@ describe("criterion-4 terminal projection rollover", () => {
 
     await expect(pending).rejects.toMatchObject({ code: "timeout" });
     runtime.close();
+  }, 20_000);
+
+  test("flushes an append-only ids-only projection trace before a pending wait settles", async () => {
+    const traceRoot = await mkdtemp(join(tmpdir(), "t3layer-c4-projection-trace."));
+    const tracePath = join(traceRoot, "trace.jsonl");
+    const seedRow = '{"endpoint":"seed"}\n';
+    await Bun.write(tracePath, seedRow);
+    await chmod(tracePath, 0o640);
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const ids = ["command-1", "message-1", "lease-1"];
+    const runtime = createStockT3NativeRuntime({
+      client: clientForIndependentProjections(
+        [
+          { sequence: 8, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+          { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+          {
+            sequence: 14,
+            latestTurn: pendingBoundTurn,
+            session: runningSession,
+            messages: ambiguousAssistantMessages,
+          },
+          {
+            sequence: 16,
+            latestTurn: null,
+            session: readySession,
+            messages: ambiguousAssistantMessages,
+          },
+        ],
+        [
+          { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+          { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+          { sequence: 11, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+          {
+            sequence: 16,
+            latestTurn: null,
+            session: readySession,
+            messages: ambiguousAssistantMessages,
+          },
+        ],
+        (sequence) => {
+          if (sequence === 16) terminalObserved();
+        },
+      ),
+      id: () => ids.shift()!,
+      now: () => requestedAt,
+      clock: () => currentMs,
+      projectionTracePath: tracePath,
+    });
+
+    try {
+      const receipt = await runtime.send(ref, "target");
+      const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+      await observed;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const traceBeforeSettlement = await Bun.file(tracePath).text();
+      expect(traceBeforeSettlement.startsWith(seedRow)).toBe(true);
+      const rows = traceBeforeSettlement
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(rows.length).toBeGreaterThan(0);
+      expect((await stat(tracePath)).mode & 0o777).toBe(0o600);
+      expect(rows.some((row) => row.endpoint === "shell")).toBe(true);
+      const terminalDetail = rows.find(
+        (row) => row.endpoint === "detail" && row.snapshotSequence === 16,
+      ) as {
+        latestTurn?: unknown;
+        monotonicOffsetMs?: unknown;
+        messages?: readonly Record<string, unknown>[];
+        runtime?: Record<string, unknown>;
+        session?: unknown;
+      } | undefined;
+      expect(terminalDetail).toBeDefined();
+      expect(terminalDetail?.monotonicOffsetMs).toBeNumber();
+      expect(terminalDetail?.latestTurn).toBeNull();
+      expect(terminalDetail?.session).toEqual({ status: "ready", activeTurnId: null });
+      expect(terminalDetail?.runtime).toMatchObject({
+        boundTurnId: "turn-a",
+        boundRequestedAt: requestedAt,
+        boundAssistantMessageId: null,
+      });
+      expect(terminalDetail?.messages).toEqual([
+        { id: "message-1", role: "user", turnId: null, streaming: false, textLength: 6 },
+        { id: "assistant-a", role: "assistant", turnId: "turn-a", streaming: false, textLength: 4 },
+        { id: "assistant-b", role: "assistant", turnId: "turn-a", streaming: false, textLength: 9 },
+      ]);
+      expect(traceBeforeSettlement).not.toContain('"text"');
+      expect(traceBeforeSettlement).not.toContain("also done");
+
+      currentMs = 30_001;
+      await expect(pending).rejects.toMatchObject({ code: "timeout" });
+    } finally {
+      runtime.close();
+      await rm(traceRoot, { recursive: true, force: true });
+    }
   }, 20_000);
 
   test("does not capture an assistant id when shell requestedAt disagrees with the bound target", async () => {

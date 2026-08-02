@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -689,6 +689,40 @@ fi
       teardown: { pidStopped: true, worktreeRemoved: true, rootRemoved: true },
     });
   });
+
+  test("creates a caller-owned mode-600 projection trace outside the disposable proof root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-external-trace."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const traceTarget = join(root, "projection-trace.jsonl");
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+      T3_STOCK_TRACE_PATH: traceTarget,
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stderr).toContain("cleanup root_removed=true");
+    expect(await Bun.file(traceTarget).exists()).toBe(true);
+    expect((await stat(traceTarget)).mode & 0o777).toBe(0o600);
+    expect(await Bun.file(traceTarget).text()).toBe("");
+  }, 20_000);
+
+  test("requires a fresh external projection trace before a real proof can allocate work", async () => {
+    const result = await run(
+      ["bash", "scripts/stock-t3-live-harness.sh"],
+      { T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key" },
+      ["T3_STOCK_TRACE_PATH"],
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("projection_trace_invalid");
+    expect(result.stderr).toContain("reason=missing_path");
+    expect(result.stderr).toContain("cleanup root_removed=true");
+    expect(result.stderr).not.toContain("op://fixture/provider/key");
+  }, 20_000);
 
   test("test-mode teardown failure cannot exit zero or publish a receipt", async () => {
     const root = await mkdtemp(join(tmpdir(), "t3layer-harness-teardown-failure."));
