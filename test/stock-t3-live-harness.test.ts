@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   ProofReceiptError,
@@ -12,10 +13,28 @@ import {
   validateProofReceipt,
 } from "../src/stockProof";
 
-async function run(command: string[], env: Record<string, string> = {}) {
+const candidateRepo = join(import.meta.dir, "..");
+const candidateEnv = (candidateSha = "a".repeat(40)) => ({
+  T3_STOCK_CANDIDATE_REPO: candidateRepo,
+  T3_STOCK_CANDIDATE_SHA: candidateSha,
+});
+
+async function run(
+  command: string[],
+  env: Record<string, string> = {},
+  unsetEnv: readonly string[] = [],
+) {
+  const harnessDefaults = command[1] === "scripts/stock-t3-live-harness.sh"
+    ? candidateEnv()
+    : {};
+  const processEnv = { ...Bun.env, ...harnessDefaults, ...env } as Record<
+    string,
+    string | undefined
+  >;
+  for (const name of unsetEnv) delete processEnv[name];
   const process = Bun.spawn(command, {
     cwd: join(import.meta.dir, ".."),
-    env: { ...Bun.env, ...env },
+    env: processEnv,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -25,8 +44,6 @@ async function run(command: string[], env: Record<string, string> = {}) {
     stderr: await new Response(process.stderr).text(),
   };
 }
-
-import { join } from "node:path";
 
 const temporaryRoots: string[] = [];
 afterEach(async () => {
@@ -173,6 +190,133 @@ describe("stock live harness lifecycle", () => {
       "after-http-negative", "after-live-test", "after-provisional-validation", "before-normal-exit",
       "before-final-body-validation", "after-final-body-validation", "after-final-rename",
     ]) expect(source).toContain(seam);
+  });
+
+  test("defaults to a verified Claude subscription without requiring or injecting a provider secret", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-subscription."));
+    temporaryRoots.push(root);
+    const bin = root;
+    const claude = join(bin, "claude");
+    const authLog = join(root, "claude-auth.log");
+    const target = join(root, "proof.json");
+    await Bun.write(
+      claude,
+      `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' "$*" >> '${authLog}'\nprintf '%s\\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'\n`,
+    );
+    await chmod(claude, 0o700);
+
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      ...candidateEnv(),
+      PATH: `${bin}:${Bun.env.PATH ?? ""}`,
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    }, ["T3_STOCK_PROVIDER_SECRET_REF", "ANTHROPIC_API_KEY"]);
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(await Bun.file(authLog).text()).toBe("auth status\n");
+    expect(result.stderr).not.toContain("ANTHROPIC_API_KEY");
+    await expect(Bun.file(target).json()).resolves.toMatchObject({ success: true });
+
+    const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
+    expect(source).toContain('(cd "$workspace" && exec node "$stock_tree/apps/server/dist/bin.mjs" serve');
+  });
+
+  test("fails closed with a typed reason when Claude subscription auth is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-no-subscription."));
+    temporaryRoots.push(root);
+    const bin = root;
+    const claude = join(bin, "claude");
+    const target = join(root, "proof.json");
+    await Bun.write(
+      claude,
+      "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"apiKey\",\"apiProvider\":\"firstParty\"}'\n",
+    );
+    await chmod(claude, 0o700);
+
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      ...candidateEnv(),
+      PATH: `${bin}:${Bun.env.PATH ?? ""}`,
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    }, ["T3_STOCK_PROVIDER_SECRET_REF", "ANTHROPIC_API_KEY"]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("provider_auth_unavailable");
+    expect(result.stderr).toContain("reason=subscription_not_authenticated");
+    expect(await Bun.file(target).exists()).toBe(false);
+  });
+
+  test("preserves the provider-secret override without probing subscription auth", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-secret-override."));
+    temporaryRoots.push(root);
+    const bin = root;
+    const claude = join(bin, "claude");
+    const authLog = join(root, "claude-auth.log");
+    const target = join(root, "proof.json");
+    await Bun.write(
+      claude,
+      `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' "$*" >> '${authLog}'\nexit 99\n`,
+    );
+    await chmod(claude, 0o700);
+
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      ...candidateEnv(),
+      PATH: `${bin}:${Bun.env.PATH ?? ""}`,
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(await Bun.file(authLog).exists()).toBe(false);
+    expect(result.stderr).not.toContain("op://fixture/provider/key");
+  });
+
+  test("binds the archived candidate to caller-supplied repository and SHA inputs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t3layer-harness-candidate."));
+    temporaryRoots.push(root);
+    const target = join(root, "proof.json");
+    const expectedSha = "c".repeat(40);
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      ...candidateEnv(expectedSha),
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+      T3_STOCK_PROOF_TARGET: target,
+    });
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    await expect(Bun.file(target).json()).resolves.toMatchObject({ candidateSha: expectedSha });
+
+    const source = await Bun.file(join(import.meta.dir, "../scripts/stock-t3-live-harness.sh")).text();
+    expect(source).not.toContain("/Users/etanheyman/Gits/t3layer-stock-http-runtime");
+    expect(source).toContain("T3_STOCK_CANDIDATE_REPO");
+    expect(source).toContain("T3_STOCK_CANDIDATE_SHA");
+    expect(source).not.toContain('candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)');
+    expect(source).toContain('actual_candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse HEAD)');
+    expect(source).toContain('main_candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse refs/heads/main)');
+    expect(source).toContain('origin_candidate_sha=$(/usr/bin/git -C "$candidate_repo" rev-parse refs/remotes/origin/main)');
+  });
+
+  test("fails closed before allocation when caller candidate identity is missing", async () => {
+    const result = await run(["bash", "scripts/stock-t3-live-harness.sh"], {
+      T3_STOCK_PROVIDER_SECRET_REF: "op://fixture/provider/key",
+      T3_STOCK_HARNESS_TEST_MODE: "1",
+      T3_STOCK_HARNESS_COMMAND_RUNNER: "/usr/bin/true",
+    }, ["T3_STOCK_CANDIDATE_REPO", "T3_STOCK_CANDIDATE_SHA"]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("candidate_identity_invalid");
+    expect(result.stderr).not.toContain("op://fixture/provider/key");
+  });
+
+  test("asserts both requested live sentinels in-process", async () => {
+    const source = await Bun.file(join(import.meta.dir, "stock-t3-live.test.ts")).text();
+    expect(source).toContain('expect(first.assistantContent.trim()).toBe("T3LAYER_STOCK_PROOF_OK")');
+    expect(source).toContain('expect(second.assistantContent.trim()).toBe("T3LAYER_STOCK_PROOF_FOLLOWUP_OK")');
   });
 
   test("test-mode failure after allocation cleans the exact proof root", async () => {
