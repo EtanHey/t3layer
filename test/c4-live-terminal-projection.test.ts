@@ -161,6 +161,7 @@ function detail(
 interface Projection {
   readonly sequence: number;
   readonly latestTurn: StockLatestTurn | null;
+  readonly shellLatestTurn?: StockLatestTurn | null;
   readonly session: StockSession;
   readonly messages: readonly StockMessage[];
 }
@@ -183,7 +184,13 @@ function clientForProjections(
     getShell: async () => {
       shellReads += 1;
       const current = projection(shellReads - 1);
-      return shell(current.sequence, current.latestTurn, current.session);
+      return shell(
+        current.sequence,
+        current.shellLatestTurn === undefined
+          ? current.latestTurn
+          : current.shellLatestTurn,
+        current.session,
+      );
     },
     getThread: async () => {
       detailReads += 1;
@@ -204,12 +211,14 @@ function clientForProjections(
 function runtimeFor(
   projections: readonly Projection[],
   onDetailProjection?: (sequence: number) => void,
+  clock?: () => number,
 ) {
   const ids = ["command-1", "message-1", "lease-1"];
   return createStockT3NativeRuntime({
     client: clientForProjections(projections, onDetailProjection),
     id: () => ids.shift()!,
     now: () => requestedAt,
+    ...(clock === undefined ? {} : { clock }),
   });
 }
 
@@ -273,6 +282,26 @@ describe("criterion-4 terminal projection rollover", () => {
     runtime.close();
   });
 
+  test("rejects when shell and detail disagree about a cleared latestTurn", async () => {
+    const runtime = runtimeFor([
+      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+      {
+        sequence: 16,
+        latestTurn: null,
+        shellLatestTurn: boundTurn,
+        session: readySession,
+        messages: completedMessages,
+      },
+    ]);
+    const receipt = await runtime.send(ref, "target");
+
+    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+      code: "concurrent_writer",
+      evidence: { reason: "shell_detail_turn_conflict" },
+    });
+    runtime.close();
+  });
+
   test.each([
     ["error", "turn_error"],
     ["stopped", "turn_interrupted"],
@@ -295,37 +324,67 @@ describe("criterion-4 terminal projection rollover", () => {
   });
 
   test("does not complete a cleared ready session without a captured finalized assistant", async () => {
-    const runtime = runtimeFor([
-      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
-      { sequence: 16, latestTurn: null, session: readySession, messages: userMessages },
-    ]);
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeFor(
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        { sequence: 16, latestTurn: null, session: readySession, messages: userMessages },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
+      },
+      () => currentMs,
+    );
     const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
 
-    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+    await expect(pending).rejects.toMatchObject({
       code: "timeout",
     });
     runtime.close();
   });
 
   test("does not substitute a same-turn assistant whose id was never advertised", async () => {
-    const runtime = runtimeFor([
-      { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
-      {
-        sequence: 14,
-        latestTurn: boundTurn,
-        session: runningSession,
-        messages: mismatchedAssistantMessages,
+    let currentMs = 0;
+    let terminalObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      terminalObserved = resolve;
+    });
+    const runtime = runtimeFor(
+      [
+        { sequence: 9, latestTurn: pendingBoundTurn, session: runningSession, messages: userMessages },
+        {
+          sequence: 14,
+          latestTurn: boundTurn,
+          session: runningSession,
+          messages: mismatchedAssistantMessages,
+        },
+        {
+          sequence: 16,
+          latestTurn: null,
+          session: readySession,
+          messages: mismatchedAssistantMessages,
+        },
+      ],
+      (sequence) => {
+        if (sequence === 16) terminalObserved();
       },
-      {
-        sequence: 16,
-        latestTurn: null,
-        session: readySession,
-        messages: mismatchedAssistantMessages,
-      },
-    ]);
+      () => currentMs,
+    );
     const receipt = await runtime.send(ref, "target");
+    const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
+    await observed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    currentMs = 30_001;
 
-    await expect(runtime.wait(receipt, { timeoutMs: 3_000 })).rejects.toMatchObject({
+    await expect(pending).rejects.toMatchObject({
       code: "timeout",
     });
     runtime.close();
