@@ -796,6 +796,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
         options.projectionTracePath,
         fsConstants.O_WRONLY |
           fsConstants.O_APPEND |
+          fsConstants.O_NONBLOCK |
           (fsConstants.O_NOFOLLOW ?? 0),
       );
       if (!fstatSync(projectionTraceFd).isFile()) {

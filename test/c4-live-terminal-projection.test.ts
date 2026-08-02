@@ -745,27 +745,40 @@ describe("criterion-4 terminal projection rollover", () => {
       const receipt = await runtime.send(ref, "target");
       const pending = runtime.wait(receipt, { timeoutMs: 30_000 });
       await observed;
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      const traceBeforeSettlement = await Bun.file(tracePath).text();
-      expect(traceBeforeSettlement.startsWith(seedRow)).toBe(true);
-      const rows = traceBeforeSettlement
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
-      expect(rows.length).toBeGreaterThan(0);
-      expect((await stat(tracePath)).mode & 0o777).toBe(0o600);
-      expect(rows.some((row) => row.endpoint === "shell")).toBe(true);
-      const terminalDetail = rows.find(
-        (row) => row.endpoint === "detail" && row.snapshotSequence === 16,
-      ) as {
+      let traceBeforeSettlement = "";
+      let rows: Record<string, unknown>[] = [];
+      let terminalDetail: {
         latestTurn?: unknown;
         monotonicOffsetMs?: unknown;
         messages?: readonly Record<string, unknown>[];
         runtime?: Record<string, unknown>;
         session?: unknown;
       } | undefined;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        traceBeforeSettlement = await Bun.file(tracePath).text();
+        try {
+          rows = traceBeforeSettlement
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+        } catch {
+          rows = [];
+        }
+        terminalDetail = rows.find(
+          (row) => row.endpoint === "detail" && row.snapshotSequence === 16,
+        );
+        if (terminalDetail !== undefined) break;
+        await Bun.sleep(10);
+      }
+      if (terminalDetail === undefined) {
+        throw new Error("projection trace did not flush terminal detail sequence 16");
+      }
+
+      expect(traceBeforeSettlement.startsWith(seedRow)).toBe(true);
+      expect(rows.length).toBeGreaterThan(0);
+      expect((await stat(tracePath)).mode & 0o777).toBe(0o600);
+      expect(rows.some((row) => row.endpoint === "shell")).toBe(true);
       expect(terminalDetail).toBeDefined();
       expect(terminalDetail?.monotonicOffsetMs).toBeNumber();
       expect(terminalDetail?.latestTurn).toBeNull();
@@ -787,6 +800,51 @@ describe("criterion-4 terminal projection rollover", () => {
       await expect(pending).rejects.toMatchObject({ code: "timeout" });
     } finally {
       runtime.close();
+      await rm(traceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("rejects a FIFO projection trace without blocking before type validation", async () => {
+    const traceRoot = await mkdtemp(join(tmpdir(), "t3layer-c4-projection-fifo."));
+    const tracePath = join(traceRoot, "trace.fifo");
+    const mkfifo = Bun.spawn(["mkfifo", tracePath], { stdout: "pipe", stderr: "pipe" });
+    expect(await mkfifo.exited).toBe(0);
+    const moduleUrl = new URL("../src/nativeRuntime.ts", import.meta.url).href;
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `
+          const { createStockT3NativeRuntime } = await import(${JSON.stringify(moduleUrl)});
+          try {
+            createStockT3NativeRuntime({ client: {}, projectionTracePath: ${JSON.stringify(tracePath)} });
+            console.log(JSON.stringify({ accepted: true }));
+          } catch (error) {
+            console.log(JSON.stringify({ code: error?.code, evidence: error?.evidence }));
+          }
+        `,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+
+    try {
+      const outcome = await Promise.race([
+        child.exited.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+        Bun.sleep(1_000).then(() => ({ kind: "timeout" as const })),
+      ]);
+      if (outcome.kind === "timeout") {
+        child.kill("SIGKILL");
+        await child.exited;
+      }
+      expect(outcome.kind).toBe("exit");
+      const stdout = await new Response(child.stdout).text();
+      expect(JSON.parse(stdout)).toEqual({
+        code: "protocol_mismatch",
+        evidence: { reason: "projection_trace_unavailable" },
+      });
+    } finally {
+      child.kill("SIGKILL");
+      await child.exited;
       await rm(traceRoot, { recursive: true, force: true });
     }
   }, 20_000);
