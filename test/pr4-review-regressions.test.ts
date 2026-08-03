@@ -10,9 +10,9 @@ import {
   type TurnReceipt,
 } from "../src/facade";
 import {
-  createStockT3NativeRuntime,
   digestStockSpawnInput,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 import { createStockT3Facade } from "../src/facade";
 
 const modelSelection = { instanceId: "claudeAgent", model: "claude-opus-5" };

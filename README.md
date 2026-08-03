@@ -143,6 +143,14 @@ await t3.spawn({
 });
 ```
 
+Before any HTTP request, `spawn` reads the selected instance cache from
+`<modelCacheDirectory>/<instanceId>.json`; the directory defaults to
+`~/.t3/caches`. The cache requires an exact match in
+`models[].slug`. Unknown instances, missing or unreadable caches, and unknown
+slugs fail closed as `model_unavailable`. Slug failures include the rejected
+`instanceId` and `model` plus the cache's complete `validSlugs` list; the same
+typed evidence crosses the MCP boundary unchanged.
+
 HTTP spawn is a two-stage operation:
 
 ```text
@@ -237,7 +245,7 @@ Failures set `isError: true` and retain the direct error family:
 
 Runtime codes currently include `command_rejected`, `authentication_failed`,
 `permission_denied`, `server_internal`, `internal_error`,
-`transport_unavailable`, `protocol_mismatch`, `environment_changed`,
+`transport_unavailable`, `protocol_mismatch`, `model_unavailable`, `environment_changed`,
 `identity_conflict`, `send_in_progress`, `receipt_expired`,
 `correlation_capacity`, `cancelled`, `timeout`, `superseded`,
 `concurrent_writer`, `causality_unverifiable`, `pending_approval`,
@@ -282,6 +290,9 @@ artifact.
   never print the token while diagnosing.
 - `protocol_mismatch`: inspect `evidence.field`; numeric budgets must follow the
   bounded-integer rules above, and scoped refs require both IDs.
+- `model_unavailable`: inspect `evidence.reason`, then select one of
+  `evidence.validSlugs`; missing or unreadable caches must be restored before
+  retrying because validation never assumes an unchecked model is available.
 - `pending_approval` or `pending_input`: respond to the pending request, then
   call `wait` again with the same active receipt.
 - `receipt_expired`: do not reconstruct or replay the causal claim. Observe the

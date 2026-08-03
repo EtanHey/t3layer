@@ -213,7 +213,7 @@ describe("T3Layer stdio MCP service", () => {
         'const grandchild = \'process.stdout.on("error", () => process.exit(0)); setInterval(() => process.stdout.write("."), 50); setTimeout(() => process.exit(0), 30_000);\'; Bun.spawn([process.execPath, "-e", grandchild], { stdin: "ignore", stdout: "inherit", stderr: "ignore" }); process.on("SIGTERM", () => {}); process.stdout.write("ready\\n"); setInterval(() => {}, 1_000);',
       ],
       env: {},
-      timeoutMs: 25,
+      timeoutMs: 250,
     });
 
     expect(result.exitCode).not.toBe(0);

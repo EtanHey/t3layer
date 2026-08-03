@@ -6,10 +6,10 @@ import {
   reattachCanonicalAgent,
 } from "../src/policy";
 import {
-  createStockT3NativeRuntime,
   type AgentRef,
   type StockT3RuntimeClient,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 import type {
   PollObservation,
 } from "../src/adaptivePoller";

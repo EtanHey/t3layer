@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  createStockT3NativeRuntime,
   type StockT3RuntimeClient,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 import type {
   ShellSnapshot,
   StockLatestTurn,

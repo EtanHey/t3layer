@@ -1,0 +1,7 @@
+{
+  "instanceId": "claudeAgent",
+  "models": [
+    { "slug": "claude-opus-5" },
+    { "slug": "claude-sonnet-4-5" }
+  ]
+}

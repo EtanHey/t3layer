@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  createStockT3NativeRuntime,
   type StockSpawnInput,
   type TurnReceipt,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 
 const iso = "2026-08-01T04:00:00.000Z";
 const selection = { instanceId: "claudeAgent", model: "claude-opus-5" };

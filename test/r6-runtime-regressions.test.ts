@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 
 import {
-  createStockT3NativeRuntime,
   type StockSpawnInput,
   type StockT3RuntimeClient,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 import type {
   EnvironmentDescriptor,
   ShellSnapshot,

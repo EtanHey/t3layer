@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  createStockT3NativeRuntime,
   digestStockSpawnInput,
   type CreateReconciliationPending,
   type StockSpawnInput,
   type StockT3RuntimeClient,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 import type {
   ShellSnapshot,
   StockMessage,

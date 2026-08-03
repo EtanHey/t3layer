@@ -8,13 +8,13 @@ import {
 import { createStockT3Facade } from "../src/facade";
 import {
   StockRuntimeError,
-  createStockT3NativeRuntime,
   type AgentRef,
   type ApprovalResponse,
   type RuntimeOperationOptions,
   type T3NativeRuntime,
   type UserInputResponse,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 import { WorkerOverlayError } from "../src/overlay";
 
 const ref: AgentRef = Object.freeze({ environmentId: "environment-1", threadId: "thread-1" });
