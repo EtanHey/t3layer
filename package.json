@@ -11,5 +11,8 @@
     "test": "\"$npm_execpath\" test --timeout 30000",
     "typecheck": "tsc --noEmit"
   },
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
 }
