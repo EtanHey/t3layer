@@ -290,9 +290,10 @@ artifact.
   never print the token while diagnosing.
 - `protocol_mismatch`: inspect `evidence.field`; numeric budgets must follow the
   bounded-integer rules above, and scoped refs require both IDs.
-- `model_unavailable`: inspect `evidence.reason`, then select one of
-  `evidence.validSlugs`; missing or unreadable caches must be restored before
-  retrying because validation never assumes an unchecked model is available.
+- `model_unavailable`: inspect `evidence.reason`. When `evidence.validSlugs` is
+  non-empty, select one of those slugs. When it is empty, configure a known
+  instance or restore its missing/unreadable cache before retrying; validation
+  never assumes an unchecked model is available.
 - `pending_approval` or `pending_input`: respond to the pending request, then
   call `wait` again with the same active receipt.
 - `receipt_expired`: do not reconstruct or replay the causal claim. Observe the
