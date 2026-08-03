@@ -75,6 +75,31 @@ nested-agent variables. `T3_STOCK_PROVIDER_SECRET_REF` remains an optional
 1Password-backed override; its resolved value is scoped only to the owned
 isolated server child.
 
+## Global MCP for Claude agents
+
+After this repository is merged at `/Users/etanheyman/Gits/t3layer`, register
+the stdio entrypoint once at user scope with the pinned Bun 1.3.11 binary:
+
+```bash
+claude mcp add --scope user t3layer -- /Users/etanheyman/.bun/install/cache/@oven/bun-darwin-aarch64@1.3.11@@@1/bin/bun /Users/etanheyman/Gits/t3layer/scripts/t3layer-mcp-server.ts
+```
+
+The server defaults to `T3LAYER_BASE_URL=http://127.0.0.1:3773` and
+`T3LAYER_CONNECTION_PROFILE=local`. It issues a scoped 12-hour subscription
+bearer at boot through the installed T3 Code (Alpha) CLI, retains that bearer
+in process memory only, and reissues it after authentication failure. A failed
+mint or boot descriptor probe does not terminate the stdio server.
+
+For a Nightly or other install, re-add the entry with the app executable path
+stored in the MCP environment, for example:
+
+```bash
+claude mcp add --scope user -e 'T3LAYER_APP_BIN=/Applications/T3 Code Nightly.app/Contents/MacOS/T3 Code Nightly' t3layer -- /Users/etanheyman/.bun/install/cache/@oven/bun-darwin-aarch64@1.3.11@@@1/bin/bun /Users/etanheyman/Gits/t3layer/scripts/t3layer-mcp-server.ts
+```
+
+The lead performs this user-scope wiring after merge; repository verification
+must not mutate the global Claude MCP configuration.
+
 ## Causal API
 
 Project lookup remains stock-authoritative. If a unique project for
