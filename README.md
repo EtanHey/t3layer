@@ -165,6 +165,11 @@ executable. External-writer terminal partials retain the complete accepted or
 ambiguous receipt as `leaseState: "released"`; that evidence is not executable
 and `wait` rejects it as `receipt_expired`.
 
+`spawn` and `send` set the returned receipt's lease expiry to that operation's
+deadline. Size that deadline for the expected full agent turn, not merely for
+dispatch; a short dispatch-sized deadline can expire a healthy long-running
+turn before `wait` observes completion.
+
 Workspace roots cross one stock-compatible ingress seam before lookup, identity
 validation, payload construction, or comparison: whitespace is trimmed, `~` is
 expanded, relative paths become absolute, trailing separators are normalized,

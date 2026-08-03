@@ -3191,14 +3191,6 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           }
           const shellLatest = shellThread.latestTurn;
           const captureAdvertisedAssistant = (assistantMessageId: string) => {
-            if (
-              state.boundAssistantMessageId !== null &&
-              state.boundAssistantMessageId !== assistantMessageId
-            ) {
-              throw new StockRuntimeError("concurrent_writer", {
-                reason: "assistant_message_changed",
-              });
-            }
             state.boundAssistantMessageId = assistantMessageId;
           };
           if (
