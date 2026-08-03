@@ -211,12 +211,21 @@ export async function mintSubscriptionToken(input: {
 interface RuntimeSlot {
   readonly proxy: T3LayerMcpRuntime;
   readonly current: () => T3LayerMcpRuntime;
+  readonly generation: () => number;
+  readonly acquire: () => {
+    readonly generation: number;
+    readonly release: () => void;
+  };
   readonly replace: (create: () => T3LayerMcpRuntime) => void;
   readonly close: () => void;
 }
 
 function createRuntimeSlot(initial: T3LayerMcpRuntime): RuntimeSlot {
   let current = initial;
+  let generation = 0;
+  let closed = false;
+  const activeCalls = new Map<number, number>();
+  const retired = new Map<number, T3LayerMcpRuntime>();
   const proxy = new Proxy(initial, {
     get(_target, property) {
       const value = Reflect.get(current, property);
@@ -226,13 +235,51 @@ function createRuntimeSlot(initial: T3LayerMcpRuntime): RuntimeSlot {
   return {
     proxy,
     current: () => current,
+    generation: () => generation,
+    acquire() {
+      if (closed) throw new Error("T3Layer MCP service is closed");
+      const acquiredGeneration = generation;
+      activeCalls.set(
+        acquiredGeneration,
+        (activeCalls.get(acquiredGeneration) ?? 0) + 1,
+      );
+      let released = false;
+      return {
+        generation: acquiredGeneration,
+        release() {
+          if (released) return;
+          released = true;
+          const remaining = (activeCalls.get(acquiredGeneration) ?? 1) - 1;
+          if (remaining > 0) {
+            activeCalls.set(acquiredGeneration, remaining);
+            return;
+          }
+          activeCalls.delete(acquiredGeneration);
+          const retiredRuntime = retired.get(acquiredGeneration);
+          if (retiredRuntime !== undefined) {
+            retired.delete(acquiredGeneration);
+            retiredRuntime.close();
+          }
+        },
+      };
+    },
     replace(create) {
       const previous = current;
+      const previousGeneration = generation;
       current = create();
-      previous.close();
+      generation += 1;
+      if ((activeCalls.get(previousGeneration) ?? 0) > 0) {
+        retired.set(previousGeneration, previous);
+      } else {
+        previous.close();
+      }
     },
     close() {
+      if (closed) return;
+      closed = true;
       current.close();
+      for (const runtime of retired.values()) runtime.close();
+      retired.clear();
     },
   };
 }
@@ -295,6 +342,13 @@ export function createT3LayerMcpService(
   let initializePromise: Promise<void> | undefined;
   let recreatePromise: Promise<boolean> | undefined;
   let recreateRemints = false;
+  let recreateRemintRequested = false;
+  let credentialGeneration = 0;
+  let closed = false;
+
+  function assertOpen(): void {
+    if (closed) throw new Error("T3Layer MCP service is closed");
+  }
 
   const newRuntime = (token: string | undefined) =>
     createRuntime({
@@ -324,6 +378,10 @@ export function createT3LayerMcpService(
       bearerToken = undefined;
       unavailableReason = "token_mint_failed";
     }
+    if (closed) {
+      bearerToken = undefined;
+      return;
+    }
     runtimeSlot = createRuntimeSlot(newRuntime(bearerToken));
     mcpFacade = createMcpFacade(runtimeSlot.proxy);
     if (bearerToken === undefined) return;
@@ -336,37 +394,50 @@ export function createT3LayerMcpService(
   }
 
   async function recreate(remint: boolean): Promise<boolean> {
+    if (closed) return false;
     const pending = recreatePromise;
     if (pending !== undefined) {
-      if (!remint || recreateRemints) return pending;
-      try {
-        await pending;
-      } catch {
-        // Authentication recovery still needs a remint after a failed
-        // environment-only recreation.
+      if (remint && !recreateRemints) {
+        recreateRemintRequested = true;
+        recreateRemints = true;
       }
-      return recreate(true);
+      return pending;
     }
     recreateRemints = remint;
     const operation = (async () => {
-      let replacementToken = bearerToken;
-      if (remint || replacementToken === undefined) {
-        try {
-          replacementToken = await mint();
-        } catch {
-          unavailableReason = "token_mint_failed";
-          return false;
+      let shouldRemint = remint;
+      while (true) {
+        let replacementToken = bearerToken;
+        const mintRequired = shouldRemint || replacementToken === undefined;
+        if (mintRequired) {
+          recreateRemints = true;
+          try {
+            replacementToken = await mint();
+          } catch {
+            unavailableReason = "token_mint_failed";
+            return false;
+          }
         }
-      }
-      runtimeSlot!.replace(() => newRuntime(replacementToken));
-      bearerToken = replacementToken;
-      try {
-        await probeCurrentRuntime();
-        unavailableReason = undefined;
-        return true;
-      } catch {
-        unavailableReason = "descriptor_probe_failed";
-        return false;
+        if (closed) return false;
+        runtimeSlot!.replace(() => newRuntime(replacementToken));
+        bearerToken = replacementToken;
+        if (mintRequired) credentialGeneration += 1;
+        let probeSucceeded = false;
+        try {
+          await probeCurrentRuntime();
+          if (closed) return false;
+          unavailableReason = undefined;
+          probeSucceeded = true;
+        } catch {
+          if (closed) return false;
+          unavailableReason = "descriptor_probe_failed";
+        }
+        if (!shouldRemint && recreateRemintRequested) {
+          shouldRemint = true;
+          recreateRemintRequested = false;
+          continue;
+        }
+        return probeSucceeded;
       }
     })();
     recreatePromise = operation;
@@ -376,6 +447,7 @@ export function createT3LayerMcpService(
       if (recreatePromise === operation) {
         recreatePromise = undefined;
         recreateRemints = false;
+        recreateRemintRequested = false;
       }
     }
   }
@@ -386,12 +458,39 @@ export function createT3LayerMcpService(
     return mcpFacade;
   }
 
+  async function callFacade(
+    name: string,
+    argumentsValue: unknown,
+    context: StockT3McpCallContext,
+  ): Promise<{
+    readonly credentialGeneration: number;
+    readonly generation: number;
+    readonly result: StockT3McpToolResult;
+  }> {
+    const lease = runtimeSlot!.acquire();
+    try {
+      return {
+        credentialGeneration,
+        generation: lease.generation,
+        result: await initializedFacade().callTool(
+          name,
+          argumentsValue,
+          context,
+        ),
+      };
+    } finally {
+      lease.release();
+    }
+  }
+
   return Object.freeze({
     initialize(): Promise<void> {
+      assertOpen();
       initializePromise ??= initializeOnce();
       return initializePromise;
     },
     listTools() {
+      assertOpen();
       return initializedFacade().listTools();
     },
     async callTool(
@@ -399,23 +498,53 @@ export function createT3LayerMcpService(
       argumentsValue: unknown,
       context: StockT3McpCallContext = {},
     ): Promise<T3LayerMcpServerResult> {
+      assertOpen();
       initializePromise ??= initializeOnce();
       await initializePromise;
-      const facade = initializedFacade();
+      assertOpen();
       if (unavailableReason !== undefined && !LOCAL_TOOL_NAMES.has(name)) {
-        if (!(await recreate(true))) return appUnavailable(unavailableReason);
+        if (!(await recreate(true))) {
+          assertOpen();
+          return appUnavailable(unavailableReason);
+        }
       }
-      let result = await facade.callTool(name, argumentsValue, context);
-      if (isAuthenticationFailure(result)) {
-        if (!(await recreate(true))) return appUnavailable(unavailableReason!);
-        result = await facade.callTool(name, argumentsValue, context);
-      } else if (resultErrorCode(result) === "environment_changed") {
-        if (!(await recreate(false))) return appUnavailable(unavailableReason!);
-        result = await facade.callTool(name, argumentsValue, context);
+      let authenticationRecoveries = 0;
+      let environmentRecoveries = 0;
+      let attempt = await callFacade(name, argumentsValue, context);
+      while (true) {
+        const authenticationFailure = isAuthenticationFailure(attempt.result);
+        const environmentChanged =
+          resultErrorCode(attempt.result) === "environment_changed";
+        if (!authenticationFailure && !environmentChanged) {
+          return attempt.result;
+        }
+
+        if (authenticationFailure) {
+          if (authenticationRecoveries >= 1) return attempt.result;
+          authenticationRecoveries += 1;
+          const credentialsAlreadyAdvanced =
+            attempt.credentialGeneration !== credentialGeneration;
+          if (!credentialsAlreadyAdvanced && !(await recreate(true))) {
+            assertOpen();
+            return appUnavailable(unavailableReason!);
+          }
+        } else {
+          if (environmentRecoveries >= 1) return attempt.result;
+          environmentRecoveries += 1;
+          if (
+            attempt.generation === runtimeSlot!.generation() &&
+            !(await recreate(false))
+          ) {
+            assertOpen();
+            return appUnavailable(unavailableReason!);
+          }
+        }
+        attempt = await callFacade(name, argumentsValue, context);
       }
-      return result;
     },
     close(): void {
+      if (closed) return;
+      closed = true;
       bearerToken = undefined;
       runtimeSlot?.close();
     },
@@ -429,9 +558,11 @@ export function createT3LayerSdkServer(
     { name: "t3layer", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [...service.listTools()],
-  }));
+  server.onclose = () => service.close();
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    await service.initialize();
+    return { tools: [...service.listTools()] };
+  });
   server.setRequestHandler(
     CallToolRequestSchema,
     async (request, extra) =>
@@ -457,9 +588,38 @@ export async function startT3LayerMcpServer(
   return { server, service };
 }
 
+export function installT3LayerMcpShutdownHandlers(
+  server: { readonly close: () => Promise<void> },
+  service: { readonly close: () => void },
+  signalTarget: {
+    readonly once: (
+      signal: "SIGINT" | "SIGTERM",
+      listener: () => void,
+    ) => unknown;
+    readonly exit: (code: number) => unknown;
+  } = process,
+): void {
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      service.close();
+    } finally {
+      void server.close().finally(() => signalTarget.exit(0));
+    }
+  };
+  signalTarget.once("SIGINT", shutdown);
+  signalTarget.once("SIGTERM", shutdown);
+}
+
 if (import.meta.main) {
-  void startT3LayerMcpServer().catch(() => {
-    process.stderr.write("T3Layer MCP stdio transport failed to start\n");
-    process.exitCode = 1;
-  });
+  void startT3LayerMcpServer()
+    .then(({ server, service }) =>
+      installT3LayerMcpShutdownHandlers(server, service),
+    )
+    .catch(() => {
+      process.stderr.write("T3Layer MCP stdio transport failed to start\n");
+      process.exitCode = 1;
+    });
 }

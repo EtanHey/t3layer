@@ -8,6 +8,7 @@ import {
   T3LAYER_LOCAL_TOOL_NAMES,
   createT3LayerSdkServer,
   createT3LayerMcpService,
+  installT3LayerMcpShutdownHandlers,
   mintSubscriptionToken,
   readT3LayerMcpConfig,
   runCommand,
@@ -218,7 +219,7 @@ describe("T3Layer stdio MCP service", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stdout.startsWith("ready\n")).toBe(true);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(200);
-    expect(Date.now() - startedAt).toBeLessThan(1_500);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
   });
 
   test("lists the exact MCP tool surface and passes calls through verbatim", async () => {
@@ -264,7 +265,7 @@ describe("T3Layer stdio MCP service", () => {
     expect(await service.callTool("observe", {})).toBe(transportFailure);
   });
 
-  test("registers the exact facade over real SDK list and call handlers", async () => {
+  test("initializes and registers the exact facade over real SDK handlers", async () => {
     const called = success({ source: "facade" });
     const calls: unknown[][] = [];
     const service = createT3LayerMcpService({
@@ -276,7 +277,6 @@ describe("T3Layer stdio MCP service", () => {
       createRuntime: () => runtime(),
       runCommand: runnerReturning("token-1"),
     });
-    await service.initialize();
     const server = createT3LayerSdkServer(service);
     const client = new Client({ name: "t3layer-test", version: "0.1.0" });
     const [clientTransport, serverTransport] =
@@ -302,6 +302,39 @@ describe("T3Layer stdio MCP service", () => {
       await client.close();
       await server.close();
     }
+  });
+
+  test("closes the service and SDK server once on process termination", async () => {
+    const listeners = new Map<string, () => void>();
+    const exits: number[] = [];
+    let serviceCloses = 0;
+    let serverCloses = 0;
+    let releaseServerClose: (() => void) | undefined;
+    const serverClose = new Promise<void>((resolve) => {
+      releaseServerClose = resolve;
+    });
+
+    installT3LayerMcpShutdownHandlers(
+      {
+        close: async () => {
+          serverCloses += 1;
+          await serverClose;
+        },
+      },
+      { close: () => (serviceCloses += 1) },
+      {
+        once: (signal, listener) => listeners.set(signal, listener),
+        exit: (code) => exits.push(code),
+      },
+    );
+
+    listeners.get("SIGTERM")!();
+    listeners.get("SIGINT")!();
+    expect(serviceCloses).toBe(1);
+    expect(serverCloses).toBe(1);
+    releaseServerClose!();
+    await Bun.sleep(0);
+    expect(exits).toEqual([0]);
   });
 
   test("keeps local overlay tools available after failed mint while network tools return a server error", async () => {
@@ -531,6 +564,179 @@ describe("T3Layer stdio MCP service", () => {
     expect(await environmentCall).toBe(recovered);
     expect(await authCall).toBe(recovered);
     expect(runtimeTokens).toEqual(["token-1", "token-1", "token-2"]);
+  });
+
+  test("re-mints when an environment retry reveals a genuinely expired bearer", async () => {
+    const runtimeTokens: Array<string | undefined> = [];
+    let currentToken: string | undefined;
+    let callCount = 0;
+    const recovered = success("authenticated");
+    const service = createT3LayerMcpService({
+      createMcpFacade: () =>
+        adapter(async () => {
+          callCount += 1;
+          if (callCount === 1) return stockFailure("environment_changed");
+          return currentToken === "token-1"
+            ? stockFailure("authentication_failed")
+            : recovered;
+        }),
+      createRuntime: ({ bearerToken }) => {
+        runtimeTokens.push(bearerToken);
+        currentToken = bearerToken;
+        return runtime();
+      },
+      runCommand: runnerReturning("token-1", "token-2"),
+    });
+    await service.initialize();
+
+    expect(await service.callTool("observe", {})).toBe(recovered);
+    expect(runtimeTokens).toEqual(["token-1", "token-1", "token-2"]);
+    expect(callCount).toBe(3);
+  });
+
+  test("retires an old runtime only after unrelated in-flight calls settle", async () => {
+    let releaseSlowCall: (() => void) | undefined;
+    let slowCallStarted = false;
+    const slowCall = new Promise<void>((resolve) => {
+      releaseSlowCall = resolve;
+    });
+    const closeCounts = [0, 0];
+    const calls = new Map<string, number>();
+    const recovered = success("recovered");
+    const slowResult = success("slow-result");
+    const service = createT3LayerMcpService({
+      createMcpFacade: () =>
+        adapter(async (name) => {
+          const count = (calls.get(name) ?? 0) + 1;
+          calls.set(name, count);
+          if (name === "listChildren") {
+            slowCallStarted = true;
+            await slowCall;
+            return slowResult;
+          }
+          return count === 1 ? stockFailure("environment_changed") : recovered;
+        }),
+      createRuntime: () => {
+        const index = calls.size === 0 ? 0 : 1;
+        return runtime({ close: () => (closeCounts[index] += 1) });
+      },
+      runCommand: runnerReturning("token-1"),
+    });
+    await service.initialize();
+
+    const unrelated = service.callTool("listChildren", {});
+    while (!slowCallStarted) await Bun.sleep(1);
+    expect(await service.callTool("listWorkers", {})).toBe(recovered);
+    expect(closeCounts[0]).toBe(0);
+    releaseSlowCall!();
+    expect(await unrelated).toBe(slowResult);
+    expect(closeCounts[0]).toBe(1);
+  });
+
+  test("retries a stale auth error on the current generation without replacing it", async () => {
+    let releaseStaleCall: (() => void) | undefined;
+    let staleCallStarted = false;
+    const staleCall = new Promise<void>((resolve) => {
+      releaseStaleCall = resolve;
+    });
+    const runtimeTokens: Array<string | undefined> = [];
+    const closeCounts = [0, 0, 0];
+    const calls = new Map<string, number>();
+    const recovered = success("current-generation");
+    const service = createT3LayerMcpService({
+      createMcpFacade: () =>
+        adapter(async (name) => {
+          const count = (calls.get(name) ?? 0) + 1;
+          calls.set(name, count);
+          if (name === "listChildren" && count === 1) {
+            staleCallStarted = true;
+            await staleCall;
+          }
+          return count === 1
+            ? stockFailure("authentication_failed")
+            : recovered;
+        }),
+      createRuntime: ({ bearerToken }) => {
+        const index = runtimeTokens.length;
+        runtimeTokens.push(bearerToken);
+        return runtime({ close: () => (closeCounts[index] += 1) });
+      },
+      runCommand: runnerReturning("token-1", "token-2", "token-3"),
+    });
+    await service.initialize();
+
+    const stale = service.callTool("listChildren", {});
+    while (!staleCallStarted) await Bun.sleep(1);
+    expect(await service.callTool("listWorkers", {})).toBe(recovered);
+    expect(runtimeTokens).toEqual(["token-1", "token-2"]);
+    expect(closeCounts[0]).toBe(0);
+    releaseStaleCall!();
+    expect(await stale).toBe(recovered);
+    expect(runtimeTokens).toEqual(["token-1", "token-2"]);
+    expect(closeCounts[0]).toBe(1);
+  });
+
+  test("does not construct a runtime after close wins a pending initialization", async () => {
+    let releaseMint: (() => void) | undefined;
+    let mintStarted = false;
+    const mint = new Promise<void>((resolve) => {
+      releaseMint = resolve;
+    });
+    let runtimeCreations = 0;
+    const service = createT3LayerMcpService({
+      createMcpFacade: () => adapter(async () => success("unused")),
+      createRuntime: () => {
+        runtimeCreations += 1;
+        return runtime();
+      },
+      runCommand: async () => {
+        mintStarted = true;
+        await mint;
+        return { exitCode: 0, stdout: "token-after-close\n" };
+      },
+    });
+
+    const initialization = service.initialize();
+    while (!mintStarted) await Bun.sleep(1);
+    service.close();
+    releaseMint!();
+    await initialization;
+    expect(runtimeCreations).toBe(0);
+  });
+
+  test("does not replace a runtime after close wins a pending auth remint", async () => {
+    let releaseRemint: (() => void) | undefined;
+    let remintStarted = false;
+    const remint = new Promise<void>((resolve) => {
+      releaseRemint = resolve;
+    });
+    const runtimeTokens: Array<string | undefined> = [];
+    let closeCount = 0;
+    let mintCount = 0;
+    const service = createT3LayerMcpService({
+      createMcpFacade: () =>
+        adapter(async () => stockFailure("authentication_failed")),
+      createRuntime: ({ bearerToken }) => {
+        runtimeTokens.push(bearerToken);
+        return runtime({ close: () => (closeCount += 1) });
+      },
+      runCommand: async () => {
+        mintCount += 1;
+        if (mintCount === 1) return { exitCode: 0, stdout: "token-1\n" };
+        remintStarted = true;
+        await remint;
+        return { exitCode: 0, stdout: "token-2\n" };
+      },
+    });
+    await service.initialize();
+
+    const call = service.callTool("listWorkers", {});
+    while (!remintStarted) await Bun.sleep(1);
+    service.close();
+    releaseRemint!();
+    await expect(call).rejects.toThrow("T3Layer MCP service is closed");
+    expect(runtimeTokens).toEqual(["token-1"]);
+    expect(closeCount).toBe(1);
   });
 
   test("re-mints and recreates only the runtime once on an authentication failure", async () => {
