@@ -1,0 +1,6 @@
+{
+  "instanceId": "provider",
+  "models": [
+    { "slug": "model" }
+  ]
+}

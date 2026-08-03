@@ -9,10 +9,10 @@ import {
   parseProjectCreateIdentity,
 } from "../src/facade";
 import {
-  createStockT3NativeRuntime,
   type StockSpawnInput,
   type TurnReceipt,
 } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 
 const iso = "2026-08-01T08:00:00.000Z";
 const selection = { instanceId: "claudeAgent", model: "claude-opus-5" };

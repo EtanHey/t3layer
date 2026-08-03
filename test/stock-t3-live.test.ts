@@ -35,7 +35,7 @@ describe.skipIf(!live)("isolated exact-stock live proof", () => {
       projectionTraceFd: Number(projectionTraceFd),
     });
     const facade = createStockT3Facade(runtime);
-    const modelSelection = { instanceId: "claudeAgent", model: "claude-sonnet-4-5" };
+    const modelSelection = { instanceId: "claudeAgent", model: "claude-sonnet-4-6" };
     const title = `t3layer-stock-proof-${runId.slice(0, 8)}`;
     const spawned = await facade.spawn({
       workspaceRoot,

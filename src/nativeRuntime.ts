@@ -16,8 +16,9 @@ import {
   openSync,
   writeSync,
 } from "node:fs";
+import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { posix, win32 } from "node:path";
+import { join, posix, win32 } from "node:path";
 import {
   StockT3HttpError,
   createStockT3HttpClient,
@@ -265,6 +266,7 @@ export type StockRuntimeErrorCode =
   | "internal_error"
   | "transport_unavailable"
   | "protocol_mismatch"
+  | "model_unavailable"
   | "environment_changed"
   | "identity_conflict"
   | "send_in_progress"
@@ -532,6 +534,8 @@ export interface StockT3NativeRuntimeOptions {
   readonly bearerToken?: string;
   readonly fetch?: FetchLike;
   readonly connectionProfile?: ConnectionProfile;
+  /** Directory containing live T3 instance caches named `<instanceId>.json`. */
+  readonly modelCacheDirectory?: string;
   readonly id?: () => string;
   readonly now?: () => string;
   readonly clock?: () => number;
@@ -781,6 +785,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
   const id = options.id ?? (() => crypto.randomUUID());
   const now = options.now ?? (() => new Date().toISOString());
   const clock = options.clock ?? Date.now;
+  const modelCacheDirectory = options.modelCacheDirectory ?? join(homedir(), ".t3", "caches");
   const projectionTraceClock = options.projectionTraceClock ?? (() => performance.now());
   const projectionTraceStartedAt = projectionTraceClock();
   let projectionTraceFd: number | null = null;
@@ -981,6 +986,106 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       1,
     );
     return { ...input, deadlineMs: operationDeadline(input) };
+  }
+
+  // Every future caller-controlled modelSelection entry point must pass here before HTTP.
+  async function validateModelSelectionAvailable(selection: RuntimeModelSelection): Promise<void> {
+    const instanceId = selection.instanceId;
+    const model = selection.model;
+    if (typeof instanceId !== "string" || instanceId.trim().length === 0) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "modelSelection.instanceId" });
+    }
+    if (typeof model !== "string" || model.trim().length === 0) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "modelSelection.model" });
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(instanceId)) {
+      throw new StockRuntimeError("model_unavailable", {
+        reason: "model_instance_unknown",
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+
+    let cacheEntries: readonly string[];
+    try {
+      cacheEntries = await readdir(modelCacheDirectory);
+    } catch (error) {
+      const reason = typeof error === "object" && error !== null &&
+          "code" in error && error.code === "ENOENT"
+        ? "model_cache_missing"
+        : "model_cache_unreadable";
+      throw new StockRuntimeError("model_unavailable", {
+        reason,
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+
+    const cacheName = `${instanceId}.json`;
+    if (!cacheEntries.includes(cacheName)) {
+      throw new StockRuntimeError("model_unavailable", {
+        reason: "model_instance_unknown",
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+
+    let cache: unknown;
+    try {
+      cache = JSON.parse(await readFile(join(modelCacheDirectory, cacheName), "utf8"));
+    } catch (error) {
+      const reason = typeof error === "object" && error !== null &&
+          "code" in error && error.code === "ENOENT"
+        ? "model_cache_missing"
+        : "model_cache_unreadable";
+      throw new StockRuntimeError("model_unavailable", {
+        reason,
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+    if (typeof cache !== "object" || cache === null || Array.isArray(cache)) {
+      throw new StockRuntimeError("model_unavailable", {
+        reason: "model_cache_unreadable",
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+    const record = cache as Record<string, unknown>;
+    if (record.instanceId !== instanceId || !Array.isArray(record.models)) {
+      throw new StockRuntimeError("model_unavailable", {
+        reason: "model_cache_unreadable",
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+    const validSlugs = record.models.flatMap((entry) => {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
+      const slug = (entry as Record<string, unknown>).slug;
+      return typeof slug === "string" && slug.length > 0 ? [slug] : [];
+    });
+    if (validSlugs.length !== record.models.length) {
+      throw new StockRuntimeError("model_unavailable", {
+        reason: "model_cache_unreadable",
+        instanceId,
+        model,
+        validSlugs: [],
+      });
+    }
+    if (!validSlugs.includes(model)) {
+      throw new StockRuntimeError("model_unavailable", {
+        reason: "model_slug_unavailable",
+        instanceId,
+        model,
+        validSlugs,
+      });
+    }
   }
 
   function stopCode(
@@ -2145,6 +2250,11 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     const bounded = boundedOperation(operation);
     const initialStop = stopCode(bounded);
     if (initialStop !== null) throw new StockRuntimeError(initialStop);
+    await validateModelSelectionAvailable(input.modelSelection);
+    const stoppedAfterModelValidation = stopCode(bounded);
+    if (stoppedAfterModelValidation !== null) {
+      throw new StockRuntimeError(stoppedAfterModelValidation);
+    }
     const environment = await descriptor({ deadlineMs: bounded.deadlineMs, signal: bounded.signal });
     input = canonicalizeSpawnInput(input, environment.platform.os);
     const projectId = await resolveProject(
@@ -2340,6 +2450,23 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
         pendingResult.createAttempt,
         pendingResult.initialTurnContinuation,
         resumeStop === "cancelled" ? "cancelled" : "deadline_exhausted",
+        {
+          shell: null,
+          detail: null,
+          projectionState: pendingResult.reconciliation.projectionState,
+          conflict: null,
+        },
+        bounded.deadlineMs,
+      );
+    }
+    await validateModelSelectionAvailable(input.modelSelection);
+    const stoppedAfterModelValidation = stopCode(bounded);
+    if (stoppedAfterModelValidation !== null) {
+      return pending(
+        pendingResult.provisionalRef,
+        pendingResult.createAttempt,
+        pendingResult.initialTurnContinuation,
+        stoppedAfterModelValidation === "cancelled" ? "cancelled" : "deadline_exhausted",
         {
           shell: null,
           detail: null,

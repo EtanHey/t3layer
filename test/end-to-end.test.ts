@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import { createStockT3Facade } from "../src/facade";
 import { createStockT3McpFacade, type StockT3McpToolResult } from "../src/mcp";
-import { StockRuntimeError, createStockT3NativeRuntime } from "../src/nativeRuntime";
+import { StockRuntimeError } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 
 const bearerToken = "phase7-fixture-token";
 const createdAt = "2026-08-02T09:00:00.000Z";

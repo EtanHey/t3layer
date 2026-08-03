@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 
 import { createStockT3Facade } from "../src/facade";
-import { createStockT3NativeRuntime } from "../src/nativeRuntime";
+import { createStockT3NativeRuntime } from "./support/modelCache";
 
 const auth = "proof-token";
 const iso = "2026-07-31T18:00:00.000Z";
