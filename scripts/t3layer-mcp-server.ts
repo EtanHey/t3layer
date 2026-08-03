@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 
@@ -214,6 +215,7 @@ interface RuntimeSlot {
   readonly generation: () => number;
   readonly acquire: () => {
     readonly generation: number;
+    readonly run: <T>(call: () => Promise<T>) => Promise<T>;
     readonly release: () => void;
   };
   readonly replace: (create: () => T3LayerMcpRuntime) => void;
@@ -226,10 +228,12 @@ function createRuntimeSlot(initial: T3LayerMcpRuntime): RuntimeSlot {
   let closed = false;
   const activeCalls = new Map<number, number>();
   const retired = new Map<number, T3LayerMcpRuntime>();
+  const runtimeLeaseContext = new AsyncLocalStorage<T3LayerMcpRuntime>();
   const proxy = new Proxy(initial, {
     get(_target, property) {
-      const value = Reflect.get(current, property);
-      return typeof value === "function" ? value.bind(current) : value;
+      const runtime = runtimeLeaseContext.getStore() ?? current;
+      const value = Reflect.get(runtime, property);
+      return typeof value === "function" ? value.bind(runtime) : value;
     },
   });
   return {
@@ -238,6 +242,7 @@ function createRuntimeSlot(initial: T3LayerMcpRuntime): RuntimeSlot {
     generation: () => generation,
     acquire() {
       if (closed) throw new Error("T3Layer MCP service is closed");
+      const leasedRuntime = current;
       const acquiredGeneration = generation;
       activeCalls.set(
         acquiredGeneration,
@@ -246,6 +251,7 @@ function createRuntimeSlot(initial: T3LayerMcpRuntime): RuntimeSlot {
       let released = false;
       return {
         generation: acquiredGeneration,
+        run: (call) => runtimeLeaseContext.run(leasedRuntime, call),
         release() {
           if (released) return;
           released = true;
@@ -472,10 +478,8 @@ export function createT3LayerMcpService(
       return {
         credentialGeneration,
         generation: lease.generation,
-        result: await initializedFacade().callTool(
-          name,
-          argumentsValue,
-          context,
+        result: await lease.run(() =>
+          initializedFacade().callTool(name, argumentsValue, context),
         ),
       };
     } finally {

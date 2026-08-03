@@ -633,6 +633,67 @@ describe("T3Layer stdio MCP service", () => {
     expect(closeCounts[0]).toBe(1);
   });
 
+  test("pins every method in one facade call to its acquired runtime generation", async () => {
+    let releaseObserve: (() => void) | undefined;
+    let observeStarted = false;
+    const observeGate = new Promise<void>((resolve) => {
+      releaseObserve = resolve;
+    });
+    const runtimeCalls: string[] = [];
+    let runtimeCreations = 0;
+    let listWorkersCalls = 0;
+    const recovered = success("recovered");
+    const service = createT3LayerMcpService({
+      createMcpFacade: (runtimeProxy) =>
+        adapter(async (name) => {
+          if (name === "spawn") {
+            await runtimeProxy.observe({
+              environmentId: "environment-1",
+              threadId: "parent-1",
+            });
+            return success(await runtimeProxy.spawn({} as never));
+          }
+          listWorkersCalls += 1;
+          return listWorkersCalls === 1
+            ? stockFailure("environment_changed")
+            : recovered;
+        }),
+      createRuntime: () => {
+        const runtimeId = runtimeCreations;
+        runtimeCreations += 1;
+        return {
+          client: {
+            getDescriptor: async () => ({ environmentId: "environment-1" }),
+          },
+          async observe() {
+            runtimeCalls.push(`runtime-${runtimeId}:observe`);
+            if (runtimeId === 0) {
+              observeStarted = true;
+              await observeGate;
+            }
+            return undefined;
+          },
+          async spawn() {
+            runtimeCalls.push(`runtime-${runtimeId}:spawn`);
+            return `runtime-${runtimeId}`;
+          },
+          close() {},
+        } as unknown as T3LayerMcpRuntime;
+      },
+      runCommand: runnerReturning("token-1"),
+    });
+    await service.initialize();
+
+    const spanningCall = service.callTool("spawn", {});
+    while (!observeStarted) await Bun.sleep(1);
+    expect(await service.callTool("listWorkers", {})).toBe(recovered);
+    releaseObserve!();
+
+    expect(await spanningCall).toEqual(success("runtime-0"));
+    expect(runtimeCalls).toEqual(["runtime-0:observe", "runtime-0:spawn"]);
+    expect(runtimeCreations).toBe(2);
+  });
+
   test("retries a stale auth error on the current generation without replacing it", async () => {
     let releaseStaleCall: (() => void) | undefined;
     let staleCallStarted = false;
