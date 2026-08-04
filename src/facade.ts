@@ -187,6 +187,11 @@ export function createStockT3Facade(
         : createWorkerOverlay(options.overlay);
   const lifecycleSequenceByRef = new Map<string, number>();
   const lifecycleMutationsByRef = new Map<string, number>();
+  const lifecycleInitialTerminalByRef = new Map<string, boolean>();
+  const lifecycleTerminalOutcomeByRef = new Map<
+    string,
+    { readonly sequence: number; readonly terminal: boolean }
+  >();
 
   function lifecycleKey(ref: AgentRef): string {
     return JSON.stringify([ref.environmentId, ref.threadId]);
@@ -204,17 +209,61 @@ export function createStockT3Facade(
     else lifecycleMutationsByRef.set(key, remaining);
   }
 
+  function rememberLifecycleStart(key: string, wasTerminal: boolean): void {
+    if ((lifecycleMutationsByRef.get(key) ?? 0) === 1) {
+      lifecycleInitialTerminalByRef.set(key, wasTerminal);
+    }
+  }
+
+  function rememberLifecycleOutcome(
+    key: string,
+    sequence: number,
+    terminal: boolean,
+  ): void {
+    const current = lifecycleTerminalOutcomeByRef.get(key);
+    if (current === undefined || sequence >= current.sequence) {
+      lifecycleTerminalOutcomeByRef.set(key, { sequence, terminal });
+    }
+    lifecycleSequenceByRef.set(
+      key,
+      Math.max(lifecycleSequenceByRef.get(key) ?? 0, sequence),
+    );
+  }
+
+  function completeLifecycleMutation(ref: AgentRef, key: string): void {
+    endLifecycleMutation(key);
+    if ((lifecycleMutationsByRef.get(key) ?? 0) > 0) {
+      recordWorkerTerminalState(overlay, ref, false);
+      return;
+    }
+    const terminal =
+      lifecycleTerminalOutcomeByRef.get(key)?.terminal ??
+      lifecycleInitialTerminalByRef.get(key) ??
+      false;
+    lifecycleTerminalOutcomeByRef.delete(key);
+    lifecycleInitialTerminalByRef.delete(key);
+    recordWorkerTerminalState(overlay, ref, terminal);
+    if (terminal) pruneLifecycleTracking(ref);
+  }
+
   function pruneLifecycleTracking(ref: AgentRef): void {
     const key = lifecycleKey(ref);
     lifecycleSequenceByRef.delete(key);
     if ((lifecycleMutationsByRef.get(key) ?? 0) === 0) {
       lifecycleMutationsByRef.delete(key);
+      lifecycleInitialTerminalByRef.delete(key);
+      lifecycleTerminalOutcomeByRef.delete(key);
     }
   }
 
   function recordTerminalRelease(ref: AgentRef, observedSequence: number): boolean {
-    const minimumSequence = lifecycleSequenceByRef.get(lifecycleKey(ref));
+    const key = lifecycleKey(ref);
+    const minimumSequence = lifecycleSequenceByRef.get(key);
     if (minimumSequence !== undefined && observedSequence < minimumSequence) return false;
+    if ((lifecycleMutationsByRef.get(key) ?? 0) > 0) {
+      rememberLifecycleOutcome(key, observedSequence, true);
+      return true;
+    }
     recordWorkerTerminalState(overlay, ref, true);
     pruneLifecycleTracking(ref);
     return true;
@@ -232,31 +281,24 @@ export function createStockT3Facade(
     let wasTerminal: boolean;
     try {
       wasTerminal = recordWorkerTerminalState(overlay, ref, false);
+      rememberLifecycleStart(mutationKey, wasTerminal);
     } catch (error) {
       endLifecycleMutation(mutationKey);
       throw error;
     }
+    let result: ControlOperationResult;
     try {
-      const result = await action();
-      if (result.kind === "pending") {
-        endLifecycleMutation(mutationKey);
-        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
-        return result;
-      }
-      lifecycleSequenceByRef.set(mutationKey, result.snapshot.snapshotSequence);
-      const terminal = isTerminalSnapshot(result.snapshot);
-      recordWorkerTerminalState(overlay, ref, terminal);
-      endLifecycleMutation(mutationKey);
-      if (terminal) pruneLifecycleTracking(ref);
-      return result;
+      result = await action();
     } catch (error) {
-      endLifecycleMutation(mutationKey);
-      if (wasTerminal) {
-        recordWorkerTerminalState(overlay, ref, true);
-        pruneLifecycleTracking(ref);
-      }
+      completeLifecycleMutation(ref, mutationKey);
       throw error;
     }
+    if (result.kind !== "pending") {
+      const terminal = isTerminalSnapshot(result.snapshot);
+      rememberLifecycleOutcome(mutationKey, result.snapshot.snapshotSequence, terminal);
+    }
+    completeLifecycleMutation(ref, mutationKey);
+    return result;
   }
 
   async function requireCanonical(
@@ -345,23 +387,25 @@ export function createStockT3Facade(
       let wasTerminal: boolean;
       try {
         wasTerminal = recordWorkerTerminalState(overlay, ref, false);
+        rememberLifecycleStart(mutationKey, wasTerminal);
       } catch (error) {
         endLifecycleMutation(mutationKey);
         throw error;
       }
+      let receipt: TurnReceipt;
       try {
-        const receipt = await runtime.send(ref, message, options);
-        lifecycleSequenceByRef.set(
-          mutationKey,
-          Math.max(receipt.observedSequence, receipt.acceptedSequence ?? 0),
-        );
-        endLifecycleMutation(mutationKey);
-        return receipt;
+        receipt = await runtime.send(ref, message, options);
       } catch (error) {
-        endLifecycleMutation(mutationKey);
-        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
+        completeLifecycleMutation(ref, mutationKey);
         throw error;
       }
+      rememberLifecycleOutcome(
+        mutationKey,
+        Math.max(receipt.observedSequence, receipt.acceptedSequence ?? 0),
+        false,
+      );
+      completeLifecycleMutation(ref, mutationKey);
+      return receipt;
     },
     async wait(receipt: TurnReceipt, options?: RuntimeOperationOptions) {
       try {

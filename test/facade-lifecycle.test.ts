@@ -791,6 +791,113 @@ describe("stock facade lifecycle commands", () => {
     expect(() => overlay.attach(replacement, { role: "worker", parentRef: null })).not.toThrow();
     expect(overlay.getWorker(replacement)?.ref).toEqual(replacement);
   });
+
+  test("keeps overlay capacity occupied until concurrent pending lifecycle mutations finish", async () => {
+    const overlay = createWorkerOverlay({ maxWorkers: 1 });
+    overlay.attach(ref, { role: "worker", parentRef: null });
+    recordWorkerTerminalState(overlay, ref, true);
+    const pending = {
+      kind: "pending" as const,
+      operation: "archive" as const,
+      reason: "projection_pending" as const,
+      agentRef: ref,
+      receipt: {
+        operation: "archive" as const,
+        commandId: "archive-command",
+        acceptedSequence: 2,
+        observedSequence: 1,
+        retryState: "not_needed" as const,
+      },
+      snapshot: detail(1, activeState),
+    };
+    const releases: Array<(result: typeof pending) => void> = [];
+    const facade = createStockT3Facade({
+      archive: async () => new Promise<typeof pending>((resolve) => releases.push(resolve)),
+    } as unknown as T3NativeRuntime, { overlay });
+    const first = facade.archive(ref);
+    const second = facade.archive(ref);
+    const replacement = { environmentId: ref.environmentId, threadId: "thread-2" };
+
+    releases[0]!(pending);
+    await first;
+    let capacityError: unknown;
+    try {
+      overlay.attach(replacement, { role: "worker", parentRef: null });
+    } catch (error) {
+      capacityError = error;
+    }
+    expect(capacityError).toMatchObject({ code: "overlay_capacity_exceeded" });
+
+    releases[1]!(pending);
+    await second;
+    expect(() => overlay.attach(replacement, { role: "worker", parentRef: null })).not.toThrow();
+  });
+
+  test("defers a concurrent wait terminal release until the lifecycle group finishes", async () => {
+    const overlay = createWorkerOverlay({ maxWorkers: 1 });
+    overlay.attach(ref, { role: "worker", parentRef: null });
+    const pending = {
+      kind: "pending" as const,
+      operation: "archive" as const,
+      reason: "projection_pending" as const,
+      agentRef: ref,
+      receipt: {
+        operation: "archive" as const,
+        commandId: "archive-command",
+        acceptedSequence: 2,
+        observedSequence: 1,
+        retryState: "not_needed" as const,
+      },
+      snapshot: detail(1, activeState),
+    };
+    let releaseArchive!: (result: typeof pending) => void;
+    const terminalBase = detail(3, activeState);
+    const terminalSnapshot: ThreadDetailSnapshot = {
+      ...terminalBase,
+      thread: {
+        ...terminalBase.thread,
+        latestTurn: {
+          turnId: "turn-1",
+          state: "completed",
+          requestedAt: iso,
+          startedAt: iso,
+          completedAt: iso,
+          assistantMessageId: "assistant-1",
+        },
+      },
+    };
+    const receipt = {
+      agentRef: ref,
+      leaseId: "lease-1",
+      commandId: "turn-command",
+      messageId: "message-1",
+      acceptedSequence: 2,
+      observedSequence: 2,
+      leaseExpiresAt: Date.now() + 1_000,
+      leaseState: "active" as const,
+    };
+    const facade = createStockT3Facade({
+      archive: async () => new Promise<typeof pending>((resolve) => {
+        releaseArchive = resolve;
+      }),
+      wait: async () => terminalSnapshot,
+    } as unknown as T3NativeRuntime, { overlay });
+    const archive = facade.archive(ref);
+    await facade.wait(receipt);
+    const replacement = { environmentId: ref.environmentId, threadId: "thread-2" };
+
+    let capacityError: unknown;
+    try {
+      overlay.attach(replacement, { role: "worker", parentRef: null });
+    } catch (error) {
+      capacityError = error;
+    }
+    expect(capacityError).toMatchObject({ code: "overlay_capacity_exceeded" });
+
+    releaseArchive(pending);
+    await expect(archive).resolves.toEqual(pending);
+    expect(() => overlay.attach(replacement, { role: "worker", parentRef: null })).not.toThrow();
+  });
 });
 
 describe("stock facade lifecycle MCP parity", () => {
