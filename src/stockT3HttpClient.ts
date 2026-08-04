@@ -4,10 +4,12 @@ import {
   type EnvironmentDescriptor,
   type SanitizedDispatchError,
   type ShellSnapshot,
+  type StockReadModelSnapshot,
   type ThreadDetailSnapshot,
   decodeDescriptor,
   decodeDispatchError,
   decodeDispatchResult,
+  decodeReadModelSnapshot,
   decodeShellSnapshot,
   decodeThreadDetailSnapshot,
   decodeTokenResult,
@@ -334,6 +336,20 @@ export function createStockT3HttpClient(options: StockT3HttpClientOptions) {
       if (!response.ok) throw receivedHttpError(response);
       return decodeOrProtocol(
         () => decodeShellSnapshot(body, { minimumSequence: boundary.minimumSequence }),
+        response.status,
+      );
+    },
+
+    async getSnapshot(boundary: RequestBoundaryOptions = {}): Promise<StockReadModelSnapshot> {
+      const { response, body } = await requestJson(
+        "/api/orchestration/snapshot",
+        { method: "GET" },
+        boundary,
+        true,
+      );
+      if (!response.ok) throw receivedHttpError(response);
+      return decodeOrProtocol(
+        () => decodeReadModelSnapshot(body, { minimumSequence: boundary.minimumSequence }),
         response.status,
       );
     },

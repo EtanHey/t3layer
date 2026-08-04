@@ -2,7 +2,9 @@ import type {
   EnvironmentDescriptor,
   ShellSnapshot,
   StockMessage,
+  StockReadModelSnapshot,
   StockThreadDetail,
+  StockThreadIdentity,
   StockThreadShell,
   ThreadDetailSnapshot,
   ConnectionProfile,
@@ -157,7 +159,26 @@ export type ControlOperationName =
   | "interrupt"
   | "stop"
   | "respond_to_approval"
-  | "respond_to_user_input";
+  | "respond_to_user_input"
+  | "archive"
+  | "unarchive"
+  | "settle"
+  | "unsettle"
+  | "snooze"
+  | "unsnooze"
+  | "update_meta";
+
+export type LifecycleOperationName = Extract<
+  ControlOperationName,
+  "archive" | "unarchive" | "settle" | "unsettle" | "snooze" | "unsnooze" | "update_meta"
+>;
+
+export interface ThreadMetaFields {
+  readonly title?: string;
+  readonly modelSelection?: RuntimeModelSelection;
+  readonly branch?: string | null;
+  readonly worktreePath?: string | null;
+}
 
 export const APPROVAL_DECISIONS = [
   "accept",
@@ -199,10 +220,27 @@ export type ControlOperationResult =
     }
   | {
       readonly kind: "no_op";
-      readonly operation: "interrupt" | "stop";
-      readonly reason: "turn_terminal" | "session_terminal";
+      readonly operation: ControlOperationName;
+      readonly reason:
+        | "turn_terminal"
+        | "session_terminal"
+        | "already_archived"
+        | "already_unarchived"
+        | "already_settled"
+        | "already_unsettled"
+        | "already_snoozed_until_target"
+        | "not_snoozed"
+        | "metadata_unchanged";
       readonly agentRef: AgentRef;
       readonly observedSequence: number;
+      readonly snapshot: ThreadDetailSnapshot;
+    }
+  | {
+      readonly kind: "pending";
+      readonly operation: LifecycleOperationName;
+      readonly reason: "projection_pending";
+      readonly agentRef: AgentRef;
+      readonly receipt: ControlReceipt;
       readonly snapshot: ThreadDetailSnapshot;
     };
 
@@ -479,6 +517,9 @@ export function parseProjectCreateIdentity(
 export interface StockT3RuntimeClient {
   readonly getDescriptor: (options?: RequestBoundaryOptions) => Promise<EnvironmentDescriptor>;
   readonly getShell: (options?: RequestBoundaryOptions) => Promise<ShellSnapshot>;
+  readonly getSnapshot?: (
+    options?: RequestBoundaryOptions,
+  ) => Promise<StockReadModelSnapshot>;
   readonly getThread: (
     threadId: string,
     options?: RequestBoundaryOptions,
@@ -2918,6 +2959,631 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     );
   }
 
+  type LifecycleNoOpReason = Extract<
+    ControlOperationResult,
+    { readonly kind: "no_op" }
+  >["reason"];
+
+  function lifecycleNoOp(
+    operationName: LifecycleOperationName,
+    reason: LifecycleNoOpReason,
+    ref: AgentRef,
+    preflight: ControlPreflight,
+  ): ControlOperationResult {
+    return {
+      kind: "no_op",
+      operation: operationName,
+      reason,
+      agentRef: ref,
+      observedSequence: observedControlSequence(preflight),
+      snapshot: preflight.detail,
+    };
+  }
+
+  async function dispatchLifecycle(
+    operationName: LifecycleOperationName,
+    ref: AgentRef,
+    command: Readonly<Record<string, unknown>>,
+    commandId: string,
+    preflight: ControlPreflight,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+    predicate: ControlPredicate,
+  ): Promise<ControlOperationResult> {
+    try {
+      return await dispatchControl(
+        operationName,
+        ref,
+        command,
+        commandId,
+        observedControlSequence(preflight),
+        operation,
+        predicate,
+      );
+    } catch (error) {
+      const receipt = error instanceof StockRuntimeError
+        ? error.evidence.receipt as ControlReceipt | undefined
+        : undefined;
+      if (error instanceof StockRuntimeError && error.code === "timeout" && receipt !== undefined) {
+        return {
+          kind: "pending",
+          operation: operationName,
+          reason: "projection_pending",
+          agentRef: ref,
+          receipt,
+          snapshot: preflight.detail,
+        };
+      }
+      throw error;
+    }
+  }
+
+  async function disposition(
+    operationName: LifecycleOperationName,
+    commandType: string,
+    ref: AgentRef,
+    operation: RuntimeOperationOptions,
+    noOpReason: LifecycleNoOpReason,
+    alreadyApplied: ControlPredicate,
+    payload: Readonly<Record<string, unknown>> = {},
+    requiredFields: readonly (keyof StockThreadIdentity)[] = [],
+    validatePreflight?: (preflight: ControlPreflight) => void,
+  ): Promise<ControlOperationResult> {
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightControl(ref, bounded);
+    for (const field of requiredFields) {
+      if (!Object.hasOwn(preflight.shellThread, field) || !Object.hasOwn(preflight.detail.thread, field)) {
+        throw new StockRuntimeError("protocol_mismatch", {
+          reason: "lifecycle_projection_unavailable",
+          field,
+        });
+      }
+    }
+    validatePreflight?.(preflight);
+    if (alreadyApplied(preflight.shellThread, preflight.detail)) {
+      return lifecycleNoOp(operationName, noOpReason, ref, preflight);
+    }
+    const commandId = id();
+    const command = Object.freeze({
+      type: commandType,
+      commandId,
+      threadId: ref.threadId,
+      ...payload,
+    });
+    return dispatchLifecycle(
+      operationName,
+      ref,
+      command,
+      commandId,
+      preflight,
+      bounded,
+      alreadyApplied,
+    );
+  }
+
+  function projectedOnBoth(
+    shellThread: StockThreadShell,
+    detail: ThreadDetailSnapshot,
+    predicate: (thread: StockThreadShell | StockThreadDetail) => boolean,
+  ): boolean {
+    return predicate(shellThread) && predicate(detail.thread);
+  }
+
+  interface FullThreadPreflight {
+    readonly detail: ThreadDetailSnapshot;
+  }
+
+  function validateFullThreadIdentity(ref: AgentRef, thread: StockThreadDetail): void {
+    controlIdentifier(thread.projectId, "snapshot.thread.projectId");
+    if (
+      thread.id !== ref.threadId ||
+      (thread.session !== null && thread.session.threadId !== ref.threadId)
+    ) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "control_thread_identity_conflict",
+      });
+    }
+    if (thread.deletedAt != null) {
+      throw new StockRuntimeError("identity_conflict", {
+        reason: "thread_not_found",
+        threadId: ref.threadId,
+      });
+    }
+  }
+
+  function fullSnapshotClient(): NonNullable<StockT3RuntimeClient["getSnapshot"]> {
+    if (client.getSnapshot === undefined) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "full_snapshot_unavailable",
+      });
+    }
+    return client.getSnapshot;
+  }
+
+  async function preflightFullThread(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+  ): Promise<FullThreadPreflight> {
+    validateControlRef(ref);
+    const stopped = stopCode(operation);
+    if (stopped !== null) throw new StockRuntimeError(stopped);
+    const getSnapshot = fullSnapshotClient();
+    const [environment, snapshot] = await Promise.all([
+      descriptor({ deadlineMs: operation.deadlineMs, signal: operation.signal }),
+      getSnapshot({ deadlineMs: operation.deadlineMs, signal: operation.signal }).catch((error) => {
+        throw mapReceivedError(error);
+      }),
+    ] as const);
+    if (environment.environmentId !== ref.environmentId) {
+      throw new StockRuntimeError("environment_changed", {
+        expectedEnvironmentId: ref.environmentId,
+        actualEnvironmentId: environment.environmentId,
+      });
+    }
+    const thread = snapshot.threads.find((entry) => entry.id === ref.threadId);
+    if (thread === undefined) {
+      throw new StockRuntimeError("identity_conflict", {
+        reason: "thread_not_found",
+        threadId: ref.threadId,
+      });
+    }
+    validateFullThreadIdentity(ref, thread);
+    return { detail: { snapshotSequence: snapshot.snapshotSequence, thread } };
+  }
+
+  async function waitBetweenFullSnapshotReads(
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+  ): Promise<void> {
+    const remainingMs = operation.deadlineMs - clock();
+    if (remainingMs <= 0) return;
+    await new Promise<void>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        operation.signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, Math.min(25, remainingMs));
+      operation.signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  async function observeFullThread(
+    ref: AgentRef,
+    minimumSequence: number,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+    predicate: (thread: StockThreadDetail) => boolean,
+  ): Promise<{ readonly matched: boolean; readonly detail: ThreadDetailSnapshot | null }> {
+    const getSnapshot = fullSnapshotClient();
+    let last: ThreadDetailSnapshot | null = null;
+    const readLimit = Math.max(1, operation.maxReconciliationReads ?? 4);
+    for (let index = 0; index < readLimit; index += 1) {
+      const stopped = stopCode(operation);
+      if (stopped !== null) break;
+      let snapshot: StockReadModelSnapshot;
+      try {
+        snapshot = await getSnapshot({
+          deadlineMs: operation.deadlineMs,
+          signal: operation.signal,
+        });
+      } catch (error) {
+        if (isAmbiguous(error)) {
+          if (index + 1 < readLimit) await waitBetweenFullSnapshotReads(operation);
+          continue;
+        }
+        throw mapReceivedError(error);
+      }
+      const thread = snapshot.threads.find((entry) => entry.id === ref.threadId);
+      if (thread === undefined) {
+        throw new StockRuntimeError("identity_conflict", {
+          reason: "thread_not_found",
+          threadId: ref.threadId,
+        });
+      }
+      validateFullThreadIdentity(ref, thread);
+      last = { snapshotSequence: snapshot.snapshotSequence, thread };
+      if (snapshot.snapshotSequence >= minimumSequence && predicate(thread)) {
+        return { matched: true, detail: last };
+      }
+      if (index + 1 < readLimit) {
+        await waitBetweenFullSnapshotReads(operation);
+      }
+    }
+    return { matched: false, detail: last };
+  }
+
+  async function dispatchFullLifecycle(
+    operationName: "archive" | "unarchive",
+    ref: AgentRef,
+    commandType: "thread.archive" | "thread.unarchive",
+    preflight: FullThreadPreflight,
+    operation: RuntimeOperationOptions & { readonly deadlineMs: number },
+    predicate: (thread: StockThreadDetail) => boolean,
+  ): Promise<ControlOperationResult> {
+    const commandId = id();
+    const command = Object.freeze({ type: commandType, commandId, threadId: ref.threadId });
+    let acceptedSequence: number | null = null;
+    let retryState: ControlReceipt["retryState"] = "not_needed";
+    try {
+      acceptedSequence = (await client.dispatch(command, {
+        deadlineMs: operation.deadlineMs,
+        signal: operation.signal,
+      })).sequence;
+      poller.dispatchObserved(ref.environmentId);
+    } catch (error) {
+      const failure = classifyDispatchFailure(error, operation);
+      if (failure.kind !== "ambiguous") {
+        if (failure.kind === "cancelled" || failure.kind === "timeout") {
+          throw new StockRuntimeError(failure.kind, { operation: operationName, commandId });
+        }
+        throw failure.error;
+      }
+      const reconciled = await observeFullThread(ref, 0, operation, predicate);
+      if (reconciled.matched && reconciled.detail !== null) {
+        return appliedControlResult(
+          operationName,
+          ref,
+          commandId,
+          null,
+          "reconciled_before_retry",
+          reconciled.detail,
+        );
+      }
+      const stopped = stopCode(operation);
+      if (stopped !== null) throw new StockRuntimeError(stopped, { operation: operationName, commandId });
+      try {
+        acceptedSequence = (await client.dispatch(command, {
+          deadlineMs: operation.deadlineMs,
+          signal: operation.signal,
+        })).sequence;
+        retryState = "identical_retry_accepted";
+        poller.dispatchObserved(ref.environmentId);
+      } catch (retryError) {
+        const retryFailure = classifyDispatchFailure(retryError, operation);
+        if (retryFailure.kind === "cancelled" || retryFailure.kind === "timeout") {
+          throw new StockRuntimeError(retryFailure.kind, { operation: operationName, commandId });
+        }
+        if (
+          retryFailure.kind === "received" &&
+          (retryFailure.error.code === "protocol_mismatch" ||
+            ![400, 401, 403, 500].includes(
+              typeof retryFailure.error.evidence.status === "number"
+                ? retryFailure.error.evidence.status
+                : 0,
+            ))
+        ) {
+          throw retryFailure.error;
+        }
+        retryState = "identical_retry_outcome_unknown";
+      }
+    }
+    const observed = await observeFullThread(ref, acceptedSequence ?? 0, operation, predicate);
+    const snapshot = observed.detail ?? preflight.detail;
+    const receipt: ControlReceipt = {
+      operation: operationName,
+      commandId,
+      acceptedSequence,
+      observedSequence: snapshot.snapshotSequence,
+      retryState,
+    };
+    return observed.matched
+      ? appliedControlResult(
+          operationName,
+          ref,
+          commandId,
+          acceptedSequence,
+          retryState,
+          snapshot,
+        )
+      : {
+          kind: "pending",
+          operation: operationName,
+          reason: "projection_pending",
+          agentRef: ref,
+          receipt,
+          snapshot,
+        };
+  }
+
+  async function archive(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightFullThread(ref, bounded);
+    if (!Object.hasOwn(preflight.detail.thread, "archivedAt")) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "lifecycle_projection_unavailable",
+        field: "archivedAt",
+      });
+    }
+    if (preflight.detail.thread.archivedAt != null) {
+      return {
+        kind: "no_op",
+        operation: "archive",
+        reason: "already_archived",
+        agentRef: ref,
+        observedSequence: preflight.detail.snapshotSequence,
+        snapshot: preflight.detail,
+      };
+    }
+    return dispatchFullLifecycle(
+      "archive",
+      ref,
+      "thread.archive",
+      preflight,
+      bounded,
+      (thread) => thread.archivedAt != null,
+    );
+  }
+
+  async function unarchive(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const bounded = boundedControlOperation(operation);
+    const preflight = await preflightFullThread(ref, bounded);
+    if (!Object.hasOwn(preflight.detail.thread, "archivedAt")) {
+      throw new StockRuntimeError("protocol_mismatch", {
+        reason: "lifecycle_projection_unavailable",
+        field: "archivedAt",
+      });
+    }
+    if (preflight.detail.thread.archivedAt == null) {
+      return {
+        kind: "no_op",
+        operation: "unarchive",
+        reason: "already_unarchived",
+        agentRef: ref,
+        observedSequence: preflight.detail.snapshotSequence,
+        snapshot: preflight.detail,
+      };
+    }
+    return dispatchFullLifecycle(
+      "unarchive",
+      ref,
+      "thread.unarchive",
+      preflight,
+      bounded,
+      (thread) => thread.archivedAt == null,
+    );
+  }
+
+  async function settle(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    return disposition(
+      "settle",
+      "thread.settle",
+      ref,
+      operation,
+      "already_settled",
+      (shellThread, detail) => projectedOnBoth(
+        shellThread,
+        detail,
+        (thread) => thread.settledAt != null && thread.settledOverride !== "active",
+      ),
+      {},
+      ["settledAt", "settledOverride"],
+      (preflight) => {
+        const shell = preflight.shellThread;
+        const sessionActive = [shell.session, preflight.detail.thread.session].some(
+          (session) => session?.status === "starting" || session?.status === "running",
+        );
+        if (
+          sessionActive ||
+          shell.hasPendingApprovals ||
+          shell.hasPendingUserInput ||
+          hasQueuedTurnStart(shell)
+        ) {
+          throw new StockRuntimeError("command_rejected", {
+            reason: "thread_not_settleable",
+          });
+        }
+      },
+    );
+  }
+
+  async function unsettle(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    return disposition(
+      "unsettle",
+      "thread.unsettle",
+      ref,
+      operation,
+      "already_unsettled",
+      (shellThread, detail) => projectedOnBoth(
+        shellThread,
+        detail,
+        (thread) => thread.settledOverride === "active",
+      ),
+      { reason: "user" },
+      ["settledAt", "settledOverride"],
+    );
+  }
+
+  function snoozeUntil(value: unknown): string {
+    if (typeof value !== "string" || value.trim() !== value || !Number.isFinite(Date.parse(value))) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "snoozedUntil" });
+    }
+    return value;
+  }
+
+  async function snooze(
+    ref: AgentRef,
+    until: string,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const parsed = snoozeUntil(until);
+    if (!(Date.parse(parsed) > Date.parse(now()))) {
+      throw new StockRuntimeError("command_rejected", {
+        reason: "snooze_not_in_future",
+      });
+    }
+    return disposition(
+      "snooze",
+      "thread.snooze",
+      ref,
+      operation,
+      "already_snoozed_until_target",
+      (shellThread, detail) => projectedOnBoth(
+        shellThread,
+        detail,
+        (thread) => thread.snoozedUntil === parsed,
+      ),
+      { snoozedUntil: parsed },
+      ["snoozedUntil"],
+      (preflight) => {
+        const shell = preflight.shellThread;
+        if (
+          shell.hasPendingApprovals ||
+          shell.hasPendingUserInput ||
+          hasQueuedTurnStart(shell)
+        ) {
+          throw new StockRuntimeError("command_rejected", {
+            reason: "thread_not_snoozable",
+          });
+        }
+      },
+    );
+  }
+
+  function hasQueuedTurnStart(thread: StockThreadShell): boolean {
+    if (thread.latestUserMessageAt == null || thread.session?.status === "error") return false;
+    const messageAt = Date.parse(thread.latestUserMessageAt);
+    const current = Date.parse(now());
+    if (!Number.isFinite(messageAt) || !Number.isFinite(current)) return false;
+    if (Math.abs(current - messageAt) > 2 * 60_000) return false;
+    const turn = thread.latestTurn;
+    if (turn === null) return true;
+    return [turn.requestedAt, turn.startedAt, turn.completedAt].every(
+      (candidate) => candidate == null || Date.parse(candidate) < messageAt,
+    );
+  }
+
+  function activelySnoozed(value: string | null | undefined): boolean {
+    return value != null && Number.isFinite(Date.parse(value)) && Date.parse(value) > Date.parse(now());
+  }
+
+  async function unsnooze(
+    ref: AgentRef,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    return disposition(
+      "unsnooze",
+      "thread.unsnooze",
+      ref,
+      operation,
+      "not_snoozed",
+      (shellThread, detail) => projectedOnBoth(
+        shellThread,
+        detail,
+        (thread) => !activelySnoozed(thread.snoozedUntil),
+      ),
+      { reason: "user" },
+      ["snoozedUntil"],
+    );
+  }
+
+  function nullableTrimmed(value: unknown, field: string): string | null {
+    if (value === null) return null;
+    if (typeof value !== "string" || value.trim().length === 0 || value.trim() !== value) {
+      throw new StockRuntimeError("protocol_mismatch", { field });
+    }
+    return value;
+  }
+
+  function trimmed(value: unknown, field: string): string {
+    const parsed = nullableTrimmed(value, field);
+    if (parsed === null) throw new StockRuntimeError("protocol_mismatch", { field });
+    return parsed;
+  }
+
+  function parseThreadMetaFields(value: ThreadMetaFields): ThreadMetaFields {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "fields" });
+    }
+    const record = value as Readonly<Record<string, unknown>>;
+    const allowed = new Set(["title", "modelSelection", "branch", "worktreePath"]);
+    for (const key of Object.keys(record)) {
+      if (!allowed.has(key)) throw new StockRuntimeError("protocol_mismatch", { field: `fields.${key}` });
+    }
+    if (Object.keys(record).length === 0) {
+      throw new StockRuntimeError("protocol_mismatch", { field: "fields" });
+    }
+    const parsed: {
+      title?: string;
+      modelSelection?: RuntimeModelSelection;
+      branch?: string | null;
+      worktreePath?: string | null;
+    } = {};
+    if (Object.hasOwn(record, "title")) parsed.title = trimmed(record.title, "fields.title");
+    if (Object.hasOwn(record, "branch")) parsed.branch = nullableTrimmed(record.branch, "fields.branch");
+    if (Object.hasOwn(record, "worktreePath")) {
+      parsed.worktreePath = nullableTrimmed(record.worktreePath, "fields.worktreePath");
+    }
+    if (Object.hasOwn(record, "modelSelection")) {
+      const selection = record.modelSelection;
+      if (typeof selection !== "object" || selection === null || Array.isArray(selection)) {
+        throw new StockRuntimeError("protocol_mismatch", { field: "fields.modelSelection" });
+      }
+      const model = selection as Readonly<Record<string, unknown>>;
+      for (const key of Object.keys(model)) {
+        if (!["instanceId", "model", "options"].includes(key)) {
+          throw new StockRuntimeError("protocol_mismatch", { field: `fields.modelSelection.${key}` });
+        }
+      }
+      parsed.modelSelection = {
+        instanceId: trimmed(model.instanceId, "fields.modelSelection.instanceId"),
+        model: trimmed(model.model, "fields.modelSelection.model"),
+        ...(model.options === undefined ? {} : { options: model.options as readonly unknown[] }),
+      };
+      if (parsed.modelSelection.options !== undefined && !Array.isArray(parsed.modelSelection.options)) {
+        throw new StockRuntimeError("protocol_mismatch", { field: "fields.modelSelection.options" });
+      }
+    }
+    return Object.freeze(parsed);
+  }
+
+  function sameModelSelection(left: RuntimeModelSelection, right: RuntimeModelSelection): boolean {
+    return canonical(left) === canonical(right);
+  }
+
+  async function updateMeta(
+    ref: AgentRef,
+    fields: ThreadMetaFields,
+    operation: RuntimeOperationOptions = {},
+  ): Promise<ControlOperationResult> {
+    const parsed = parseThreadMetaFields(fields);
+    const bounded = boundedControlOperation(operation);
+    const initialStop = stopCode(bounded);
+    if (initialStop !== null) throw new StockRuntimeError(initialStop);
+    if (parsed.modelSelection !== undefined) {
+      await validateModelSelectionAvailable(parsed.modelSelection);
+      const stoppedAfterModelValidation = stopCode(bounded);
+      if (stoppedAfterModelValidation !== null) {
+        throw new StockRuntimeError(stoppedAfterModelValidation);
+      }
+    }
+    const matches = (thread: StockThreadShell | StockThreadDetail) =>
+      (parsed.title === undefined || thread.title === parsed.title) &&
+      (parsed.modelSelection === undefined || sameModelSelection(thread.modelSelection, parsed.modelSelection)) &&
+      (!Object.hasOwn(parsed, "branch") || thread.branch === parsed.branch) &&
+      (!Object.hasOwn(parsed, "worktreePath") || thread.worktreePath === parsed.worktreePath);
+    return disposition(
+      "update_meta",
+      "thread.meta.update",
+      ref,
+      bounded,
+      "metadata_unchanged",
+      (shellThread, detail) => matches(shellThread) && matches(detail.thread),
+      parsed as Readonly<Record<string, unknown>>,
+    );
+  }
+
   async function interrupt(
     ref: AgentRef,
     operation: RuntimeOperationOptions = {},
@@ -3520,6 +4186,13 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     stop,
     respondToApproval,
     respondToUserInput,
+    archive,
+    unarchive,
+    settle,
+    unsettle,
+    snooze,
+    unsnooze,
+    updateMeta,
     send,
     wait,
     async observe(ref: AgentRef, operation: RuntimeOperationOptions = {}) {

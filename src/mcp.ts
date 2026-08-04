@@ -5,6 +5,7 @@ import type {
   ApprovalResponse,
   RuntimeOperationOptions,
   StockSpawnInput,
+  ThreadMetaFields,
   TurnReceipt,
   UserInputResponse,
 } from "./nativeRuntime";
@@ -22,6 +23,13 @@ export const MCP_TOOL_NAMES = [
   "stop",
   "respondToApproval",
   "respondToUserInput",
+  "archive",
+  "unarchive",
+  "settle",
+  "unsettle",
+  "snooze",
+  "unsnooze",
+  "updateMeta",
 ] as const;
 
 export type StockT3McpToolName = (typeof MCP_TOOL_NAMES)[number];
@@ -174,6 +182,16 @@ const receiptSchema = Object.freeze({
   ]),
   additionalProperties: false,
 });
+const threadMetaFieldsSchema = Object.freeze({
+  type: "object",
+  properties: Object.freeze({
+    title: stringSchema,
+    modelSelection: modelSelectionSchema,
+    branch: nullableStringSchema,
+    worktreePath: nullableStringSchema,
+  }),
+  additionalProperties: false,
+});
 
 function tool(
   name: StockT3McpToolName,
@@ -256,6 +274,36 @@ const TOOLS = Object.freeze([
     }),
     operation: operationSchema,
   }, ["ref", "response"]),
+  tool("archive", "Archive a stock thread and confirm the disposition through snapshots.", {
+    ref: agentRefSchema,
+    operation: operationSchema,
+  }, ["ref"]),
+  tool("unarchive", "Restore an archived stock thread and confirm through snapshots.", {
+    ref: agentRefSchema,
+    operation: operationSchema,
+  }, ["ref"]),
+  tool("settle", "Settle a stock thread and confirm the disposition through snapshots.", {
+    ref: agentRefSchema,
+    operation: operationSchema,
+  }, ["ref"]),
+  tool("unsettle", "Reopen a settled stock thread as an explicit user action.", {
+    ref: agentRefSchema,
+    operation: operationSchema,
+  }, ["ref"]),
+  tool("snooze", "Snooze a stock thread until an ISO timestamp and confirm through snapshots.", {
+    ref: agentRefSchema,
+    until: stringSchema,
+    operation: operationSchema,
+  }, ["ref", "until"]),
+  tool("unsnooze", "Wake a snoozed stock thread as an explicit user action.", {
+    ref: agentRefSchema,
+    operation: operationSchema,
+  }, ["ref"]),
+  tool("updateMeta", "Update canonical stock thread metadata and confirm through snapshots.", {
+    ref: agentRefSchema,
+    fields: threadMetaFieldsSchema,
+    operation: operationSchema,
+  }, ["ref", "fields"]),
 ]);
 
 function resultContent(payload: unknown) {
@@ -478,6 +526,28 @@ export function createStockT3McpFacade(facade: StockT3Facade) {
             return success(await facade.respondToUserInput(
               args.ref as AgentRef,
               args.response as unknown as UserInputResponse,
+              operation,
+            ));
+          case "archive":
+            return success(await facade.archive(args.ref as AgentRef, operation));
+          case "unarchive":
+            return success(await facade.unarchive(args.ref as AgentRef, operation));
+          case "settle":
+            return success(await facade.settle(args.ref as AgentRef, operation));
+          case "unsettle":
+            return success(await facade.unsettle(args.ref as AgentRef, operation));
+          case "snooze":
+            return success(await facade.snooze(
+              args.ref as AgentRef,
+              args.until as string,
+              operation,
+            ));
+          case "unsnooze":
+            return success(await facade.unsnooze(args.ref as AgentRef, operation));
+          case "updateMeta":
+            return success(await facade.updateMeta(
+              args.ref as AgentRef,
+              args.fields as ThreadMetaFields,
               operation,
             ));
           default:

@@ -5,6 +5,7 @@ import {
   decodeDescriptor,
   decodeDispatchError,
   decodeDispatchResult,
+  decodeReadModelSnapshot,
   decodeShellSnapshot,
   decodeThreadDetailSnapshot,
 } from "../src/stockT3Contracts";
@@ -138,6 +139,75 @@ describe("stock T3 narrow contracts", () => {
 
     expect(shell.threads[0]?.hasPendingUserInput).toBe(true);
     expect(detail.thread.messages[1]?.turnId).toBe("turn-1");
+  });
+
+  test("decodes archived threads from the full read model", () => {
+    const snapshot = decodeReadModelSnapshot({
+      snapshotSequence: 12,
+      projects: [],
+      threads: [{
+        ...threadBase,
+        archivedAt: iso,
+        settledOverride: "settled",
+        settledAt: iso,
+        snoozedUntil: iso,
+        snoozedAt: iso,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+      }],
+      updatedAt: iso,
+    });
+
+    expect(snapshot.snapshotSequence).toBe(12);
+    expect(snapshot.threads).toHaveLength(1);
+    expect(snapshot.threads[0]).toMatchObject({
+      id: "thread-1",
+      archivedAt: iso,
+      settledOverride: "settled",
+      settledAt: iso,
+      snoozedUntil: iso,
+      snoozedAt: iso,
+    });
+  });
+
+  test("preserves absence of lifecycle projections instead of inventing null state", () => {
+    const {
+      archivedAt: _archivedAt,
+      settledOverride: _settledOverride,
+      settledAt: _settledAt,
+      ...withoutLifecycle
+    } = threadBase;
+    const snapshot = decodeThreadDetailSnapshot({
+      snapshotSequence: 11,
+      thread: {
+        ...withoutLifecycle,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+      },
+    });
+
+    expect(Object.hasOwn(snapshot.thread, "archivedAt")).toBeFalse();
+    expect(Object.hasOwn(snapshot.thread, "settledOverride")).toBeFalse();
+    expect(Object.hasOwn(snapshot.thread, "settledAt")).toBeFalse();
+    const readModel = decodeReadModelSnapshot({
+      snapshotSequence: 11,
+      projects: [],
+      threads: [{
+        ...withoutLifecycle,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+      }],
+      updatedAt: iso,
+    });
+    expect(Object.hasOwn(readModel.threads[0]!, "archivedAt")).toBeFalse();
+    expect(Object.hasOwn(readModel.threads[0]!, "settledOverride")).toBeFalse();
+    expect(Object.hasOwn(readModel.threads[0]!, "settledAt")).toBeFalse();
   });
 
   test("rejects negative or regressing sequence anchors", () => {
