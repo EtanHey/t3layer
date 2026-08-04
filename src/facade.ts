@@ -7,6 +7,7 @@ import type {
   SpawnResult,
   StockSpawnInput,
   T3NativeRuntime,
+  ThreadMetaFields,
   TurnReceipt,
   UserInputResponse,
 } from "./nativeRuntime";
@@ -46,6 +47,7 @@ export type {
   RetryState,
   RuntimeModelSelection,
   RuntimeOperationOptions,
+  ThreadMetaFields,
   SanitizedRetryError,
   SpawnResult,
   StockRuntimeErrorCode,
@@ -236,6 +238,11 @@ export function createStockT3Facade(
     }
     try {
       const result = await action();
+      if (result.kind === "pending") {
+        endLifecycleMutation(mutationKey);
+        if (wasTerminal) recordWorkerTerminalState(overlay, ref, true);
+        return result;
+      }
       lifecycleSequenceByRef.set(mutationKey, result.snapshot.snapshotSequence);
       const terminal = isTerminalSnapshot(result.snapshot);
       recordWorkerTerminalState(overlay, ref, terminal);
@@ -405,6 +412,23 @@ export function createStockT3Facade(
       ref,
       () => runtime.respondToUserInput(ref, response, options),
     ),
+    archive: async (ref: AgentRef, options?: RuntimeOperationOptions) =>
+      runControlLifecycleMutation(ref, () => runtime.archive(ref, options)),
+    unarchive: async (ref: AgentRef, options?: RuntimeOperationOptions) =>
+      runControlLifecycleMutation(ref, () => runtime.unarchive(ref, options)),
+    settle: async (ref: AgentRef, options?: RuntimeOperationOptions) =>
+      runControlLifecycleMutation(ref, () => runtime.settle(ref, options)),
+    unsettle: async (ref: AgentRef, options?: RuntimeOperationOptions) =>
+      runControlLifecycleMutation(ref, () => runtime.unsettle(ref, options)),
+    snooze: async (ref: AgentRef, until: string, options?: RuntimeOperationOptions) =>
+      runControlLifecycleMutation(ref, () => runtime.snooze(ref, until, options)),
+    unsnooze: async (ref: AgentRef, options?: RuntimeOperationOptions) =>
+      runControlLifecycleMutation(ref, () => runtime.unsnooze(ref, options)),
+    updateMeta: async (
+      ref: AgentRef,
+      fields: ThreadMetaFields,
+      options?: RuntimeOperationOptions,
+    ) => runControlLifecycleMutation(ref, () => runtime.updateMeta(ref, fields, options)),
     async observe(ref: AgentRef, options?: RuntimeOperationOptions) {
       const snapshot = await runtime.observe(ref, options);
       if (snapshot !== undefined) {

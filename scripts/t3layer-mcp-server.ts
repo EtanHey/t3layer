@@ -46,6 +46,13 @@ export const T3LAYER_APP_REQUIRED_TOOL_NAMES = [
   "stop",
   "respondToApproval",
   "respondToUserInput",
+  "archive",
+  "unarchive",
+  "settle",
+  "unsettle",
+  "snooze",
+  "unsnooze",
+  "updateMeta",
 ] as const satisfies readonly StockT3McpToolName[];
 
 const LOCAL_TOOL_NAMES = new Set<string>(T3LAYER_LOCAL_TOOL_NAMES);

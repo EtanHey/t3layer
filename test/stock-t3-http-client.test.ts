@@ -36,7 +36,7 @@ describe("stock T3 HTTP client", () => {
     });
     expect(JSON.stringify(client.observations())).not.toContain("must-not-appear");
   });
-  test("uses only descriptor, shell, detail, dispatch, and token HTTP routes", async () => {
+  test("uses only descriptor, shell, full snapshot, detail, dispatch, and token HTTP routes", async () => {
     const requests: Request[] = [];
     const fetch = async (input: string | URL | Request, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -47,6 +47,14 @@ describe("stock T3 HTTP client", () => {
       if (request.url.endsWith("/api/orchestration/shell")) {
         return Response.json({
           snapshotSequence: 0,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-07-31T18:00:00.000Z",
+        });
+      }
+      if (request.url.endsWith("/api/orchestration/snapshot")) {
+        return Response.json({
+          snapshotSequence: 7,
           projects: [],
           threads: [],
           updatedAt: "2026-07-31T18:00:00.000Z",
@@ -74,6 +82,7 @@ describe("stock T3 HTTP client", () => {
 
     await client.getDescriptor();
     await client.getShell();
+    expect(await client.getSnapshot()).toMatchObject({ snapshotSequence: 7, threads: [] });
     expect(await client.getThread("thread/one")).toBeUndefined();
     expect(await client.dispatch({ type: "thread.delete", commandId: "c", threadId: "t" })).toEqual({ sequence: 9 });
     expect(await client.exchangeToken({ grantType: "pairing", credential: "bootstrap-secret" })).toEqual({
@@ -85,12 +94,14 @@ describe("stock T3 HTTP client", () => {
     expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
       "/.well-known/t3/environment",
       "/api/orchestration/shell",
+      "/api/orchestration/snapshot",
       "/api/orchestration/threads/thread%2Fone",
       "/api/orchestration/dispatch",
       "/oauth/token",
     ]);
     expect(requests[0]?.headers.get("authorization")).toBeNull();
     expect(requests[1]?.headers.get("authorization")).toBe("Bearer bearer-secret");
+    expect(requests[2]?.headers.get("authorization")).toBe("Bearer bearer-secret");
   });
 
   test("preserves a reverse-proxy path prefix on every stock endpoint", async () => {

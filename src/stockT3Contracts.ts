@@ -109,6 +109,12 @@ export interface StockThreadIdentity {
   readonly latestTurn: StockLatestTurn | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly archivedAt?: string | null;
+  readonly settledOverride?: "settled" | "active" | null;
+  readonly settledAt?: string | null;
+  readonly snoozedUntil?: string | null;
+  readonly snoozedAt?: string | null;
+  readonly deletedAt?: string | null;
   readonly session: StockSession | null;
 }
 
@@ -145,6 +151,13 @@ export interface ShellSnapshot {
 export interface ThreadDetailSnapshot {
   readonly snapshotSequence: number;
   readonly thread: StockThreadDetail;
+}
+
+export interface StockReadModelSnapshot {
+  readonly snapshotSequence: number;
+  readonly projects: readonly StockProjectShell[];
+  readonly threads: readonly StockThreadDetail[];
+  readonly updatedAt: string;
 }
 
 function literal<T extends string>(value: unknown, allowed: readonly T[], path: string): T {
@@ -205,6 +218,48 @@ function decodeThreadIdentity(input: JsonObject, path: string): StockThreadIdent
     latestTurn: decodeLatestTurn(input.latestTurn, `${path}.latestTurn`),
     createdAt: iso(input.createdAt, `${path}.createdAt`),
     updatedAt: iso(input.updatedAt, `${path}.updatedAt`),
+    ...(input.archivedAt === undefined
+      ? {}
+      : {
+          archivedAt: input.archivedAt === null
+            ? null
+            : iso(input.archivedAt, `${path}.archivedAt`),
+        }),
+    ...(input.settledOverride === undefined
+      ? {}
+      : {
+          settledOverride: input.settledOverride === null
+            ? null
+            : literal(input.settledOverride, ["settled", "active"] as const, `${path}.settledOverride`),
+        }),
+    ...(input.settledAt === undefined
+      ? {}
+      : {
+          settledAt: input.settledAt === null
+            ? null
+            : iso(input.settledAt, `${path}.settledAt`),
+        }),
+    ...(input.snoozedUntil === undefined
+      ? {}
+      : {
+          snoozedUntil: input.snoozedUntil === null
+            ? null
+            : iso(input.snoozedUntil, `${path}.snoozedUntil`),
+        }),
+    ...(input.snoozedAt === undefined
+      ? {}
+      : {
+          snoozedAt: input.snoozedAt === null
+            ? null
+            : iso(input.snoozedAt, `${path}.snoozedAt`),
+        }),
+    ...(input.deletedAt === undefined
+      ? {}
+      : {
+          deletedAt: input.deletedAt === null
+            ? null
+            : iso(input.deletedAt, `${path}.deletedAt`),
+        }),
     session: decodeSession(input.session, `${path}.session`),
   };
 }
@@ -306,15 +361,34 @@ export function decodeThreadDetailSnapshot(
   const input = object(value, "detail");
   const snapshotSequence = integer(input.snapshotSequence, "detail.snapshotSequence");
   assertSequence(snapshotSequence, options.minimumSequence, "detail.snapshotSequence");
-  const threadInput = object(input.thread, "detail.thread");
   return {
     snapshotSequence,
-    thread: {
-      ...decodeThreadIdentity(threadInput, "detail.thread"),
-      messages: array(threadInput.messages, "detail.thread.messages", decodeMessage),
-      activities: array(threadInput.activities, "detail.thread.activities", (entry) => entry),
-      checkpoints: array(threadInput.checkpoints, "detail.thread.checkpoints", (entry) => entry),
-    },
+    thread: decodeThreadDetail(input.thread, "detail.thread"),
+  };
+}
+
+function decodeThreadDetail(value: unknown, path: string): StockThreadDetail {
+  const input = object(value, path);
+  return {
+    ...decodeThreadIdentity(input, path),
+    messages: array(input.messages, `${path}.messages`, decodeMessage),
+    activities: array(input.activities, `${path}.activities`, (entry) => entry),
+    checkpoints: array(input.checkpoints, `${path}.checkpoints`, (entry) => entry),
+  };
+}
+
+export function decodeReadModelSnapshot(
+  value: unknown,
+  options: { readonly minimumSequence?: number } = {},
+): StockReadModelSnapshot {
+  const input = object(value, "snapshot");
+  const snapshotSequence = integer(input.snapshotSequence, "snapshot.snapshotSequence");
+  assertSequence(snapshotSequence, options.minimumSequence, "snapshot.snapshotSequence");
+  return {
+    snapshotSequence,
+    projects: array(input.projects, "snapshot.projects", decodeProject),
+    threads: array(input.threads, "snapshot.threads", decodeThreadDetail),
+    updatedAt: iso(input.updatedAt, "snapshot.updatedAt"),
   };
 }
 
