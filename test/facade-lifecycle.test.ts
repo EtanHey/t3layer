@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 import {
   StockRuntimeError,
@@ -14,7 +14,7 @@ import type {
   ThreadDetailSnapshot,
 } from "../src/stockT3Contracts";
 import { decodeReadModelSnapshot } from "../src/stockT3Contracts";
-import { createStockT3NativeRuntime } from "./support/modelCache";
+import { createStockT3NativeRuntime as createRuntime } from "./support/modelCache";
 import { createStockT3Facade } from "../src/facade";
 import { createStockT3McpFacade } from "../src/mcp";
 import { StockT3HttpError } from "../src/stockT3HttpClient";
@@ -24,6 +24,20 @@ const ref: AgentRef = Object.freeze({ environmentId: "env-1", threadId: "thread-
 const iso = "2026-08-04T10:00:00.000Z";
 const later = "2026-08-05T10:00:00.000Z";
 const operation = Object.freeze({ timeoutMs: 100, maxReconciliationReads: 1 });
+const openRuntimes = new Set<ReturnType<typeof createRuntime>>();
+
+function createStockT3NativeRuntime(
+  options: Parameters<typeof createRuntime>[0],
+): ReturnType<typeof createRuntime> {
+  const runtime = createRuntime(options);
+  openRuntimes.add(runtime);
+  return runtime;
+}
+
+afterEach(() => {
+  for (const runtime of openRuntimes) runtime.close();
+  openRuntimes.clear();
+});
 
 type LifecycleMethod =
   | "archive"
@@ -200,6 +214,7 @@ const cases: readonly {
   initial: LifecycleState;
   applied: LifecycleState;
   noOpReason: string;
+  operation?: string;
   expectedPayload?: Readonly<Record<string, unknown>>;
 }[] = [
   {
@@ -249,6 +264,7 @@ const cases: readonly {
   },
   {
     method: "updateMeta",
+    operation: "update_meta",
     command: "thread.meta.update",
     initial: activeState,
     applied: {
@@ -296,7 +312,7 @@ describe("stock facade lifecycle commands", () => {
 
       await expect(invoke(runtime, entry.method)).resolves.toMatchObject({
         kind: "no_op",
-        operation: entry.method,
+        operation: entry.operation ?? entry.method,
         reason: entry.noOpReason,
         agentRef: ref,
       });
@@ -319,7 +335,7 @@ describe("stock facade lifecycle commands", () => {
 
       await expect(invoke(runtime, entry.method)).resolves.toMatchObject({
         kind: "pending",
-        operation: entry.method,
+        operation: entry.operation ?? entry.method,
         reason: "projection_pending",
         agentRef: ref,
         receipt: {
@@ -356,7 +372,7 @@ describe("stock facade lifecycle commands", () => {
 
       await expect(invoke(runtime, entry.method, ref, { timeoutMs: 1_000 })).resolves.toMatchObject({
         kind: "applied",
-        operation: entry.method,
+        operation: entry.operation ?? entry.method,
         receipt: { acceptedSequence: 2, observedSequence: 2 },
       });
       runtime.close();
@@ -398,6 +414,7 @@ describe("stock facade lifecycle commands", () => {
       await invoke(runtime, entry.method);
       runtime.close();
     }
+    expect(commands).toHaveLength(cases.length);
     expect(commands.every((command) => command.type !== "thread.delete")).toBeTrue();
   });
 
@@ -544,8 +561,7 @@ describe("stock facade lifecycle commands", () => {
   test("confirms archive from stock's full snapshot after active shell/detail disappearance", async () => {
     let archived = false;
     let sequence = 1;
-    const runtime = createStockT3NativeRuntime({
-      client: {
+    const client: StockT3RuntimeClient = {
         getDescriptor: async () => descriptor(),
         getSnapshot: async () => readModel(
           sequence,
@@ -560,7 +576,9 @@ describe("stock facade lifecycle commands", () => {
           sequence = 2;
           return { sequence: 2 };
         },
-      } as StockT3RuntimeClient,
+      };
+    const runtime = createStockT3NativeRuntime({
+      client,
       id: () => "archive-command",
     });
     await expect(runtime.archive(ref, { timeoutMs: 1_000 })).resolves.toMatchObject({
@@ -575,8 +593,7 @@ describe("stock facade lifecycle commands", () => {
   test("preflights and confirms unarchive through the full snapshot", async () => {
     let archived = true;
     let sequence = 1;
-    const runtime = createStockT3NativeRuntime({
-      client: {
+    const client: StockT3RuntimeClient = {
         getDescriptor: async () => descriptor(),
         getSnapshot: async () => readModel(
           sequence,
@@ -591,7 +608,9 @@ describe("stock facade lifecycle commands", () => {
           sequence = 2;
           return { sequence: 2 };
         },
-      } as StockT3RuntimeClient,
+      };
+    const runtime = createStockT3NativeRuntime({
+      client,
       id: () => "unarchive-command",
     });
 
@@ -681,6 +700,41 @@ describe("stock facade lifecycle commands", () => {
     expect(dispatches).toBe(0);
   });
 
+  test("refuses settle when only the detail projection reports a running session", async () => {
+    let dispatches = 0;
+    const terminalDetail = detail(1, activeState);
+    const runtime = createStockT3NativeRuntime({
+      client: {
+        ...runtimeClient({ state: () => activeState }),
+        getThread: async () => ({
+          ...terminalDetail,
+          thread: {
+            ...terminalDetail.thread,
+            session: {
+              threadId: ref.threadId,
+              status: "running",
+              providerName: "claudeAgent",
+              activeTurnId: "turn-1",
+              lastError: null,
+              updatedAt: iso,
+            },
+          },
+        }),
+        dispatch: async () => {
+          dispatches += 1;
+          return { sequence: 2 };
+        },
+      },
+    });
+
+    await expect(runtime.settle(ref, operation)).rejects.toMatchObject({
+      code: "command_rejected",
+      evidence: { reason: "thread_not_settleable" },
+    });
+    expect(dispatches).toBe(0);
+    runtime.close();
+  });
+
   test("fails closed when required lifecycle projection fields are absent", async () => {
     const projected = thread(activeState);
     const { settledAt: _settledAt, ...withoutSettledAt } = projected;
@@ -734,6 +788,22 @@ describe("stock facade lifecycle commands", () => {
     runtime.close();
   });
 
+  test("rejects an unavailable metadata model before any HTTP", async () => {
+    const calls: string[] = [];
+    const runtime = createStockT3NativeRuntime({
+      client: runtimeClient({ state: () => activeState, calls }),
+    });
+
+    await expect(runtime.updateMeta(ref, {
+      modelSelection: { instanceId: "claudeAgent", model: "missing-model" },
+    }, operation)).rejects.toMatchObject({
+      code: "model_unavailable",
+      evidence: { reason: "model_slug_unavailable" },
+    });
+    expect(calls).toEqual([]);
+    runtime.close();
+  });
+
   test("confirms equivalent model options independent of object key order", async () => {
     const requested = {
       instanceId: "claudeAgent",
@@ -760,7 +830,34 @@ describe("stock facade lifecycle commands", () => {
     });
 
     await expect(runtime.updateMeta(ref, { modelSelection: requested }, { timeoutMs: 1_000 }))
-      .resolves.toMatchObject({ kind: "applied", operation: "updateMeta" });
+      .resolves.toMatchObject({ kind: "applied", operation: "update_meta" });
+    runtime.close();
+  });
+
+  test("paces transient full-snapshot failures before the next reconciliation read", async () => {
+    let reads = 0;
+    let ambiguousAt = 0;
+    let retryAt = 0;
+    const client: StockT3RuntimeClient = {
+      ...runtimeClient({ state: () => activeState }),
+      getSnapshot: async () => {
+        reads += 1;
+        if (reads === 1) return readModel(1, activeState);
+        if (reads === 2) {
+          ambiguousAt = performance.now();
+          throw new StockT3HttpError("transport_unavailable", null);
+        }
+        retryAt = performance.now();
+        return readModel(1, activeState);
+      },
+      dispatch: async () => ({ sequence: 2 }),
+    };
+    const runtime = createStockT3NativeRuntime({ client });
+
+    await expect(runtime.archive(ref, { timeoutMs: 1_000, maxReconciliationReads: 2 }))
+      .resolves.toMatchObject({ kind: "pending", operation: "archive" });
+    expect(reads).toBe(3);
+    expect(retryAt - ambiguousAt).toBeGreaterThanOrEqual(20);
     runtime.close();
   });
 
@@ -915,9 +1012,9 @@ describe("stock facade lifecycle MCP parity", () => {
     } as unknown as ReturnType<typeof createStockT3Facade>;
     const mcp = createStockT3McpFacade(fake);
     const names = mcp.listTools().map((tool) => tool.name);
-    expect([
+    expect(names).toEqual(expect.arrayContaining([
       "archive", "unarchive", "settle", "unsettle", "snooze", "unsnooze", "updateMeta",
-    ].every((name) => names.includes(name as (typeof names)[number]))).toBeTrue();
+    ]));
 
     for (const name of ["archive", "unarchive", "settle", "unsettle", "unsnooze"] as const) {
       const result = await mcp.callTool(name, { ref, operation });

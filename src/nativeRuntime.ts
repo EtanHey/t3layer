@@ -166,11 +166,11 @@ export type ControlOperationName =
   | "unsettle"
   | "snooze"
   | "unsnooze"
-  | "updateMeta";
+  | "update_meta";
 
 export type LifecycleOperationName = Extract<
   ControlOperationName,
-  "archive" | "unarchive" | "settle" | "unsettle" | "snooze" | "unsnooze" | "updateMeta"
+  "archive" | "unarchive" | "settle" | "unsettle" | "snooze" | "unsnooze" | "update_meta"
 >;
 
 export interface ThreadMetaFields {
@@ -3156,7 +3156,8 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
   ): Promise<{ readonly matched: boolean; readonly detail: ThreadDetailSnapshot | null }> {
     const getSnapshot = fullSnapshotClient();
     let last: ThreadDetailSnapshot | null = null;
-    for (let index = 0; index < Math.max(1, operation.maxReconciliationReads ?? 4); index += 1) {
+    const readLimit = Math.max(1, operation.maxReconciliationReads ?? 4);
+    for (let index = 0; index < readLimit; index += 1) {
       const stopped = stopCode(operation);
       if (stopped !== null) break;
       let snapshot: StockReadModelSnapshot;
@@ -3166,7 +3167,10 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
           signal: operation.signal,
         });
       } catch (error) {
-        if (isAmbiguous(error)) continue;
+        if (isAmbiguous(error)) {
+          if (index + 1 < readLimit) await waitBetweenFullSnapshotReads(operation);
+          continue;
+        }
         throw mapReceivedError(error);
       }
       const thread = snapshot.threads.find((entry) => entry.id === ref.threadId);
@@ -3181,7 +3185,7 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       if (snapshot.snapshotSequence >= minimumSequence && predicate(thread)) {
         return { matched: true, detail: last };
       }
-      if (index + 1 < Math.max(1, operation.maxReconciliationReads ?? 4)) {
+      if (index + 1 < readLimit) {
         await waitBetweenFullSnapshotReads(operation);
       }
     }
@@ -3364,8 +3368,9 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
       ["settledAt", "settledOverride"],
       (preflight) => {
         const shell = preflight.shellThread;
-        const sessionActive =
-          shell.session?.status === "starting" || shell.session?.status === "running";
+        const sessionActive = [shell.session, preflight.detail.thread.session].some(
+          (session) => session?.status === "starting" || session?.status === "running",
+        );
         if (
           sessionActive ||
           shell.hasPendingApprovals ||
@@ -3553,16 +3558,26 @@ export function createStockT3NativeRuntime(options: StockT3NativeRuntimeOptions)
     operation: RuntimeOperationOptions = {},
   ): Promise<ControlOperationResult> {
     const parsed = parseThreadMetaFields(fields);
+    const bounded = boundedControlOperation(operation);
+    const initialStop = stopCode(bounded);
+    if (initialStop !== null) throw new StockRuntimeError(initialStop);
+    if (parsed.modelSelection !== undefined) {
+      await validateModelSelectionAvailable(parsed.modelSelection);
+      const stoppedAfterModelValidation = stopCode(bounded);
+      if (stoppedAfterModelValidation !== null) {
+        throw new StockRuntimeError(stoppedAfterModelValidation);
+      }
+    }
     const matches = (thread: StockThreadShell | StockThreadDetail) =>
       (parsed.title === undefined || thread.title === parsed.title) &&
       (parsed.modelSelection === undefined || sameModelSelection(thread.modelSelection, parsed.modelSelection)) &&
       (!Object.hasOwn(parsed, "branch") || thread.branch === parsed.branch) &&
       (!Object.hasOwn(parsed, "worktreePath") || thread.worktreePath === parsed.worktreePath);
     return disposition(
-      "updateMeta",
+      "update_meta",
       "thread.meta.update",
       ref,
-      operation,
+      bounded,
       "metadata_unchanged",
       (shellThread, detail) => matches(shellThread) && matches(detail.thread),
       parsed as Readonly<Record<string, unknown>>,
